@@ -29,6 +29,8 @@
  * - анализы объединяются в одну строку "Анализы".
  ****************************************************/
 
+const MIN_BITRIX_DEAL_AMOUNT = 20000;
+
 const DEALS_CONFIG = {
   appointmentsSheetName: 'Назначения',
   requestsSheetName: 'Заявки',
@@ -36,6 +38,7 @@ const DEALS_CONFIG = {
   bitrixDealsSheetName: 'Сделки Bitrix',
   aiWebhookUrl: 'https://n8n-x3.tech.temed.ru/webhook/deal-patient-context-v2',
   bitrixWebhookUrlProperty: 'BITRIX_WEBHOOK_URL',
+  minBitrixDealAmount: MIN_BITRIX_DEAL_AMOUNT,
 
   appointmentColumns: {
     branch: 'Филиал',
@@ -260,28 +263,31 @@ function buildBitrixDealsSheet() {
 
       return a.branch.localeCompare(b.branch, 'ru');
     })
-    .map(group => [
-      group.dealKey,
-      'Новая',
-      'Не запрошено',
-      group.patientCode,
-      group.patientName,
-      group.branch,
-      group.amount,
-      group.firstPlanDate || '',
-      group.doctors.join(', '),
-      group.uids.join(', '),
-      group.uids.length,
-      aggregateAppointmentCompositionText_(group.compositions),
-      group.nearestRequests.join('\n'),
-      buildBitrixDealAppointmentsDescription_(group),
-      '',
-      '',
-      '',
-      '',
-      '',
-      ''
-    ]);
+    .map(group => {
+      const isBelowMinAmount = group.amount < DEALS_CONFIG.minBitrixDealAmount;
+      return [
+        group.dealKey,
+        isBelowMinAmount ? 'Не отправлять: сумма < 20 000' : 'Новая',
+        isBelowMinAmount ? 'Не требуется' : 'Не запрошено',
+        group.patientCode,
+        group.patientName,
+        group.branch,
+        group.amount,
+        group.firstPlanDate || '',
+        group.doctors.join(', '),
+        group.uids.join(', '),
+        group.uids.length,
+        aggregateAppointmentCompositionText_(group.compositions),
+        group.nearestRequests.join('\n'),
+        buildBitrixDealAppointmentsDescription_(group),
+        '',
+        '',
+        '',
+        isBelowMinAmount ? 'Сумма сделки меньше минимального порога 20 000 ₽' : '',
+        '',
+        ''
+      ];
+    });
 
   writeBitrixDealsOutput_(ss, outputRows);
 }
@@ -302,6 +308,16 @@ function requestAiSummariesForBitrixDeals() {
     }
 
     const rowNumber = i + 2;
+    const dealAmount = parseNumber_(row['Сумма сделки']);
+
+    if (dealAmount < DEALS_CONFIG.minBitrixDealAmount) {
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Статус отправки', 'Не отправлять: сумма < 20 000');
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI статус', 'Не требуется');
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', 'Сумма сделки меньше минимального порога 20 000 ₽');
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI updated_at', now);
+      return;
+    }
+
     const payload = {
       spreadsheet_id: ss.getId(),
       sheet_name: DEALS_CONFIG.bitrixDealsSheetName,
@@ -310,7 +326,7 @@ function requestAiSummariesForBitrixDeals() {
       patient_code: row['Пациент.Код'] || '',
       patient_name: row['ФИО'] || '',
       branch: row['Филиал'] || '',
-      deal_amount: parseNumber_(row['Сумма сделки']),
+      deal_amount: dealAmount,
       first_plan_date: formatDateTimeForText_(row['Первый плановый день']),
       doctor: row['Врач'] || '',
       uids: row['УИДы'] || '',
@@ -391,6 +407,14 @@ function sendReadyBitrixDealsToBitrix() {
     }
 
     const rowNumber = i + 2;
+    const dealAmount = parseNumber_(row['Сумма сделки']);
+
+    if (dealAmount < DEALS_CONFIG.minBitrixDealAmount) {
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Статус отправки', 'Не отправлять: сумма < 20 000');
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', 'Сумма сделки меньше минимального порога 20 000 ₽');
+      return;
+    }
+
     const payload = buildBitrixDealPayload_(row);
 
     try {
