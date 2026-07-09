@@ -33,6 +33,9 @@ const DEALS_CONFIG = {
   appointmentsSheetName: 'Назначения',
   requestsSheetName: 'Заявки',
   outputSheetName: 'Сделки',
+  bitrixDealsSheetName: 'Сделки Bitrix',
+  aiWebhookUrl: 'https://n8n-x3.tech.temed.ru/webhook/deal-patient-context-v2',
+  bitrixWebhookUrlProperty: 'BITRIX_WEBHOOK_URL',
 
   appointmentColumns: {
     branch: 'Филиал',
@@ -141,6 +144,489 @@ function buildDealsSheet() {
   writeDealsOutput_(ss, outputRows);
 }
 
+
+
+/****************************************************
+ * Сделки Bitrix: 1 пациент + 1 филиал = 1 сделка
+ ****************************************************/
+
+const BITRIX_DEALS_HEADERS = [
+  'DealKey',
+  'Статус отправки',
+  'AI статус',
+  'Пациент.Код',
+  'ФИО',
+  'Филиал',
+  'Сумма сделки',
+  'Первый плановый день',
+  'Врач',
+  'УИДы',
+  'Кол-во назначений',
+  'Состав назначений',
+  'Ближайшие заявки пациента',
+  'Описание назначений',
+  'AI справка',
+  'Описание для Bitrix',
+  'Bitrix Deal ID',
+  'Ошибка',
+  'AI request_id',
+  'AI updated_at'
+];
+
+
+function buildBitrixDealsSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dealsSheet = getRequiredSheet_(ss, DEALS_CONFIG.outputSheetName);
+  const deals = readSheetAsObjects_(dealsSheet);
+  const groups = new Map();
+
+  deals.forEach(row => {
+    if (String(row['Статус'] || '').trim() !== DEALS_CONFIG.resultStatuses.createDeal) {
+      return;
+    }
+
+    const patientCode = String(row['Пациент.Код'] || '').trim();
+    const branch = String(row['Филиал'] || '').trim();
+
+    if (!patientCode || !branch) {
+      return;
+    }
+
+    const dealKey = buildBitrixDealKey_(patientCode, branch);
+
+    if (!groups.has(dealKey)) {
+      groups.set(dealKey, {
+        dealKey,
+        patientCode,
+        patientName: String(row['ФИО'] || '').trim(),
+        branch,
+        amount: 0,
+        firstPlanDate: null,
+        doctors: [],
+        uids: [],
+        compositions: [],
+        nearestRequests: [],
+        uidRows: []
+      });
+    }
+
+    const group = groups.get(dealKey);
+    const planDate = parseDateOnly_(row['Первый плановый день']);
+
+    group.amount += parseNumber_(row['Сумма к продаже']);
+
+    if (planDate && (!group.firstPlanDate || planDate < group.firstPlanDate)) {
+      group.firstPlanDate = planDate;
+    }
+
+    addUniqueText_(group.doctors, row['Врач']);
+    addUniqueText_(group.uids, row['УИД']);
+
+    if (row['Состав назначений']) {
+      group.compositions.push(String(row['Состав назначений']));
+    }
+
+    splitLines_(row['Ближайшие заявки пациента']).forEach(line => addUniqueText_(group.nearestRequests, line));
+
+    group.uidRows.push({
+      uid: String(row['УИД'] || '').trim(),
+      firstPlanDate: planDate,
+      doctor: String(row['Врач'] || '').trim(),
+      composition: String(row['Состав назначений'] || '').trim(),
+      amount: parseNumber_(row['Сумма к продаже'])
+    });
+  });
+
+  const outputRows = Array.from(groups.values())
+    .sort((a, b) => {
+      const dateDiff = (a.firstPlanDate ? a.firstPlanDate.getTime() : 0) - (b.firstPlanDate ? b.firstPlanDate.getTime() : 0);
+      if (dateDiff !== 0) return dateDiff;
+
+      const patientDiff = a.patientName.localeCompare(b.patientName, 'ru');
+      if (patientDiff !== 0) return patientDiff;
+
+      return a.branch.localeCompare(b.branch, 'ru');
+    })
+    .map(group => [
+      group.dealKey,
+      'Новая',
+      'Не запрошено',
+      group.patientCode,
+      group.patientName,
+      group.branch,
+      group.amount,
+      group.firstPlanDate || '',
+      group.doctors.join(', '),
+      group.uids.join(', '),
+      group.uids.length,
+      aggregateAppointmentCompositionText_(group.compositions),
+      group.nearestRequests.join('\n'),
+      buildBitrixDealAppointmentsDescription_(group),
+      '',
+      '',
+      '',
+      '',
+      '',
+      ''
+    ]);
+
+  writeBitrixDealsOutput_(ss, outputRows);
+}
+
+
+function requestAiSummariesForBitrixDeals() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = getRequiredSheet_(ss, DEALS_CONFIG.bitrixDealsSheetName);
+  const data = readSheetWithHeaders_(sheet);
+  const now = new Date();
+
+  data.rows.forEach((row, i) => {
+    const sendStatus = String(row['Статус отправки'] || '').trim();
+    const aiStatus = String(row['AI статус'] || '').trim();
+
+    if (sendStatus !== 'Новая' || (aiStatus && aiStatus !== 'Не запрошено')) {
+      return;
+    }
+
+    const rowNumber = i + 2;
+    const payload = {
+      spreadsheet_id: ss.getId(),
+      sheet_name: DEALS_CONFIG.bitrixDealsSheetName,
+      row_number: rowNumber,
+      deal_key: row['DealKey'] || '',
+      patient_code: row['Пациент.Код'] || '',
+      patient_name: row['ФИО'] || '',
+      branch: row['Филиал'] || '',
+      deal_amount: parseNumber_(row['Сумма сделки']),
+      first_plan_date: formatDateTimeForText_(row['Первый плановый день']),
+      doctor: row['Врач'] || '',
+      uids: row['УИДы'] || '',
+      appointment_composition: row['Состав назначений'] || '',
+      nearest_requests: row['Ближайшие заявки пациента'] || '',
+      deal_description: row['Описание назначений'] || '',
+      booking_execution_context: 'По данным текущей выгрузки по связанным назначениям требуется создание сделки.'
+    };
+
+    try {
+      const response = UrlFetchApp.fetch(DEALS_CONFIG.aiWebhookUrl, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      });
+      const code = response.getResponseCode();
+      const body = response.getContentText() || '';
+      const parsed = parseJsonSafely_(body);
+
+      if (code >= 200 && code < 300) {
+        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI статус', 'processing');
+        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI request_id', getAiRequestId_(parsed));
+        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI updated_at', now);
+      } else {
+        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI статус', 'error');
+        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', extractErrorText_(parsed, body, code));
+        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI updated_at', now);
+      }
+    } catch (err) {
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI статус', 'error');
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', err && err.message ? err.message : String(err));
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI updated_at', now);
+    }
+  });
+}
+
+
+function buildFinalBitrixDescriptions() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = getRequiredSheet_(ss, DEALS_CONFIG.bitrixDealsSheetName);
+  const data = readSheetWithHeaders_(sheet);
+
+  data.rows.forEach((row, i) => {
+    const aiStatus = String(row['AI статус'] || '').trim();
+    const currentDescription = String(row['Описание для Bitrix'] || '').trim();
+
+    if (aiStatus !== 'done' || currentDescription) {
+      return;
+    }
+
+    const aiSummary = String(row['AI справка'] || '').trim();
+    const appointmentsDescription = String(row['Описание назначений'] || '').trim();
+    const finalDescription = aiSummary
+      ? aiSummary + '\n\n---\n\nНАЗНАЧЕНИЯ К ПРОДАЖЕ:\n\n' + appointmentsDescription
+      : appointmentsDescription;
+    const rowNumber = i + 2;
+
+    setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Описание для Bitrix', finalDescription);
+    setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Статус отправки', 'Готова к отправке');
+  });
+}
+
+
+function sendReadyBitrixDealsToBitrix() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = getRequiredSheet_(ss, DEALS_CONFIG.bitrixDealsSheetName);
+  const data = readSheetWithHeaders_(sheet);
+  const bitrixWebhookUrl = String(PropertiesService.getScriptProperties().getProperty(DEALS_CONFIG.bitrixWebhookUrlProperty) || '').trim();
+
+  if (!bitrixWebhookUrl) {
+    throw new Error('Не задан Script Property ' + DEALS_CONFIG.bitrixWebhookUrlProperty + ' с URL вебхука Bitrix24.');
+  }
+
+  data.rows.forEach((row, i) => {
+    if (String(row['Статус отправки'] || '').trim() !== 'Готова к отправке') {
+      return;
+    }
+
+    const rowNumber = i + 2;
+    const payload = buildBitrixDealPayload_(row);
+
+    try {
+      const response = UrlFetchApp.fetch(normalizeBitrixMethodUrl_(bitrixWebhookUrl, 'crm.deal.add'), {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      });
+      const code = response.getResponseCode();
+      const body = response.getContentText() || '';
+      const parsed = parseJsonSafely_(body);
+
+      if (code >= 200 && code < 300 && parsed && parsed.result) {
+        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Статус отправки', 'Отправлена');
+        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Bitrix Deal ID', parsed.result);
+        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', '');
+      } else {
+        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Статус отправки', 'Ошибка');
+        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', extractErrorText_(parsed, body, code));
+      }
+    } catch (err) {
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Статус отправки', 'Ошибка');
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', err && err.message ? err.message : String(err));
+    }
+  });
+}
+
+
+function buildBitrixDealPayload_(row) {
+  return {
+    fields: {
+      TITLE: String(row['ФИО'] || '').trim() + ' — ' + String(row['Филиал'] || '').trim(),
+      OPPORTUNITY: parseNumber_(row['Сумма сделки']),
+      CURRENCY_ID: 'RUB',
+      COMMENTS: buildBitrixDealComments_(row)
+    },
+    params: {
+      REGISTER_SONET_EVENT: 'Y'
+    }
+  };
+}
+
+
+function buildBitrixDealComments_(row) {
+  return [
+    'ФИО: ' + String(row['ФИО'] || '').trim(),
+    'Пациент.Код: ' + String(row['Пациент.Код'] || '').trim(),
+    'Филиал: ' + String(row['Филиал'] || '').trim(),
+    'Сумма сделки: ' + formatMoneyForText_(parseNumber_(row['Сумма сделки'])),
+    'УИДы: ' + String(row['УИДы'] || '').trim(),
+    'Первый плановый день: ' + formatDateTimeForText_(row['Первый плановый день']),
+    '',
+    String(row['Описание для Bitrix'] || '').trim()
+  ].join('\n');
+}
+
+
+function normalizeBitrixMethodUrl_(webhookUrl, methodName) {
+  const base = String(webhookUrl || '').trim().replace(/\/+$/g, '');
+
+  if (base.match(new RegExp('/' + methodName + '(\\.json)?$', 'i'))) {
+    return base;
+  }
+
+  return base + '/' + methodName + '.json';
+}
+
+
+function buildBitrixDealKey_(patientCode, branch) {
+  return String(patientCode || '').trim() + '|' + String(branch || '').trim();
+}
+
+
+function aggregateAppointmentCompositionText_(compositionTexts) {
+  const counts = new Map();
+
+  (compositionTexts || []).forEach(text => {
+    splitLines_(text).forEach(line => {
+      const parsed = parseCompositionLine_(line);
+      if (!parsed.name) return;
+      counts.set(parsed.name, (counts.get(parsed.name) || 0) + parsed.count);
+    });
+  });
+
+  return Array.from(counts.entries())
+    .sort((a, b) => a[0].localeCompare(b[0], 'ru'))
+    .map(([name, count]) => count > 1 ? name + ' х ' + count : name)
+    .join('\n');
+}
+
+
+function parseCompositionLine_(line) {
+  const text = String(line || '').trim();
+  const match = text.match(/^(.*?)\s+[xх]\s*(\d+(?:[.,]\d+)?)$/i);
+
+  if (!match) {
+    return { name: text, count: text ? 1 : 0 };
+  }
+
+  return {
+    name: match[1].trim(),
+    count: parseNumber_(match[2]) || 1
+  };
+}
+
+
+function buildBitrixDealAppointmentsDescription_(group) {
+  const lines = ['Назначения к продаже:', ''];
+
+  group.uidRows.forEach((row, i) => {
+    if (i > 0) {
+      lines.push('');
+    }
+
+    lines.push((i + 1) + ') УИД: ' + row.uid);
+    lines.push('Первый плановый день: ' + formatDateRu_(row.firstPlanDate));
+    lines.push('Врач: ' + row.doctor);
+    lines.push('Состав назначений:');
+
+    if (row.composition) {
+      splitLines_(row.composition).forEach(line => lines.push(line));
+    }
+
+    lines.push('Сумма: ' + formatMoneyForText_(row.amount));
+  });
+
+  return lines.join('\n');
+}
+
+
+function writeBitrixDealsOutput_(ss, outputRows) {
+  let sheet = ss.getSheetByName(DEALS_CONFIG.bitrixDealsSheetName);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(DEALS_CONFIG.bitrixDealsSheetName);
+  }
+
+  sheet.clear();
+  sheet.getRange(1, 1, 1, BITRIX_DEALS_HEADERS.length).setValues([BITRIX_DEALS_HEADERS]);
+
+  if (outputRows.length > 0) {
+    sheet.getRange(2, 1, outputRows.length, BITRIX_DEALS_HEADERS.length).setValues(outputRows);
+  }
+
+  sheet.setFrozenRows(1);
+  sheet.getRange(1, 1, 1, BITRIX_DEALS_HEADERS.length)
+    .setFontWeight('bold')
+    .setBackground('#cfe2f3')
+    .setHorizontalAlignment('center');
+
+  const totalRows = Math.max(outputRows.length, 1);
+  sheet.getRange(2, 7, totalRows, 1).setNumberFormat('#,##0.00');
+  sheet.getRange(2, 8, totalRows, 1).setNumberFormat('dd.MM.yyyy');
+  sheet.getRange(2, 20, totalRows, 1).setNumberFormat('dd.MM.yyyy HH:mm:ss');
+
+  if (outputRows.length > 0) {
+    sheet.getRange(2, 12, outputRows.length, 5).setWrap(true);
+  }
+
+  sheet.autoResizeColumns(1, BITRIX_DEALS_HEADERS.length);
+  sheet.setColumnWidth(12, 450);
+  sheet.setColumnWidth(13, 500);
+  sheet.setColumnWidth(14, 800);
+  sheet.setColumnWidth(15, 600);
+  sheet.setColumnWidth(16, 800);
+
+  if (sheet.getFilter()) {
+    sheet.getFilter().remove();
+  }
+
+  sheet.getRange(1, 1, Math.max(outputRows.length + 1, 1), BITRIX_DEALS_HEADERS.length).createFilter();
+}
+
+
+function readSheetWithHeaders_(sheet) {
+  const values = sheet.getDataRange().getValues();
+  const headers = values.length ? values[0].map(h => String(h || '').trim()) : [];
+  const headerMap = {};
+
+  headers.forEach((header, i) => {
+    headerMap[header] = i + 1;
+  });
+
+  const rows = values.slice(1).map(row => {
+    const obj = {};
+    headers.forEach((header, i) => {
+      obj[header] = row[i];
+    });
+    return obj;
+  });
+
+  return { headers, headerMap, rows };
+}
+
+
+function setSheetValueByHeader_(sheet, headerMap, rowNumber, header, value) {
+  const colNumber = headerMap[header];
+
+  if (!colNumber) {
+    throw new Error('Не найдена колонка "' + header + '" на листе "' + sheet.getName() + '".');
+  }
+
+  sheet.getRange(rowNumber, colNumber).setValue(value);
+}
+
+
+function addUniqueText_(items, value) {
+  const text = String(value || '').trim();
+
+  if (text && items.indexOf(text) === -1) {
+    items.push(text);
+  }
+}
+
+
+function splitLines_(value) {
+  return String(value || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+}
+
+
+function parseJsonSafely_(text) {
+  try {
+    return text ? JSON.parse(text) : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+
+function getAiRequestId_(parsed) {
+  if (!parsed) {
+    return '';
+  }
+
+  return parsed.request_id || parsed.requestId || parsed.id || '';
+}
+
+
+function extractErrorText_(parsed, body, code) {
+  if (parsed && (parsed.error || parsed.message)) {
+    return parsed.error || parsed.message;
+  }
+
+  return body || ('HTTP ' + code);
+}
 
 /****************************************************
  * Построение строки по одному УИД
