@@ -79,6 +79,16 @@ const DEALS_CONFIG = {
     'Оказано'
   ],
 
+  cancelledRequestStateMarkers: [
+    'отменена',
+    'отменено',
+    'отменен',
+    'отменён',
+    'отказ',
+    'не состоялась',
+    'не состоялся'
+  ],
+
   resultStatuses: {
     createDeal: 'Создать сделку',
     planned: 'Запланировано',
@@ -360,19 +370,6 @@ function buildUidDescription_(uidGroup, data) {
     });
   }
 
-  lines.push('');
-  lines.push('Назначенные услуги внутри УИД:');
-
-  uidGroup.items.forEach(item => {
-    lines.push(
-      '- ' +
-      formatDateRu_(item.treatmentDate) +
-      ' — ' +
-      item.nomenclature +
-      ' — ' +
-      formatMoneyForText_(item.price)
-    );
-  });
 
   if (data.matchExplanations.length) {
     lines.push('');
@@ -486,6 +483,7 @@ function buildRequestIndexes_(requests) {
     const startDate = parseDateOnly_(row[c.startDate]);
     const nomenclature = row[c.nomenclature];
     const cabinet = row[c.cabinet];
+    const state = String(row[c.state] || '').trim();
 
     if (!clientCode || !branch || !startDate) {
       return;
@@ -496,7 +494,7 @@ function buildRequestIndexes_(requests) {
       client: String(row[c.client] || '').trim(),
       clientCode: String(clientCode || '').trim(),
       branch: String(branch || '').trim(),
-      state: String(row[c.state] || '').trim(),
+      state,
       nomenclature: String(nomenclature || '').trim(),
       cabinet: String(cabinet || '').trim(),
       startDate,
@@ -546,8 +544,9 @@ function buildNearestRequestsByClientIndex_(requests) {
   requests.forEach(row => {
     const clientCode = normalizeCode_(row[c.clientCode]);
     const startDate = parseDateOnly_(row[c.startDate]);
+    const state = String(row[c.state] || '').trim();
 
-    if (!clientCode || !startDate) {
+    if (!clientCode || !startDate || isCancelledRequestState_(state)) {
       return;
     }
 
@@ -560,7 +559,7 @@ function buildNearestRequestsByClientIndex_(requests) {
       client: String(row[c.client] || '').trim(),
       clientCode,
       branch: String(row[c.branch] || '').trim(),
-      state: String(row[c.state] || '').trim(),
+      state,
       nomenclature: String(row[c.nomenclature] || '').trim(),
       cabinet: String(row[c.cabinet] || '').trim(),
       startDate,
@@ -730,6 +729,19 @@ function writeDealsOutput_(ss, outputRows) {
 
 function isRelevantRequestState_(state) {
   return isPlannedRequestState_(state) || isStartedOrCompletedRequestState_(state);
+}
+
+
+function isCancelledRequestState_(state) {
+  const normalized = normalizeText_(state);
+
+  if (!normalized) {
+    return false;
+  }
+
+  return DEALS_CONFIG.cancelledRequestStateMarkers.some(marker => {
+    return normalized.indexOf(normalizeText_(marker)) !== -1;
+  });
 }
 
 
