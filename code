@@ -1,0 +1,1039 @@
+/****************************************************
+ * TEMED — сделки по назначениям для отдела продаж
+ *
+ * Входные листы:
+ * 1) "Назначения"
+ * 2) "Заявки"
+ *
+ * Выходной лист:
+ * "Сделки"
+ *
+ * Одна строка на листе "Сделки" = один УИД назначения.
+ *
+ * УИД НЕ требует сделки, если:
+ * - есть заявка "Начато" / "Выполнена" в день назначения;
+ * - или есть плановая заявка на эту услугу на любую будущую дату
+ *   начиная с даты назначения.
+ *
+ * Сопоставление:
+ * - Пациент.Код = КлиентКод
+ * - Филиал = Филиал
+ * - Номенклатура = НоменклатураНаименование
+ *   ИЛИ резерв:
+ *     кабинет содержит "ФТЛ"    → MLS / лазеротерапия
+ *     кабинет содержит "Магнит" → SIS / магнитотерапия
+ *
+ * Состав назначений:
+ * - однотипные назначения объединяются;
+ * - всё начиная с "|" удаляется;
+ * - анализы объединяются в одну строку "Анализы".
+ ****************************************************/
+
+const DEALS_CONFIG = {
+  appointmentsSheetName: 'Назначения',
+  requestsSheetName: 'Заявки',
+  outputSheetName: 'Сделки',
+
+  appointmentColumns: {
+    branch: 'Филиал',
+    patient: 'Пациент',
+    patientCode: 'Пациент.Код',
+    doctor: 'Врач',
+    standard: 'Стандарт лечения',
+    standardCode: 'Стандарт лечения.Код',
+    uid: 'УИД',
+    treatmentDate: 'Дата лечения',
+    nomenclature: 'Номенклатура',
+    price: 'Цена'
+  },
+
+  requestColumns: {
+    branch: 'Филиал',
+    client: 'Клиент',
+    clientCode: 'КлиентКод',
+    state: 'Состояние',
+    startDate: 'ДатаНачала',
+    endDate: 'ДатаОкончания',
+    number: 'Номер',
+    nomenclature: 'НоменклатураНаименование',
+    cabinet: 'Кабинет'
+  },
+
+  plannedRequestStates: [
+    'Запланирована',
+    'Запланировано',
+    'Подтвердил запись',
+    'Недозвон. Отправить смс'
+  ],
+
+  startedRequestStates: [
+    'Начато'
+  ],
+
+  completedRequestStates: [
+    'Выполнена',
+    'Выполнено',
+    'Завершена',
+    'Завершено',
+    'Оказана',
+    'Оказано'
+  ],
+
+  resultStatuses: {
+    createDeal: 'Создать сделку',
+    planned: 'Запланировано',
+    started: 'Начато'
+  },
+
+  nearestRequestsLimit: 7
+};
+
+
+/****************************************************
+ * Главная функция запуска
+ ****************************************************/
+
+function buildDealsSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const appointmentsSheet = getRequiredSheet_(ss, DEALS_CONFIG.appointmentsSheetName);
+  const requestsSheet = getRequiredSheet_(ss, DEALS_CONFIG.requestsSheetName);
+
+  const appointments = readSheetAsObjects_(appointmentsSheet);
+  const requests = readSheetAsObjects_(requestsSheet);
+
+  const requestIndexes = buildRequestIndexes_(requests);
+  const nearestRequestsByClient = buildNearestRequestsByClientIndex_(requests);
+  const uidGroups = groupAppointmentsByUid_(appointments);
+
+  const outputRows = Object.values(uidGroups)
+    .map(uidGroup => buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient))
+    .sort((a, b) => {
+      const statusOrder = {
+        [DEALS_CONFIG.resultStatuses.createDeal]: 1,
+        [DEALS_CONFIG.resultStatuses.started]: 2,
+        [DEALS_CONFIG.resultStatuses.planned]: 3
+      };
+
+      const statusDiff = (statusOrder[a.status] || 99) - (statusOrder[b.status] || 99);
+      if (statusDiff !== 0) return statusDiff;
+
+      const dateDiff = a.sortDate - b.sortDate;
+      if (dateDiff !== 0) return dateDiff;
+
+      const patientDiff = String(a.patient).localeCompare(String(b.patient), 'ru');
+      if (patientDiff !== 0) return patientDiff;
+
+      return String(a.uid).localeCompare(String(b.uid), 'ru');
+    })
+    .map(item => item.row);
+
+  writeDealsOutput_(ss, outputRows);
+}
+
+
+/****************************************************
+ * Построение строки по одному УИД
+ ****************************************************/
+
+function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient) {
+  const matchedRequests = [];
+  const matchedRequestNumbers = new Set();
+  const matchExplanations = [];
+
+  let amountTotal = 0;
+
+  uidGroup.items.forEach(item => {
+    amountTotal += item.price;
+
+    const candidateRequests = findCandidateRequestsForAppointmentItem_(
+      uidGroup,
+      item,
+      requestIndexes
+    );
+
+    candidateRequests.forEach(match => {
+      const req = match.request;
+      matchedRequests.push(req);
+
+      if (req.number) {
+        matchedRequestNumbers.add(req.number);
+      }
+
+      matchExplanations.push(
+        formatDateRu_(item.treatmentDate) +
+        ' — ' +
+        match.reason +
+        ': ' +
+        item.nomenclature +
+        ' → заявка ' +
+        formatRequestShort_(req)
+      );
+    });
+  });
+
+  let resultStatus = DEALS_CONFIG.resultStatuses.createDeal;
+
+  if (matchedRequests.some(req => isStartedOrCompletedRequestState_(req.state))) {
+    resultStatus = DEALS_CONFIG.resultStatuses.started;
+  } else if (matchedRequests.some(req => isPlannedRequestState_(req.state))) {
+    resultStatus = DEALS_CONFIG.resultStatuses.planned;
+  }
+
+  const amountToSell = resultStatus === DEALS_CONFIG.resultStatuses.createDeal
+    ? amountTotal
+    : 0;
+
+  const appointmentComposition = buildAppointmentCompositionText_(uidGroup.items);
+
+  const nearestRequests = nearestRequestsByClient.get(normalizeCode_(uidGroup.patientCode)) || [];
+  const nearestRequestsText = nearestRequests
+    .slice(0, DEALS_CONFIG.nearestRequestsLimit)
+    .map(req => {
+      return [
+        formatDateTimeForText_(req.startDateRaw),
+        normalizeOutputState_(req.state),
+        req.nomenclature || req.cabinet || '',
+        req.number ? '№' + req.number : ''
+      ].filter(Boolean).join(' — ');
+    })
+    .join('\n');
+
+  const description = buildUidDescription_(uidGroup, {
+    resultStatus,
+    amountTotal,
+    amountToSell,
+    matchedRequests,
+    matchedRequestNumbers: Array.from(matchedRequestNumbers),
+    matchExplanations,
+    nearestRequestsText,
+    appointmentComposition
+  });
+
+  return {
+    uid: uidGroup.uid,
+    patient: uidGroup.patient,
+    status: resultStatus,
+    sortDate: uidGroup.firstTreatmentDate ? uidGroup.firstTreatmentDate.getTime() : 0,
+    row: [
+      resultStatus,
+      uidGroup.patient,
+      uidGroup.patientCode,
+      uidGroup.branch,
+      uidGroup.uid,
+      uidGroup.items.length,
+      amountTotal,
+      amountToSell,
+      uidGroup.firstTreatmentDate,
+      uidGroup.doctor,
+      uidGroup.standard,
+      appointmentComposition,
+      Array.from(matchedRequestNumbers).join(', '),
+      nearestRequestsText,
+      description
+    ]
+  };
+}
+
+
+function findCandidateRequestsForAppointmentItem_(uidGroup, item, requestIndexes) {
+  const out = [];
+
+  const exactKey = buildExactServiceMatchKeyWithoutDate_(
+    uidGroup.patientCode,
+    uidGroup.branch,
+    item.nomenclature
+  );
+
+  const exactRequests = requestIndexes.exact.get(exactKey) || [];
+
+  exactRequests.forEach(req => {
+    if (isRequestSuitableByDateAndStatus_(req, item.treatmentDate)) {
+      out.push({
+        request: req,
+        reason: 'совпадение по номенклатуре'
+      });
+    }
+  });
+
+  // Если точные совпадения уже есть, резерв по кабинету не нужен.
+  if (out.length > 0) {
+    return out;
+  }
+
+  const appointmentCategory = detectAppointmentServiceCategory_(item.nomenclature);
+
+  if (!appointmentCategory) {
+    return out;
+  }
+
+  const categoryKey = buildCategoryServiceMatchKeyWithoutDate_(
+    uidGroup.patientCode,
+    uidGroup.branch,
+    appointmentCategory
+  );
+
+  const categoryRequests = requestIndexes.category.get(categoryKey) || [];
+
+  categoryRequests.forEach(req => {
+    if (isRequestSuitableByDateAndStatus_(req, item.treatmentDate)) {
+      out.push({
+        request: req,
+        reason: 'совпадение по кабинету ' + req.cabinet
+      });
+    }
+  });
+
+  return out;
+}
+
+
+function isRequestSuitableByDateAndStatus_(req, treatmentDate) {
+  if (!req || !req.startDate || !treatmentDate) {
+    return false;
+  }
+
+  const requestDayKey = formatDateKey_(req.startDate);
+  const treatmentDayKey = formatDateKey_(treatmentDate);
+
+  // Если заявка начата или выполнена именно в день назначения —
+  // считаем, что назначение уже исполняется.
+  if (
+    isStartedOrCompletedRequestState_(req.state) &&
+    requestDayKey === treatmentDayKey
+  ) {
+    return true;
+  }
+
+  // Если есть плановая заявка на любую будущую дату,
+  // начиная с даты назначения, считаем, что пациент записан.
+  if (
+    isPlannedRequestState_(req.state) &&
+    requestDayKey >= treatmentDayKey
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+
+/****************************************************
+ * Описание УИД
+ ****************************************************/
+
+function buildUidDescription_(uidGroup, data) {
+  const lines = [];
+
+  lines.push('Пациент: ' + uidGroup.patient);
+  lines.push('Код пациента: ' + uidGroup.patientCode);
+  lines.push('Филиал: ' + uidGroup.branch);
+  lines.push('УИД назначения: ' + uidGroup.uid);
+
+  if (uidGroup.doctor) {
+    lines.push('Врач: ' + uidGroup.doctor);
+  }
+
+  if (uidGroup.standard) {
+    lines.push('Стандарт лечения: ' + uidGroup.standard);
+  }
+
+  lines.push('Статус: ' + data.resultStatus);
+  lines.push('Первый плановый день: ' + formatDateRu_(uidGroup.firstTreatmentDate));
+  lines.push('Сумма назначений всего: ' + formatMoneyForText_(data.amountTotal));
+  lines.push('Сумма к продаже: ' + formatMoneyForText_(data.amountToSell));
+
+  if (data.appointmentComposition) {
+    lines.push('Состав назначений: ' + data.appointmentComposition.replace(/\n/g, '; '));
+  }
+
+  if (data.matchedRequestNumbers.length) {
+    lines.push('Найденные заявки: ' + data.matchedRequestNumbers.join(', '));
+  }
+
+  lines.push('');
+  lines.push('Состав назначений:');
+
+  if (data.appointmentComposition) {
+    data.appointmentComposition.split('\n').forEach(line => {
+      lines.push('- ' + line);
+    });
+  }
+
+  lines.push('');
+  lines.push('Назначенные услуги внутри УИД:');
+
+  uidGroup.items.forEach(item => {
+    lines.push(
+      '- ' +
+      formatDateRu_(item.treatmentDate) +
+      ' — ' +
+      item.nomenclature +
+      ' — ' +
+      formatMoneyForText_(item.price)
+    );
+  });
+
+  if (data.matchExplanations.length) {
+    lines.push('');
+    lines.push('Почему УИД считается записанным/исполняемым:');
+    data.matchExplanations.forEach(line => {
+      lines.push('- ' + line);
+    });
+  } else {
+    lines.push('');
+    lines.push('По этому УИД не найдено ни одной подходящей заявки:');
+    lines.push('- нет плановой заявки на будущую дату по номенклатуре или кабинету;');
+    lines.push('- нет начатой/выполненной заявки в день назначения.');
+  }
+
+  if (data.nearestRequestsText) {
+    lines.push('');
+    lines.push('Ближайшие заявки пациента:');
+    data.nearestRequestsText.split('\n').forEach(line => {
+      lines.push('- ' + line);
+    });
+  }
+
+  return lines.join('\n');
+}
+
+
+/****************************************************
+ * Состав назначений
+ ****************************************************/
+
+function buildAppointmentCompositionText_(items) {
+  const counts = new Map();
+
+  (items || []).forEach(item => {
+    const normalizedName = normalizeAppointmentCompositionName_(item.nomenclature);
+
+    if (!normalizedName) {
+      return;
+    }
+
+    counts.set(normalizedName, (counts.get(normalizedName) || 0) + 1);
+  });
+
+  return Array.from(counts.entries())
+    .sort((a, b) => a[0].localeCompare(b[0], 'ru'))
+    .map(([name, count]) => {
+      return count > 1 ? name + ' х ' + count : name;
+    })
+    .join('\n');
+}
+
+
+function normalizeAppointmentCompositionName_(nomenclature) {
+  let name = String(nomenclature || '').trim();
+
+  if (!name) {
+    return '';
+  }
+
+  // Удаляем всё начиная с |, включая пробел перед ним.
+  name = name.replace(/\s*\|.*$/g, '').trim();
+
+  if (isAnalysisService_(name)) {
+    return 'Анализы';
+  }
+
+  return name;
+}
+
+
+function isAnalysisService_(name) {
+  const text = normalizeText_(name);
+
+  return (
+    text.indexOf('анализ') !== -1 ||
+    text.indexOf('кров') !== -1 ||
+    text.indexOf('моч') !== -1 ||
+    text.indexOf('биохим') !== -1 ||
+    text.indexOf('соэ') !== -1 ||
+    text.indexOf('с-реактив') !== -1 ||
+    text.indexOf('с реактив') !== -1 ||
+    text.indexOf('срб') !== -1 ||
+    text.indexOf('ревматоид') !== -1 ||
+    text.indexOf('мочевин') !== -1 ||
+    text.indexOf('креатинин') !== -1 ||
+    text.indexOf('алт') !== -1 ||
+    text.indexOf('аст') !== -1 ||
+    text.indexOf('глюкоз') !== -1 ||
+    text.indexOf('холестерин') !== -1 ||
+    text.indexOf('билирубин') !== -1 ||
+    text.indexOf('ферритин') !== -1 ||
+    text.indexOf('витамин') !== -1 ||
+    text.indexOf('лаборатор') !== -1
+  );
+}
+
+
+/****************************************************
+ * Индексы заявок
+ ****************************************************/
+
+function buildRequestIndexes_(requests) {
+  const c = DEALS_CONFIG.requestColumns;
+
+  const exact = new Map();
+  const category = new Map();
+
+  requests.forEach(row => {
+    const clientCode = row[c.clientCode];
+    const branch = row[c.branch];
+    const startDate = parseDateOnly_(row[c.startDate]);
+    const nomenclature = row[c.nomenclature];
+    const cabinet = row[c.cabinet];
+
+    if (!clientCode || !branch || !startDate) {
+      return;
+    }
+
+    const req = {
+      number: String(row[c.number] || '').trim(),
+      client: String(row[c.client] || '').trim(),
+      clientCode: String(clientCode || '').trim(),
+      branch: String(branch || '').trim(),
+      state: String(row[c.state] || '').trim(),
+      nomenclature: String(nomenclature || '').trim(),
+      cabinet: String(cabinet || '').trim(),
+      startDate,
+      startDateRaw: row[c.startDate],
+      endDateRaw: row[c.endDate]
+    };
+
+    if (nomenclature) {
+      const exactKey = buildExactServiceMatchKeyWithoutDate_(
+        clientCode,
+        branch,
+        nomenclature
+      );
+
+      if (!exact.has(exactKey)) {
+        exact.set(exactKey, []);
+      }
+
+      exact.get(exactKey).push(req);
+    }
+
+    const requestCategory = detectRequestServiceCategoryByCabinet_(cabinet);
+
+    if (requestCategory) {
+      const categoryKey = buildCategoryServiceMatchKeyWithoutDate_(
+        clientCode,
+        branch,
+        requestCategory
+      );
+
+      if (!category.has(categoryKey)) {
+        category.set(categoryKey, []);
+      }
+
+      category.get(categoryKey).push(req);
+    }
+  });
+
+  return { exact, category };
+}
+
+
+function buildNearestRequestsByClientIndex_(requests) {
+  const c = DEALS_CONFIG.requestColumns;
+  const index = new Map();
+
+  requests.forEach(row => {
+    const clientCode = normalizeCode_(row[c.clientCode]);
+    const startDate = parseDateOnly_(row[c.startDate]);
+
+    if (!clientCode || !startDate) {
+      return;
+    }
+
+    if (!index.has(clientCode)) {
+      index.set(clientCode, []);
+    }
+
+    index.get(clientCode).push({
+      number: String(row[c.number] || '').trim(),
+      client: String(row[c.client] || '').trim(),
+      clientCode,
+      branch: String(row[c.branch] || '').trim(),
+      state: String(row[c.state] || '').trim(),
+      nomenclature: String(row[c.nomenclature] || '').trim(),
+      cabinet: String(row[c.cabinet] || '').trim(),
+      startDate,
+      startDateRaw: row[c.startDate],
+      endDateRaw: row[c.endDate]
+    });
+  });
+
+  index.forEach(items => {
+    items.sort((a, b) => a.startDate.getTime() - b.startDate.getTime());
+  });
+
+  return index;
+}
+
+
+/****************************************************
+ * Группировка назначений по УИД
+ ****************************************************/
+
+function groupAppointmentsByUid_(appointments) {
+  const c = DEALS_CONFIG.appointmentColumns;
+  const groups = {};
+
+  appointments.forEach(row => {
+    const uid = String(row[c.uid] || '').trim();
+    const branch = String(row[c.branch] || '').trim();
+    const patient = String(row[c.patient] || '').trim();
+    const patientCode = String(row[c.patientCode] || '').trim();
+    const doctor = String(row[c.doctor] || '').trim();
+    const standard = String(row[c.standard] || '').trim();
+    const treatmentDate = parseDateOnly_(row[c.treatmentDate]);
+    const nomenclature = String(row[c.nomenclature] || '').trim();
+    const price = parseNumber_(row[c.price]);
+
+    if (!uid || !branch || !patientCode || !patient || !treatmentDate || !nomenclature) {
+      return;
+    }
+
+    if (!groups[uid]) {
+      groups[uid] = {
+        uid,
+        branch,
+        patient,
+        patientCode,
+        doctor,
+        standard,
+        firstTreatmentDate: treatmentDate,
+        items: []
+      };
+    }
+
+    if (treatmentDate < groups[uid].firstTreatmentDate) {
+      groups[uid].firstTreatmentDate = treatmentDate;
+    }
+
+    if (!groups[uid].doctor && doctor) {
+      groups[uid].doctor = doctor;
+    }
+
+    if (!groups[uid].standard && standard) {
+      groups[uid].standard = standard;
+    }
+
+    groups[uid].items.push({
+      treatmentDate,
+      nomenclature,
+      price
+    });
+  });
+
+  return groups;
+}
+
+
+/****************************************************
+ * Вывод листа "Сделки"
+ ****************************************************/
+
+function writeDealsOutput_(ss, outputRows) {
+  let sheet = ss.getSheetByName(DEALS_CONFIG.outputSheetName);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(DEALS_CONFIG.outputSheetName);
+  }
+
+  sheet.clear();
+
+  const headers = [
+    'Статус',
+    'ФИО',
+    'Пациент.Код',
+    'Филиал',
+    'УИД',
+    'Кол-во услуг',
+    'Сумма назначений',
+    'Сумма к продаже',
+    'Первый плановый день',
+    'Врач',
+    'Стандарт лечения',
+    'Состав назначений',
+    'Номера найденных заявок',
+    'Ближайшие заявки пациента',
+    'Описание сделки'
+  ];
+
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+
+  if (outputRows.length > 0) {
+    sheet.getRange(2, 1, outputRows.length, headers.length).setValues(outputRows);
+  }
+
+  sheet.setFrozenRows(1);
+
+  sheet.getRange(1, 1, 1, headers.length)
+    .setFontWeight('bold')
+    .setBackground('#d9ead3')
+    .setHorizontalAlignment('center');
+
+  const totalRows = Math.max(outputRows.length, 1);
+
+  sheet.getRange(2, 6, totalRows, 1).setNumberFormat('0');
+  sheet.getRange(2, 7, totalRows, 1).setNumberFormat('#,##0.00');
+  sheet.getRange(2, 8, totalRows, 1).setNumberFormat('#,##0.00');
+  sheet.getRange(2, 9, totalRows, 1).setNumberFormat('dd.MM.yyyy');
+
+  if (outputRows.length > 0) {
+    sheet.getRange(2, 12, outputRows.length, 4).setWrap(true);
+
+    const statusValues = sheet.getRange(2, 1, outputRows.length, 1).getValues();
+
+    statusValues.forEach((row, i) => {
+      const status = String(row[0] || '');
+      const range = sheet.getRange(i + 2, 1, 1, headers.length);
+
+      if (status === DEALS_CONFIG.resultStatuses.createDeal) {
+        range.setBackground('#fff2cc');
+      }
+
+      if (status === DEALS_CONFIG.resultStatuses.planned) {
+        range.setBackground('#d9ead3');
+      }
+
+      if (status === DEALS_CONFIG.resultStatuses.started) {
+        range.setBackground('#cfe2f3');
+      }
+    });
+  }
+
+  sheet.autoResizeColumns(1, headers.length);
+
+  sheet.setColumnWidth(12, 450);
+  sheet.setColumnWidth(14, 500);
+  sheet.setColumnWidth(15, 800);
+
+  if (sheet.getFilter()) {
+    sheet.getFilter().remove();
+  }
+
+  sheet.getRange(1, 1, Math.max(outputRows.length + 1, 1), headers.length).createFilter();
+}
+
+
+/****************************************************
+ * Статусы заявок
+ ****************************************************/
+
+function isRelevantRequestState_(state) {
+  return isPlannedRequestState_(state) || isStartedOrCompletedRequestState_(state);
+}
+
+
+function isPlannedRequestState_(state) {
+  const normalized = normalizeText_(state);
+
+  return DEALS_CONFIG.plannedRequestStates.some(allowedState => {
+    return normalized === normalizeText_(allowedState);
+  });
+}
+
+
+function isStartedRequestState_(state) {
+  const normalized = normalizeText_(state);
+
+  return DEALS_CONFIG.startedRequestStates.some(startedState => {
+    return normalized === normalizeText_(startedState);
+  });
+}
+
+
+function isCompletedRequestState_(state) {
+  const normalized = normalizeText_(state);
+
+  return DEALS_CONFIG.completedRequestStates.some(completedState => {
+    return normalized === normalizeText_(completedState);
+  });
+}
+
+
+function isStartedOrCompletedRequestState_(state) {
+  return isStartedRequestState_(state) || isCompletedRequestState_(state);
+}
+
+
+function normalizeOutputState_(state) {
+  if (isStartedOrCompletedRequestState_(state)) {
+    return DEALS_CONFIG.resultStatuses.started;
+  }
+
+  if (isPlannedRequestState_(state)) {
+    return DEALS_CONFIG.resultStatuses.planned;
+  }
+
+  return String(state || '').trim();
+}
+
+
+/****************************************************
+ * Ключи сопоставления без даты
+ ****************************************************/
+
+function buildExactServiceMatchKeyWithoutDate_(clientCode, branch, nomenclature) {
+  return [
+    normalizeCode_(clientCode),
+    normalizeText_(branch),
+    normalizeNomenclature_(nomenclature)
+  ].join('|');
+}
+
+
+function buildCategoryServiceMatchKeyWithoutDate_(clientCode, branch, category) {
+  return [
+    normalizeCode_(clientCode),
+    normalizeText_(branch),
+    String(category || '').trim()
+  ].join('|');
+}
+
+
+function normalizeCode_(value) {
+  return String(value || '')
+    .replace(/\s+/g, '')
+    .trim();
+}
+
+
+function normalizeNomenclature_(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+
+/****************************************************
+ * Логика кабинетов и типов услуг
+ ****************************************************/
+
+function detectRequestServiceCategoryByCabinet_(cabinet) {
+  const text = normalizeText_(cabinet);
+
+  if (text.indexOf('фтл') !== -1) {
+    return 'LASER';
+  }
+
+  if (text.indexOf('магнит') !== -1) {
+    return 'SIS';
+  }
+
+  return '';
+}
+
+
+function detectAppointmentServiceCategory_(nomenclature) {
+  const text = normalizeText_(nomenclature);
+
+  if (
+    text.indexOf('mls') !== -1 ||
+    text.indexOf('лазер') !== -1 ||
+    text.indexOf('лазеротерап') !== -1
+  ) {
+    return 'LASER';
+  }
+
+  if (
+    text.indexOf('sis') !== -1 ||
+    text.indexOf('магнит') !== -1 ||
+    text.indexOf('магнитотерап') !== -1
+  ) {
+    return 'SIS';
+  }
+
+  return '';
+}
+
+
+/****************************************************
+ * Форматирование
+ ****************************************************/
+
+function formatRequestShort_(req) {
+  return [
+    req.number ? '№' + req.number : 'без номера',
+    normalizeOutputState_(req.state),
+    formatDateTimeForText_(req.startDateRaw),
+    req.nomenclature || req.cabinet || ''
+  ].filter(Boolean).join(' / ');
+}
+
+
+function formatDateRu_(dateObj) {
+  if (!dateObj) {
+    return '';
+  }
+
+  const d = String(dateObj.getDate()).padStart(2, '0');
+  const m = String(dateObj.getMonth() + 1).padStart(2, '0');
+  const y = dateObj.getFullYear();
+
+  return d + '.' + m + '.' + y;
+}
+
+
+function formatDateTimeForText_(value) {
+  if (!value) {
+    return '';
+  }
+
+  if (Object.prototype.toString.call(value) === '[object Date]' && !isNaN(value)) {
+    const d = String(value.getDate()).padStart(2, '0');
+    const m = String(value.getMonth() + 1).padStart(2, '0');
+    const y = value.getFullYear();
+    const hh = String(value.getHours()).padStart(2, '0');
+    const mm = String(value.getMinutes()).padStart(2, '0');
+
+    if (hh === '00' && mm === '00') {
+      return d + '.' + m + '.' + y;
+    }
+
+    return d + '.' + m + '.' + y + ' ' + hh + ':' + mm;
+  }
+
+  return String(value || '').trim();
+}
+
+
+function formatMoneyForText_(value) {
+  const num = Number(value) || 0;
+
+  return num
+    .toLocaleString('ru-RU', {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 2
+    }) + ' ₽';
+}
+
+
+/****************************************************
+ * Общие helpers
+ ****************************************************/
+
+function readSheetAsObjects_(sheet) {
+  const values = sheet.getDataRange().getValues();
+
+  if (values.length < 2) {
+    return [];
+  }
+
+  const headers = values[0].map(h => String(h || '').trim());
+
+  return values.slice(1).map(row => {
+    const obj = {};
+    headers.forEach((header, i) => {
+      obj[header] = row[i];
+    });
+    return obj;
+  });
+}
+
+
+function getRequiredSheet_(ss, name) {
+  const sheet = ss.getSheetByName(name);
+
+  if (!sheet) {
+    throw new Error('Не найден лист "' + name + '". Проверь название листа в DEALS_CONFIG.');
+  }
+
+  return sheet;
+}
+
+
+function normalizeText_(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+
+function parseDateOnly_(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (Object.prototype.toString.call(value) === '[object Date]' && !isNaN(value)) {
+    return new Date(value.getFullYear(), value.getMonth(), value.getDate());
+  }
+
+  if (typeof value === 'number') {
+    const parsedNumberDate = new Date(Math.round((value - 25569) * 86400 * 1000));
+    if (!isNaN(parsedNumberDate)) {
+      return new Date(
+        parsedNumberDate.getFullYear(),
+        parsedNumberDate.getMonth(),
+        parsedNumberDate.getDate()
+      );
+    }
+  }
+
+  const text = String(value).trim();
+
+  const matchRu = text.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+  if (matchRu) {
+    return new Date(
+      Number(matchRu[3]),
+      Number(matchRu[2]) - 1,
+      Number(matchRu[1])
+    );
+  }
+
+  const matchIso = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (matchIso) {
+    return new Date(
+      Number(matchIso[1]),
+      Number(matchIso[2]) - 1,
+      Number(matchIso[3])
+    );
+  }
+
+  const parsed = new Date(text);
+  if (!isNaN(parsed)) {
+    return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
+  }
+
+  return null;
+}
+
+
+function formatDateKey_(dateObj) {
+  const y = dateObj.getFullYear();
+  const m = String(dateObj.getMonth() + 1).padStart(2, '0');
+  const d = String(dateObj.getDate()).padStart(2, '0');
+
+  return y + '-' + m + '-' + d;
+}
+
+
+function parseNumber_(value) {
+  if (typeof value === 'number') {
+    return value;
+  }
+
+  if (value === null || value === undefined || value === '') {
+    return 0;
+  }
+
+  const text = String(value)
+    .replace(/\s+/g, '')
+    .replace(',', '.');
+
+  const num = Number(text);
+
+  return isNaN(num) ? 0 : num;
+}
