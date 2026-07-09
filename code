@@ -35,9 +35,8 @@ const DEALS_CONFIG = {
   appointmentsSheetName: 'Назначения',
   requestsSheetName: 'Заявки',
   outputSheetName: 'Сделки',
-  bitrixDealsSheetName: 'Сделки Bitrix',
+  bitrixDealsSheetName: 'Сделки в Битрикс',
   aiWebhookUrl: 'https://n8n-x3.tech.temed.ru/webhook/deal-patient-context-v2',
-  bitrixWebhookUrlProperty: 'BITRIX_WEBHOOK_URL',
   minBitrixDealAmount: MIN_BITRIX_DEAL_AMOUNT,
 
   appointmentColumns: {
@@ -114,10 +113,9 @@ function onOpen() {
     .createMenu('TEMED сделки')
     .addItem('Сформировать лист "Сделки"', 'buildDealsSheet')
     .addSeparator()
-    .addItem('Сформировать лист "Сделки Bitrix"', 'buildBitrixDealsSheet')
+    .addItem('Сделки в Битрикс', 'buildBitrixDealsSheet')
     .addItem('Запросить AI справки для Bitrix', 'requestAiSummariesForBitrixDeals')
     .addItem('Собрать описания для Bitrix', 'buildFinalBitrixDescriptions')
-    .addItem('Отправить готовые сделки в Bitrix', 'sendReadyBitrixDealsToBitrix')
     .addToUi();
 }
 
@@ -163,7 +161,7 @@ function buildDealsSheet() {
 
 
 /****************************************************
- * Сделки Bitrix: 1 пациент + 1 филиал = 1 сделка
+ * Сделки в Битрикс: 1 пациент + 1 филиал = 1 сделка
  ****************************************************/
 
 const BITRIX_DEALS_HEADERS = [
@@ -254,6 +252,7 @@ function buildBitrixDealsSheet() {
   });
 
   const outputRows = Array.from(groups.values())
+    .filter(group => group.amount >= DEALS_CONFIG.minBitrixDealAmount)
     .sort((a, b) => {
       const dateDiff = (a.firstPlanDate ? a.firstPlanDate.getTime() : 0) - (b.firstPlanDate ? b.firstPlanDate.getTime() : 0);
       if (dateDiff !== 0) return dateDiff;
@@ -264,11 +263,10 @@ function buildBitrixDealsSheet() {
       return a.branch.localeCompare(b.branch, 'ru');
     })
     .map(group => {
-      const isBelowMinAmount = group.amount < DEALS_CONFIG.minBitrixDealAmount;
       return [
         group.dealKey,
-        isBelowMinAmount ? 'Не отправлять: сумма < 20 000' : 'Новая',
-        isBelowMinAmount ? 'Не требуется' : 'Не запрошено',
+        'Новая',
+        'Не запрошено',
         group.patientCode,
         group.patientName,
         group.branch,
@@ -283,7 +281,7 @@ function buildBitrixDealsSheet() {
         '',
         '',
         '',
-        isBelowMinAmount ? 'Сумма сделки меньше минимального порога 20 000 ₽' : '',
+        '',
         '',
         ''
       ];
@@ -311,10 +309,6 @@ function requestAiSummariesForBitrixDeals() {
     const dealAmount = parseNumber_(row['Сумма сделки']);
 
     if (dealAmount < DEALS_CONFIG.minBitrixDealAmount) {
-      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Статус отправки', 'Не отправлять: сумма < 20 000');
-      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI статус', 'Не требуется');
-      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', 'Сумма сделки меньше минимального порога 20 000 ₽');
-      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI updated_at', now);
       return;
     }
 
@@ -390,98 +384,6 @@ function buildFinalBitrixDescriptions() {
   });
 }
 
-
-function sendReadyBitrixDealsToBitrix() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = getRequiredSheet_(ss, DEALS_CONFIG.bitrixDealsSheetName);
-  const data = readSheetWithHeaders_(sheet);
-  const bitrixWebhookUrl = String(PropertiesService.getScriptProperties().getProperty(DEALS_CONFIG.bitrixWebhookUrlProperty) || '').trim();
-
-  if (!bitrixWebhookUrl) {
-    throw new Error('Не задан Script Property ' + DEALS_CONFIG.bitrixWebhookUrlProperty + ' с URL вебхука Bitrix24.');
-  }
-
-  data.rows.forEach((row, i) => {
-    if (String(row['Статус отправки'] || '').trim() !== 'Готова к отправке') {
-      return;
-    }
-
-    const rowNumber = i + 2;
-    const dealAmount = parseNumber_(row['Сумма сделки']);
-
-    if (dealAmount < DEALS_CONFIG.minBitrixDealAmount) {
-      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Статус отправки', 'Не отправлять: сумма < 20 000');
-      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', 'Сумма сделки меньше минимального порога 20 000 ₽');
-      return;
-    }
-
-    const payload = buildBitrixDealPayload_(row);
-
-    try {
-      const response = UrlFetchApp.fetch(normalizeBitrixMethodUrl_(bitrixWebhookUrl, 'crm.deal.add'), {
-        method: 'post',
-        contentType: 'application/json',
-        payload: JSON.stringify(payload),
-        muteHttpExceptions: true
-      });
-      const code = response.getResponseCode();
-      const body = response.getContentText() || '';
-      const parsed = parseJsonSafely_(body);
-
-      if (code >= 200 && code < 300 && parsed && parsed.result) {
-        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Статус отправки', 'Отправлена');
-        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Bitrix Deal ID', parsed.result);
-        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', '');
-      } else {
-        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Статус отправки', 'Ошибка');
-        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', extractErrorText_(parsed, body, code));
-      }
-    } catch (err) {
-      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Статус отправки', 'Ошибка');
-      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', err && err.message ? err.message : String(err));
-    }
-  });
-}
-
-
-function buildBitrixDealPayload_(row) {
-  return {
-    fields: {
-      TITLE: String(row['ФИО'] || '').trim() + ' — ' + String(row['Филиал'] || '').trim(),
-      OPPORTUNITY: parseNumber_(row['Сумма сделки']),
-      CURRENCY_ID: 'RUB',
-      COMMENTS: buildBitrixDealComments_(row)
-    },
-    params: {
-      REGISTER_SONET_EVENT: 'Y'
-    }
-  };
-}
-
-
-function buildBitrixDealComments_(row) {
-  return [
-    'ФИО: ' + String(row['ФИО'] || '').trim(),
-    'Пациент.Код: ' + String(row['Пациент.Код'] || '').trim(),
-    'Филиал: ' + String(row['Филиал'] || '').trim(),
-    'Сумма сделки: ' + formatMoneyForText_(parseNumber_(row['Сумма сделки'])),
-    'УИДы: ' + String(row['УИДы'] || '').trim(),
-    'Первый плановый день: ' + formatDateTimeForText_(row['Первый плановый день']),
-    '',
-    String(row['Описание для Bitrix'] || '').trim()
-  ].join('\n');
-}
-
-
-function normalizeBitrixMethodUrl_(webhookUrl, methodName) {
-  const base = String(webhookUrl || '').trim().replace(/\/+$/g, '');
-
-  if (base.match(new RegExp('/' + methodName + '(\\.json)?$', 'i'))) {
-    return base;
-  }
-
-  return base + '/' + methodName + '.json';
-}
 
 
 function buildBitrixDealKey_(patientCode, branch) {
