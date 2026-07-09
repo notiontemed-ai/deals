@@ -106,6 +106,19 @@ const DEALS_CONFIG = {
  * Главная функция запуска
  ****************************************************/
 
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('TEMED сделки')
+    .addItem('Сформировать лист "Сделки"', 'buildDealsSheet')
+    .addSeparator()
+    .addItem('Сформировать лист "Сделки Bitrix"', 'buildBitrixDealsSheet')
+    .addItem('Запросить AI справки для Bitrix', 'requestAiSummariesForBitrixDeals')
+    .addItem('Собрать описания для Bitrix', 'buildFinalBitrixDescriptions')
+    .addItem('Отправить готовые сделки в Bitrix', 'sendReadyBitrixDealsToBitrix')
+    .addToUi();
+}
+
+
 function buildDealsSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
