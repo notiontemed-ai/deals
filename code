@@ -178,6 +178,8 @@ const BITRIX_DEALS_HEADERS = [
   'Кол-во назначений',
   'Состав назначений',
   'Ближайшие заявки пациента',
+  'Телефон клиента',
+  'Комментарий администратора',
   'Описание назначений',
   'AI справка',
   'Описание для Bitrix',
@@ -277,6 +279,8 @@ function buildBitrixDealsSheet() {
         group.uids.length,
         aggregateAppointmentCompositionText_(group.compositions),
         group.nearestRequests.join('\n'),
+        '', // Телефон клиента — заполнит n8n
+        '', // Комментарий администратора — заполнит n8n
         buildBitrixDealAppointmentsDescription_(group),
         '',
         '',
@@ -471,18 +475,20 @@ function writeBitrixDealsOutput_(ss, outputRows) {
   const totalRows = Math.max(outputRows.length, 1);
   sheet.getRange(2, 7, totalRows, 1).setNumberFormat('#,##0.00');
   sheet.getRange(2, 8, totalRows, 1).setNumberFormat('dd.MM.yyyy');
-  sheet.getRange(2, 20, totalRows, 1).setNumberFormat('dd.MM.yyyy HH:mm:ss');
+  sheet.getRange(2, 22, totalRows, 1).setNumberFormat('dd.MM.yyyy HH:mm:ss');
 
   if (outputRows.length > 0) {
-    sheet.getRange(2, 12, outputRows.length, 5).setWrap(true);
+    sheet.getRange(2, 12, outputRows.length, 7).setWrap(true);
   }
 
   sheet.autoResizeColumns(1, BITRIX_DEALS_HEADERS.length);
   sheet.setColumnWidth(12, 450);
   sheet.setColumnWidth(13, 500);
-  sheet.setColumnWidth(14, 800);
-  sheet.setColumnWidth(15, 600);
+  sheet.setColumnWidth(14, 180);
+  sheet.setColumnWidth(15, 450);
   sheet.setColumnWidth(16, 800);
+  sheet.setColumnWidth(17, 600);
+  sheet.setColumnWidth(18, 800);
 
   if (sheet.getFilter()) {
     sheet.getFilter().remove();
