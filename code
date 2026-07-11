@@ -227,7 +227,7 @@ function buildBitrixDealsSheet() {
     }
 
     const group = groups.get(dealKey);
-    const planDate = parseDateOnly_(row['Первый плановый день']);
+    const planDate = parseBitrixDealPlanDate_(row);
 
     group.amount += parseNumber_(row['Сумма к продаже']);
 
@@ -379,7 +379,7 @@ function buildFinalBitrixDescriptions() {
     const aiSummary = String(row['AI справка'] || '').trim();
     const appointmentsDescription = String(row['Описание назначений'] || '').trim();
     const finalDescription = aiSummary
-      ? aiSummary + '\n\n---\n\nНАЗНАЧЕНИЯ К ПРОДАЖЕ:\n\n' + appointmentsDescription
+      ? aiSummary + '\n\n---\n\nНАЗНАЧЕНИЯ:\n\n' + appointmentsDescription
       : appointmentsDescription;
     const rowNumber = i + 2;
 
@@ -429,26 +429,84 @@ function parseCompositionLine_(line) {
 
 
 function buildBitrixDealAppointmentsDescription_(group) {
-  const lines = ['Назначения к продаже:', ''];
+  const lines = ['Назначения:', ''];
 
-  group.uidRows.forEach((row, i) => {
+  const firstPlanDate = getFirstDateFromUidRows_(group.uidRows) || group.firstPlanDate || null;
+  const doctorGroups = groupUidRowsByDoctor_(group.uidRows);
+
+  lines.push('Первый плановый день: ' + formatDateRu_(firstPlanDate));
+  lines.push('Общая сумма: ' + formatMoneyForText_(group.amount));
+  lines.push('');
+
+  doctorGroups.forEach((doctorGroup, i) => {
     if (i > 0) {
       lines.push('');
     }
 
-    lines.push((i + 1) + ') УИД: ' + row.uid);
-    lines.push('Первый плановый день: ' + formatDateRu_(row.firstPlanDate));
-    lines.push('Врач: ' + row.doctor);
+    lines.push('Врач: ' + (doctorGroup.doctor || 'Не указан'));
     lines.push('Состав назначений:');
 
-    if (row.composition) {
-      splitLines_(row.composition).forEach(line => lines.push(line));
+    const composition = aggregateAppointmentCompositionText_(
+      doctorGroup.rows.map(row => row.composition).filter(Boolean)
+    );
+
+    if (composition) {
+      splitLines_(composition).forEach(line => lines.push('- ' + line));
     }
 
-    lines.push('Сумма: ' + formatMoneyForText_(row.amount));
+    const amount = doctorGroup.rows.reduce((sum, row) => {
+      return sum + (Number(row.amount) || 0);
+    }, 0);
+
+    lines.push('Сумма: ' + formatMoneyForText_(amount));
   });
 
   return lines.join('\n');
+}
+
+
+function getFirstDateFromUidRows_(uidRows) {
+  const dates = (uidRows || [])
+    .map(row => row.firstPlanDate)
+    .filter(date => Object.prototype.toString.call(date) === '[object Date]' && !isNaN(date));
+
+  if (!dates.length) {
+    return null;
+  }
+
+  dates.sort((a, b) => a.getTime() - b.getTime());
+  return dates[0];
+}
+
+
+function groupUidRowsByDoctor_(uidRows) {
+  const groups = new Map();
+
+  (uidRows || []).forEach(row => {
+    const doctor = String(row.doctor || '').trim() || 'Не указан';
+
+    if (!groups.has(doctor)) {
+      groups.set(doctor, {
+        doctor,
+        rows: []
+      });
+    }
+
+    groups.get(doctor).rows.push(row);
+  });
+
+  return Array.from(groups.values());
+}
+
+
+function parseBitrixDealPlanDate_(row) {
+  return (
+    parseDateOnly_(row['Первый плановый день']) ||
+    parseDateOnly_(row['Дата лечения']) ||
+    parseDateOnly_(row['ДатаЛечения']) ||
+    parseDateOnly_(row['Дата']) ||
+    null
+  );
 }
 
 
