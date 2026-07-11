@@ -119,6 +119,9 @@ function onOpen() {
     .addItem('Запросить AI справки для Bitrix', 'requestAiSummariesForBitrixDeals')
     .addItem('Собрать описания для Bitrix', 'buildFinalBitrixDescriptions')
     .addSeparator()
+    .addItem('Обновить справочник сотрудников Bitrix', 'updateBitrixEmployeesDirectory')
+    .addItem('Отправить сделки в Bitrix', 'uploadBitrixDeals')
+    .addItem('Проверить поля Bitrix', 'debugBitrixDealFields')
     .addItem('Проверить дубли отправки Bitrix', 'checkBitrixDuplicateRegistry')
     .addToUi();
 }
@@ -192,6 +195,7 @@ const BITRIX_DEALS_HEADERS = [
   'AI справка',
   'Описание для Bitrix',
   'Bitrix Deal ID',
+  'Bitrix sent_at',
   'Ошибка',
   'AI request_id',
   'AI updated_at'
@@ -305,6 +309,7 @@ function buildBitrixDealsSheet() {
         '', // Телефон клиента — заполнит n8n
         '', // Комментарий администратора — заполнит n8n
         buildBitrixDealAppointmentsDescription_(group),
+        '',
         '',
         '',
         '',
@@ -517,8 +522,8 @@ function buildDealHashFromUids_(uids) {
     .join('');
 }
 
-function appendSentUidsToBitrixRegistry_(ss, dealRow, bitrixDealId) {
-  return appendUidsToBitrixRegistry_(ss, dealRow, bitrixDealId, 'sent_to_bitrix', '');
+function appendSentUidsToBitrixRegistry_(ss, dealRow, bitrixDealId, status, comment) {
+  return appendUidsToBitrixRegistry_(ss, dealRow, bitrixDealId, status || 'sent_to_bitrix', comment || '');
 }
 
 function appendBitrixRegistryError_(ss, dealRow, errorText) {
@@ -527,10 +532,7 @@ function appendBitrixRegistryError_(ss, dealRow, errorText) {
 
 function appendUidsToBitrixRegistry_(ss, dealRow, bitrixDealId, status, comment) {
   const sheet = getOrCreateBitrixRegistrySheet_(ss);
-  const uids = String(dealRow['УИДы'] || dealRow['TEMED_UIDS'] || '')
-    .split(',')
-    .map(uid => uid.trim())
-    .filter(Boolean);
+  const uids = splitUids_(dealRow['УИДы'] || dealRow['TEMED_UIDS']);
   const now = new Date();
 
   if (!uids.length) {
@@ -583,9 +585,6 @@ function checkBitrixDuplicateRegistry() {
     '. sent_to_bitrix без Bitrix Deal ID: ' + sentWithoutDealIdCount + '.'
   );
 }
-
-// TODO: перед созданием сделки в Bitrix искать существующую сделку по TEMED_DEAL_HASH,
-// не создавать дубль при совпадении и затем записывать УИДы в реестр через appendSentUidsToBitrixRegistry_().
 
 
 function aggregateAppointmentCompositionText_(compositionTexts) {
@@ -1725,4 +1724,416 @@ function parseNumber_(value) {
   const num = Number(text);
 
   return isNaN(num) ? 0 : num;
+}
+
+
+function getOrCreateSheet_(ss, sheetName) {
+  let sheet = ss.getSheetByName(sheetName);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(sheetName);
+  }
+
+  return sheet;
+}
+
+/****************************************************
+ * Интеграция Bitrix24: отправка сделок и сотрудники
+ ****************************************************/
+
+const BITRIX_DEAL_CATEGORY_ID = 114;
+const BITRIX_DEAL_ASSIGNED_BY_ID = 22718;
+const BITRIX_EMPLOYEES_SHEET_NAME = 'Справочник сотрудников';
+const BITRIX_DEAL_SUCCESS_STATUSES = ['Отправлено', 'sent_to_bitrix', 'Уже существует в Bitrix'];
+
+function bitrixCall_(method, payload) {
+  const props = PropertiesService.getScriptProperties();
+  const baseUrl = props.getProperty('BITRIX_WEBHOOK_BASE_URL');
+
+  if (!baseUrl) {
+    throw new Error('Не задано свойство BITRIX_WEBHOOK_BASE_URL');
+  }
+
+  const url = baseUrl.replace(/\/+$/, '') + '/' + method + '.json';
+
+  const response = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload || {}),
+    muteHttpExceptions: true
+  });
+
+  const text = response.getContentText();
+  let data;
+
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    throw new Error('Bitrix вернул не JSON: ' + text);
+  }
+
+  if (data.error) {
+    throw new Error(data.error + ': ' + (data.error_description || ''));
+  }
+
+  return data.result;
+}
+
+function updateBitrixEmployeesDirectory() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = getOrCreateSheet_(ss, BITRIX_EMPLOYEES_SHEET_NAME);
+  const employees = fetchAllBitrixUsers_();
+  const headers = [
+    'Bitrix User ID',
+    'ФИО',
+    'Имя',
+    'Фамилия',
+    'Отчество',
+    'Email',
+    'Активен',
+    'Должность',
+    'Подразделение',
+    'Дата обновления'
+  ];
+  const now = new Date();
+  const rows = employees.map(user => {
+    const lastName = String(user.LAST_NAME || '').trim();
+    const name = String(user.NAME || '').trim();
+    const secondName = String(user.SECOND_NAME || '').trim();
+    const fullName = [lastName, name, secondName].filter(Boolean).join(' ').trim();
+    const departments = Array.isArray(user.UF_DEPARTMENT)
+      ? user.UF_DEPARTMENT.join(', ')
+      : String(user.UF_DEPARTMENT || '');
+
+    return [
+      user.ID || '',
+      fullName,
+      name,
+      lastName,
+      secondName,
+      user.EMAIL || '',
+      user.ACTIVE || '',
+      user.WORK_POSITION || '',
+      departments,
+      now
+    ];
+  });
+
+  sheet.clear();
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+
+  if (rows.length) {
+    sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
+  }
+
+  sheet.setFrozenRows(1);
+  sheet.autoResizeColumns(1, headers.length);
+  SpreadsheetApp.getUi().alert('Справочник сотрудников обновлен. Загружено сотрудников: ' + rows.length);
+}
+
+function fetchAllBitrixUsers_() {
+  const result = [];
+  let start = 0;
+
+  while (true) {
+    const response = bitrixCall_('user.get', {
+      FILTER: { ACTIVE: true },
+      start: start
+    });
+    const users = Array.isArray(response) ? response : [];
+    result.push.apply(result, users);
+
+    if (users.length < 50) {
+      break;
+    }
+
+    start += 50;
+  }
+
+  return result;
+}
+
+function readBitrixEmployeesMap_(ss) {
+  const sheet = ss.getSheetByName(BITRIX_EMPLOYEES_SHEET_NAME);
+
+  if (!sheet) {
+    return new Map();
+  }
+
+  const values = sheet.getDataRange().getValues();
+
+  if (values.length < 2) {
+    return new Map();
+  }
+
+  const headers = values[0].map(String);
+  const idIndex = headers.indexOf('Bitrix User ID');
+  const fioIndex = headers.indexOf('ФИО');
+  const activeIndex = headers.indexOf('Активен');
+  const map = new Map();
+
+  if (idIndex === -1 || fioIndex === -1) {
+    return map;
+  }
+
+  values.slice(1).forEach(row => {
+    const id = String(row[idIndex] || '').trim();
+    const fio = String(row[fioIndex] || '').trim();
+    const active = activeIndex === -1 ? 'true' : String(row[activeIndex] || '').trim();
+
+    if (!id || !fio) {
+      return;
+    }
+
+    if (active && active.toLowerCase() !== 'true' && active.toLowerCase() !== 'y' && active.toLowerCase() !== 'да' && active !== '1') {
+      return;
+    }
+
+    map.set(normalizeDoctorName_(fio), id);
+  });
+
+  return map;
+}
+
+function normalizeDoctorName_(value) {
+  return String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function uploadBitrixDeals() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = getRequiredSheet_(ss, DEALS_CONFIG.bitrixDealsSheetName);
+  ensureBitrixDealsUploadColumns_(sheet);
+  const data = readSheetWithHeaders_(sheet);
+  const registry = readBitrixSentUidRegistry_(ss);
+  const doctorUserMap = readBitrixEmployeesMap_(ss);
+  const now = new Date();
+  let sentCount = 0;
+  let existingCount = 0;
+  let skippedCount = 0;
+  let errorCount = 0;
+
+  data.rows.forEach((row, i) => {
+    const rowNumber = i + 2;
+    const uids = splitUids_(row['УИДы'] || row['TEMED_UIDS']);
+    const status = String(row['Статус отправки'] || '').trim();
+    const bitrixDealId = String(row['Bitrix Deal ID'] || '').trim();
+
+    if (isEmptyBitrixDealRow_(row)) {
+      skippedCount += 1;
+      return;
+    }
+
+    if (bitrixDealId || BITRIX_DEAL_SUCCESS_STATUSES.indexOf(status) !== -1) {
+      skippedCount += 1;
+      return;
+    }
+
+    const alreadySent = uids.filter(uid => registry.sentUidSet.has(uid));
+
+    if (uids.length && alreadySent.length === uids.length) {
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', 'Все УИДы уже есть в реестре отправки Bitrix: ' + alreadySent.join(', '));
+      skippedCount += 1;
+      return;
+    }
+
+    if (alreadySent.length) {
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Статус отправки', 'Ошибка');
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', 'Часть УИДов уже есть в реестре отправки Bitrix. Пересоберите лист, чтобы отправить только новые УИДы: ' + alreadySent.join(', '));
+      skippedCount += 1;
+      return;
+    }
+
+    try {
+      const dealHash = String(row['Deal Hash'] || row['TEMED_DEAL_HASH'] || '').trim() || buildDealHashFromUids_(uids);
+      const existingDeal = findBitrixDealByHash_(dealHash);
+
+      if (existingDeal) {
+        const comment = String(row['Ошибка'] || '').trim();
+        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Bitrix Deal ID', existingDeal.ID || '');
+        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Статус отправки', 'Уже существует в Bitrix');
+        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Bitrix sent_at', now);
+        appendSentUidsToBitrixRegistry_(ss, row, existingDeal.ID || '', 'sent_to_bitrix', comment);
+        existingCount += 1;
+        return;
+      }
+
+      const created = createBitrixDealFromRow_(row, doctorUserMap);
+      const warningText = created.warnings.join('\n');
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Bitrix Deal ID', created.dealId);
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Статус отправки', 'Отправлено');
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', warningText);
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Bitrix sent_at', now);
+      appendSentUidsToBitrixRegistry_(ss, row, created.dealId, 'sent_to_bitrix', warningText);
+      created.uids.forEach(uid => registry.sentUidSet.add(uid));
+      sentCount += 1;
+    } catch (err) {
+      const errorText = err && err.message ? err.message : String(err);
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Статус отправки', 'Ошибка');
+      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', errorText);
+      appendUidsToBitrixRegistry_(ss, row, '', 'error', errorText);
+      errorCount += 1;
+    }
+  });
+
+  SpreadsheetApp.getUi().alert(
+    'Отправка завершена. Создано: ' + sentCount +
+    ', найдено дублей в Bitrix: ' + existingCount +
+    ', пропущено: ' + skippedCount +
+    ', ошибок: ' + errorCount + '.'
+  );
+}
+
+function isEmptyBitrixDealRow_(row) {
+  return !String(row['DealKey'] || '').trim() &&
+    !String(row['ФИО'] || '').trim() &&
+    !String(row['УИДы'] || row['TEMED_UIDS'] || '').trim();
+}
+
+function ensureBitrixDealsUploadColumns_(sheet) {
+  const required = ['Статус отправки', 'Bitrix Deal ID', 'Ошибка', 'Bitrix sent_at'];
+  const lastColumn = sheet.getLastColumn();
+  const headers = lastColumn > 0
+    ? sheet.getRange(1, 1, 1, lastColumn).getValues()[0].map(header => String(header || '').trim())
+    : [];
+  const missing = required.filter(header => headers.indexOf(header) === -1);
+
+  if (missing.length) {
+    sheet.getRange(1, headers.length + 1, 1, missing.length).setValues([missing]);
+  }
+}
+
+function findBitrixDealByHash_(dealHash) {
+  if (!dealHash) {
+    return null;
+  }
+
+  const result = bitrixCall_('crm.deal.list', {
+    filter: {
+      CATEGORY_ID: BITRIX_DEAL_CATEGORY_ID,
+      UF_CRM_1783751578: dealHash
+    },
+    select: ['ID', 'TITLE', 'CATEGORY_ID', 'UF_CRM_1783751578']
+  });
+
+  if (Array.isArray(result) && result.length) {
+    return result[0];
+  }
+
+  return null;
+}
+
+function createBitrixDealFromRow_(row, doctorUserMap) {
+  const warnings = [];
+  const uids = splitUids_(row['УИДы'] || row['TEMED_UIDS']);
+  const dealHash = String(row['Deal Hash'] || row['TEMED_DEAL_HASH'] || '').trim() || buildDealHashFromUids_(uids);
+  const doctorName = String(row['Врач'] || '').trim();
+  const doctorUserId = doctorUserMap.get(normalizeDoctorName_(doctorName));
+  const appointmentsText = row['Описание назначений'] || row['Описание для Bitrix'] || '';
+  const fields = {
+    CATEGORY_ID: BITRIX_DEAL_CATEGORY_ID,
+    ASSIGNED_BY_ID: BITRIX_DEAL_ASSIGNED_BY_ID,
+    TITLE: buildBitrixDealTitle_(row),
+    OPPORTUNITY: parseMoney_(row['Сумма сделки']),
+    CURRENCY_ID: 'RUB',
+    UF_CRM_1737550182812: row['ФИО'] || '',
+    UF_CRM_1759810401: row['Филиал'] || row['Клиника'] || '',
+    UF_CRM_1737550697075: row['Комментарий администратора'] || '',
+    UF_CRM_1783751372: uids,
+    UF_CRM_1783751578: dealHash,
+    UF_CRM_1783752197: appointmentsText,
+    UF_CRM_1783752297: row['AI справка'] || ''
+  };
+
+  if (doctorUserId) {
+    fields.UF_CRM_1624006506 = Number(doctorUserId);
+  } else if (doctorName) {
+    warnings.push('Врач не сопоставлен с сотрудником Bitrix: ' + doctorName);
+  }
+
+  const firstPlanDate = parseDateForBitrix_(row['Первый плановый день']);
+  if (firstPlanDate) {
+    fields.UF_CRM_1783751996 = firstPlanDate;
+  }
+
+  const dealId = bitrixCall_('crm.deal.add', {
+    fields: fields,
+    params: { REGISTER_SONET_EVENT: 'Y' }
+  });
+
+  return { dealId, dealHash, uids, warnings };
+}
+
+function debugBitrixDealFields() {
+  const fields = bitrixCall_('crm.deal.fields', {});
+  const needed = [
+    'UF_CRM_1737550182812',
+    'UF_CRM_1759810401',
+    'UF_CRM_1737550697075',
+    'UF_CRM_1624006506',
+    'UF_CRM_1783751372',
+    'UF_CRM_1783751578',
+    'UF_CRM_1783751996',
+    'UF_CRM_1783752197',
+    'UF_CRM_1783752297'
+  ];
+
+  needed.forEach(code => {
+    Logger.log(code + ': ' + JSON.stringify(fields[code]));
+  });
+}
+
+function splitUids_(value) {
+  return String(value || '').split(/[\n,;]+/).map(s => s.trim()).filter(Boolean);
+}
+
+function parseMoney_(value) {
+  if (typeof value === 'number') {
+    return value;
+  }
+
+  const normalized = String(value || '')
+    .replace(/\s+/g, '')
+    .replace(/[₽рруб.]/gi, '')
+    .replace(',', '.');
+  const number = Number(normalized);
+
+  return isNaN(number) ? 0 : number;
+}
+
+function parseDateForBitrix_(value) {
+  if (!value) {
+    return '';
+  }
+
+  if (Object.prototype.toString.call(value) === '[object Date]' && !isNaN(value)) {
+    return Utilities.formatDate(value, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  }
+
+  const text = String(value).trim();
+  const match = text.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+
+  if (match) {
+    const day = match[1].padStart(2, '0');
+    const month = match[2].padStart(2, '0');
+    const year = match[3];
+    return year + '-' + month + '-' + day;
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    return text;
+  }
+
+  return '';
+}
+
+function buildBitrixDealTitle_(row) {
+  const patientName = String(row['ФИО'] || '').trim();
+  const clinic = String(row['Филиал'] || row['Клиника'] || '').trim();
+  const dealKey = String(row['DealKey'] || '').trim();
+
+  if (patientName) {
+    return 'Назначения TEMED — ' + patientName + (clinic ? ' — ' + clinic : '');
+  }
+
+  return 'Назначения TEMED — ' + (dealKey || 'без DealKey');
 }
