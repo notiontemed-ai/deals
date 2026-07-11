@@ -418,6 +418,37 @@ function buildFinalBitrixDescriptions() {
 
 
 
+
+function normalizeMultilineTextForBitrix_(value) {
+  return String(value || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n[ \t]+/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function formatAiSummaryForBitrix_(value) {
+  let text = normalizeMultilineTextForBitrix_(value);
+
+  if (text.indexOf('\n') !== -1) {
+    return text;
+  }
+
+  text = text
+    .replace(/\s*История взаимодействия:\s*/g, '\n\nИстория взаимодействия:\n')
+    .replace(/\s*Последний прием:\s*/g, '\n\nПоследний прием:\n')
+    .replace(/\s*Запись\/исполнение:\s*/g, '\n\nЗапись/исполнение:\n')
+    .replace(/\s*Комментарий администратора:\s*/g, '\n\nКомментарий администратора:\n')
+    .replace(/\s*Особенности коммуникации:\s*/g, '\n\nОсобенности коммуникации:\n')
+    .replace(/\s*КРАТКАЯ СПРАВКА ДЛЯ СДЕЛКИ\s*/g, 'КРАТКАЯ СПРАВКА ДЛЯ СДЕЛКИ\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  return text;
+}
+
 function buildBitrixDealKey_(patientCode, branch) {
   return String(patientCode || '').trim() + '|' + String(branch || '').trim();
 }
@@ -2028,7 +2059,14 @@ function createBitrixDealFromRow_(row, doctorUserMap) {
   const dealHash = String(row['Deal Hash'] || row['TEMED_DEAL_HASH'] || '').trim() || buildDealHashFromUids_(uids);
   const doctorName = String(row['Врач'] || '').trim();
   const doctorUserId = doctorUserMap.get(normalizeDoctorName_(doctorName));
-  const appointmentsText = row['Описание назначений'] || row['Описание для Bitrix'] || '';
+  const appointmentsText = normalizeMultilineTextForBitrix_(
+    row['Описание назначений'] || row['Назначения'] || ''
+  );
+  const aiSummary = formatAiSummaryForBitrix_(row['AI справка'] || '');
+  const adminComment = normalizeMultilineTextForBitrix_(
+    row['Комментарий администратора'] || ''
+  );
+  const phone = String(row['Телефон клиента'] || '').trim();
   const fields = {
     CATEGORY_ID: BITRIX_DEAL_CATEGORY_ID,
     ASSIGNED_BY_ID: BITRIX_DEAL_ASSIGNED_BY_ID,
@@ -2037,12 +2075,16 @@ function createBitrixDealFromRow_(row, doctorUserMap) {
     CURRENCY_ID: 'RUB',
     UF_CRM_1737550182812: row['ФИО'] || '',
     UF_CRM_1759810401: row['Филиал'] || row['Клиника'] || '',
-    UF_CRM_1737550697075: row['Комментарий администратора'] || '',
+    UF_CRM_1737550697075: adminComment,
     UF_CRM_1783751372: uids,
     UF_CRM_1783751578: dealHash,
     UF_CRM_1783752197: appointmentsText,
-    UF_CRM_1783752297: row['AI справка'] || ''
+    UF_CRM_1783752297: aiSummary
   };
+
+  if (phone) {
+    fields.UF_CRM_615C18C0D7CD9 = phone;
+  }
 
   if (doctorUserId) {
     fields.UF_CRM_1624006506 = Number(doctorUserId);
@@ -2074,7 +2116,8 @@ function debugBitrixDealFields() {
     'UF_CRM_1783751578',
     'UF_CRM_1783751996',
     'UF_CRM_1783752197',
-    'UF_CRM_1783752297'
+    'UF_CRM_1783752297',
+    'UF_CRM_615C18C0D7CD9'
   ];
 
   needed.forEach(code => {
