@@ -2170,12 +2170,11 @@ function parseDateForBitrix_(value) {
 }
 
 function buildBitrixDealTitle_(row) {
-  const patientName = String(row['ФИО'] || '').trim();
-  const clinic = String(row['Филиал'] || row['Клиника'] || '').trim();
+  const patientName = String(row['ФИО'] || row['ФИО пациента'] || '').trim();
   const dealKey = String(row['DealKey'] || '').trim();
 
   if (patientName) {
-    return 'Назначения TEMED — ' + patientName + (clinic ? ' — ' + clinic : '');
+    return patientName;
   }
 
   return 'Назначения TEMED — ' + (dealKey || 'без DealKey');
