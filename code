@@ -1777,6 +1777,46 @@ const BITRIX_DEAL_ASSIGNED_BY_ID = 22718;
 const BITRIX_EMPLOYEES_SHEET_NAME = 'Справочник сотрудников';
 const BITRIX_DEAL_SUCCESS_STATUSES = ['Отправлено', 'sent_to_bitrix', 'Уже существует в Bitrix'];
 
+function addBitrixDealComment_(dealId, text) {
+  if (!dealId || !text) {
+    return null;
+  }
+
+  return bitrixCall_('crm.timeline.comment.add', {
+    fields: {
+      ENTITY_ID: dealId,
+      ENTITY_TYPE: 'deal',
+      COMMENT: text
+    }
+  });
+}
+
+function buildBitrixDealTimelineComment_(row) {
+  const aiSummary = formatAiSummaryForBitrix_(row['AI справка'] || '');
+
+  const appointmentsTextRaw = row['Описание назначений'] || row['Назначения'] || '';
+  let appointmentsText = normalizeMultilineTextForBitrix_(appointmentsTextRaw);
+
+  appointmentsText = appointmentsText
+    .replace(/^Назначения:\s*/i, '')
+    .trim();
+
+  const parts = [];
+
+  if (aiSummary) {
+    parts.push(aiSummary);
+  }
+
+  if (appointmentsText) {
+    parts.push('НАЗНАЧЕНИЯ\n\n' + appointmentsText);
+  }
+
+  return parts
+    .filter(Boolean)
+    .join('\n\n---\n\n')
+    .trim();
+}
+
 function bitrixCall_(method, payload) {
   const props = PropertiesService.getScriptProperties();
   const baseUrl = props.getProperty('BITRIX_WEBHOOK_BASE_URL');
@@ -1989,13 +2029,32 @@ function uploadBitrixDeals() {
       }
 
       const created = createBitrixDealFromRow_(row, doctorUserMap);
-      const warningText = created.warnings.join('\n');
+      const warnings = created.warnings.slice();
+
+      try {
+        const timelineComment = buildBitrixDealTimelineComment_(row);
+
+        if (timelineComment) {
+          addBitrixDealComment_(created.dealId, timelineComment);
+        }
+      } catch (commentErr) {
+        const commentErrorText = commentErr && commentErr.message
+          ? commentErr.message
+          : String(commentErr);
+
+        warnings.push('Сделка создана, но комментарий в таймлайн не добавлен: ' + commentErrorText);
+      }
+
+      const warningText = warnings.join('\n');
+
       setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Bitrix Deal ID', created.dealId);
       setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Статус отправки', 'Отправлено');
       setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', warningText);
       setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Bitrix sent_at', now);
+
       appendSentUidsToBitrixRegistry_(ss, row, created.dealId, 'sent_to_bitrix', warningText);
       created.uids.forEach(uid => registry.sentUidSet.add(uid));
+
       sentCount += 1;
     } catch (err) {
       const errorText = err && err.message ? err.message : String(err);
