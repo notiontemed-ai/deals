@@ -897,6 +897,8 @@ function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient) {
 
   let resultStatus = DEALS_CONFIG.resultStatuses.createDeal;
 
+  // Статус определяется на уровне всего УИД: достаточно любого совпадения
+  // по любой услуге из состава УИД, с приоритетом "Начато" выше "Запланировано".
   if (matchedRequests.some(req => isStartedOrCompletedRequestState_(req.state))) {
     resultStatus = DEALS_CONFIG.resultStatuses.started;
   } else if (matchedRequests.some(req => isPlannedRequestState_(req.state))) {
@@ -956,6 +958,99 @@ function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient) {
       description
     ]
   };
+}
+
+
+function testBuildUidDealRowStatusPriority_() {
+  const baseDate = new Date(2026, 0, 10);
+  const uidGroup = {
+    uid: 'TEST-UID-STATUS',
+    branch: 'Тестовый филиал',
+    patient: 'Тестовый пациент',
+    patientCode: 'P-001',
+    doctor: 'Тестовый врач',
+    standard: 'Тестовый стандарт',
+    firstTreatmentDate: baseDate,
+    items: [
+      { treatmentDate: baseDate, nomenclature: 'Услуга 1', price: 1000 },
+      { treatmentDate: baseDate, nomenclature: 'Услуга 2', price: 1000 },
+      { treatmentDate: baseDate, nomenclature: 'Услуга 3', price: 1000 },
+      { treatmentDate: baseDate, nomenclature: 'Услуга 4', price: 1000 },
+      { treatmentDate: baseDate, nomenclature: 'Услуга 5', price: 1000 }
+    ]
+  };
+
+  const checks = [
+    {
+      name: 'плановая заявка только на одну услугу',
+      requests: [
+        buildUidStatusPriorityTestRequest_('Услуга 3', 'Запланирована', new Date(2026, 0, 12), 'P-001')
+      ],
+      expectedStatus: DEALS_CONFIG.resultStatuses.planned
+    },
+    {
+      name: 'начатая заявка только на одну услугу',
+      requests: [
+        buildUidStatusPriorityTestRequest_('Услуга 4', 'Начато', baseDate, 'P-001')
+      ],
+      expectedStatus: DEALS_CONFIG.resultStatuses.started
+    },
+    {
+      name: 'плановая и начатая заявки на разные услуги',
+      requests: [
+        buildUidStatusPriorityTestRequest_('Услуга 1', 'Запланирована', new Date(2026, 0, 12), 'P-001'),
+        buildUidStatusPriorityTestRequest_('Услуга 5', 'Начато', baseDate, 'P-001')
+      ],
+      expectedStatus: DEALS_CONFIG.resultStatuses.started
+    },
+    {
+      name: 'нет подходящих заявок',
+      requests: [
+        buildUidStatusPriorityTestRequest_('Другая услуга', 'Запланирована', new Date(2026, 0, 12), 'P-001')
+      ],
+      expectedStatus: DEALS_CONFIG.resultStatuses.createDeal
+    }
+  ];
+
+  checks.forEach(check => {
+    const row = buildUidDealRow_(
+      uidGroup,
+      buildRequestIndexes_(check.requests),
+      new Map()
+    );
+
+    if (row.status !== check.expectedStatus) {
+      throw new Error(
+        'Проверка статуса УИД не пройдена: ' +
+        check.name +
+        '. Ожидалось "' +
+        check.expectedStatus +
+        '", получено "' +
+        row.status +
+        '".'
+      );
+    }
+  });
+
+  return 'Проверки статуса УИД пройдены: ' + checks.length;
+}
+
+
+function buildUidStatusPriorityTestRequest_(nomenclature, state, startDate, clientCode) {
+  const c = DEALS_CONFIG.requestColumns;
+  const row = {};
+
+  row[c.branch] = 'Тестовый филиал';
+  row[c.client] = 'Тестовый пациент';
+  row[c.clientCode] = clientCode;
+  row[c.state] = state;
+  row[c.startDate] = startDate;
+  row[c.endDate] = '';
+  row[c.number] = 'TEST-' + nomenclature;
+  row[c.nomenclature] = nomenclature;
+  row[c.cabinet] = '';
+
+  return row;
 }
 
 
