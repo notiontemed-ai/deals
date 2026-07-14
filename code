@@ -30,6 +30,7 @@
  ****************************************************/
 
 const MIN_BITRIX_DEAL_AMOUNT = 20000;
+const AI_PROCESSING_TIMEOUT_SECONDS = 180;
 
 const DEALS_CONFIG = {
   appointmentsSheetName: 'Назначения',
@@ -337,8 +338,13 @@ function requestAiSummariesForBitrixDeals() {
   data.rows.forEach((row, i) => {
     const sendStatus = String(row['Статус отправки'] || '').trim();
     const aiStatus = String(row['AI статус'] || '').trim();
+    const aiUpdatedAt = row['AI updated_at'];
+    const canRequestAi =
+      aiStatus === 'Не запрошено' ||
+      aiStatus === 'error' ||
+      isAiProcessingExpired_(aiStatus, aiUpdatedAt);
 
-    if (sendStatus !== 'Новая' || (aiStatus && aiStatus !== 'Не запрошено')) {
+    if (sendStatus !== 'Новая' || !canRequestAi) {
       return;
     }
 
@@ -389,6 +395,57 @@ function requestAiSummariesForBitrixDeals() {
       setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI updated_at', now);
     }
   });
+}
+
+
+function isAiProcessingExpired_(aiStatus, aiUpdatedAt) {
+  if (String(aiStatus || '').trim() !== 'processing') {
+    return false;
+  }
+
+  const updatedAt = parseDateTime_(aiUpdatedAt);
+
+  if (!updatedAt) {
+    return true;
+  }
+
+  const ageSeconds = (new Date().getTime() - updatedAt.getTime()) / 1000;
+
+  return ageSeconds > AI_PROCESSING_TIMEOUT_SECONDS;
+}
+
+
+function parseDateTime_(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (Object.prototype.toString.call(value) === '[object Date]' && !isNaN(value)) {
+    return value;
+  }
+
+  if (typeof value === 'number') {
+    const parsedNumberDate = new Date(Math.round((value - 25569) * 86400 * 1000));
+    return isNaN(parsedNumberDate) ? null : parsedNumberDate;
+  }
+
+  const text = String(value).trim();
+  const matchRu = text.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
+
+  if (matchRu) {
+    return new Date(
+      Number(matchRu[3]),
+      Number(matchRu[2]) - 1,
+      Number(matchRu[1]),
+      Number(matchRu[4] || 0),
+      Number(matchRu[5] || 0),
+      Number(matchRu[6] || 0)
+    );
+  }
+
+  const parsed = new Date(text);
+
+  return isNaN(parsed) ? null : parsed;
 }
 
 
