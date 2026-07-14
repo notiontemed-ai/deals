@@ -192,6 +192,7 @@ const BITRIX_DEALS_HEADERS = [
   'Телефон клиента',
   'Комментарий администратора',
   'Описание назначений',
+  'Plan Items JSON',
   'AI справка',
   'Описание для Bitrix',
   'Bitrix Deal ID',
@@ -269,12 +270,15 @@ function buildBitrixDealsSheet() {
       firstPlanDate: planDate,
       doctor: String(row['Врач'] || '').trim(),
       composition: String(row['Состав назначений'] || '').trim(),
-      amount: parseNumber_(row['Сумма к продаже'])
+      amount: parseNumber_(row['Сумма к продаже']),
+      sourceComposition: String(row['Состав назначений'] || '').trim(),
+      patientCode: String(row['Пациент.Код'] || '').trim(),
+      branch: String(row['Филиал'] || '').trim(),
+      uidPlanItemsJson: String(row['UID Plan Items JSON'] || '').trim()
     });
   });
 
   const outputRows = Array.from(groups.values())
-    .filter(group => group.amount >= DEALS_CONFIG.minBitrixDealAmount)
     .sort((a, b) => {
       const dateDiff = (a.firstPlanDate ? a.firstPlanDate.getTime() : 0) - (b.firstPlanDate ? b.firstPlanDate.getTime() : 0);
       if (dateDiff !== 0) return dateDiff;
@@ -309,6 +313,7 @@ function buildBitrixDealsSheet() {
         '', // Телефон клиента — заполнит n8n
         '', // Комментарий администратора — заполнит n8n
         buildBitrixDealAppointmentsDescription_(group),
+        buildPlanItemsJson_(group, dealHash),
         '',
         '',
         '',
@@ -339,10 +344,6 @@ function requestAiSummariesForBitrixDeals() {
 
     const rowNumber = i + 2;
     const dealAmount = parseNumber_(row['Сумма сделки']);
-
-    if (dealAmount < DEALS_CONFIG.minBitrixDealAmount) {
-      return;
-    }
 
     const payload = {
       spreadsheet_id: ss.getId(),
@@ -760,7 +761,7 @@ function writeBitrixDealsOutput_(ss, outputRows) {
   sheet.getRange(2, aiUpdatedAtColumn, totalRows, 1).setNumberFormat('dd.MM.yyyy HH:mm:ss');
 
   if (outputRows.length > 0) {
-    sheet.getRange(2, 12, outputRows.length, 7).setWrap(true);
+    sheet.getRange(2, 12, outputRows.length, 10).setWrap(true);
   }
 
   sheet.autoResizeColumns(1, BITRIX_DEALS_HEADERS.length);
@@ -771,6 +772,8 @@ function writeBitrixDealsOutput_(ss, outputRows) {
   sheet.setColumnWidth(16, 800);
   sheet.setColumnWidth(17, 600);
   sheet.setColumnWidth(18, 800);
+  sheet.setColumnWidth(20, 800);
+  sheet.setColumnWidth(21, 800);
 
   if (sheet.getFilter()) {
     sheet.getFilter().remove();
@@ -835,6 +838,165 @@ function parseJsonSafely_(text) {
   } catch (err) {
     return null;
   }
+}
+
+
+function buildUidPlanItemsJson_(uidGroup) {
+  const itemsMap = new Map();
+
+  (uidGroup.items || []).forEach(item => {
+    const sourceName = String(item.nomenclature || '').trim();
+    const displayName = normalizePlanItemDisplayName_(sourceName);
+    const doctor = String(uidGroup.doctor || '').trim();
+    const unitPrice = Number(item.price) || 0;
+    const firstPlanDate = uidGroup.firstTreatmentDate
+      ? formatDateKey_(uidGroup.firstTreatmentDate)
+      : '';
+
+    const key = [
+      uidGroup.uid,
+      sourceName,
+      doctor,
+      unitPrice
+    ].join('|');
+
+    if (!itemsMap.has(key)) {
+      itemsMap.set(key, {
+        uid: String(uidGroup.uid || '').trim(),
+        source_name: sourceName,
+        display_name: displayName,
+        service_class: detectPlanServiceClass_(sourceName),
+        doctor: doctor,
+        first_plan_date: firstPlanDate,
+        qty: 0,
+        unit_price: unitPrice,
+        sum: 0
+      });
+    }
+
+    const row = itemsMap.get(key);
+    row.qty += 1;
+    row.sum += unitPrice;
+  });
+
+  return JSON.stringify({
+    version: 1,
+    uid: String(uidGroup.uid || '').trim(),
+    patient_code: String(uidGroup.patientCode || '').trim(),
+    branch: String(uidGroup.branch || '').trim(),
+    items: Array.from(itemsMap.values())
+  });
+}
+
+
+function normalizePlanItemDisplayName_(nomenclature) {
+  const source = String(nomenclature || '').trim();
+
+  if (!source) {
+    return '';
+  }
+
+  return source
+    .replace(/\s*\|.*$/g, '')
+    .trim();
+}
+
+
+function detectPlanServiceClass_(name) {
+  const text = normalizeText_(name);
+
+  if (
+    text.indexOf('mls') !== -1 ||
+    text.indexOf('лазер') !== -1 ||
+    text.indexOf('лазеротерап') !== -1
+  ) {
+    return 'ЛАЗЕР';
+  }
+
+  if (
+    text.indexOf('sis') !== -1 ||
+    text.indexOf('магнит') !== -1 ||
+    text.indexOf('магнитотерап') !== -1
+  ) {
+    return 'МАГНИТ';
+  }
+
+  if (text.indexOf('массаж') !== -1) {
+    return 'МАССАЖ';
+  }
+
+  if (
+    text.indexOf('prp') !== -1 ||
+    text.indexOf('плазм') !== -1 ||
+    text.indexOf('плазма') !== -1 ||
+    text.indexOf('тромбоцит') !== -1
+  ) {
+    return 'ПЛАЗМА';
+  }
+
+  if (
+    text.indexOf('лфк') !== -1 ||
+    text.indexOf('физическ') !== -1 ||
+    text.indexOf('физический терапевт') !== -1 ||
+    text.indexOf('кинези') !== -1
+  ) {
+    return 'ЛФК';
+  }
+
+  if (
+    text.indexOf('анализ') !== -1 ||
+    text.indexOf('кров') !== -1 ||
+    text.indexOf('моч') !== -1 ||
+    text.indexOf('соэ') !== -1 ||
+    text.indexOf('с-реактив') !== -1 ||
+    text.indexOf('с реактив') !== -1 ||
+    text.indexOf('срб') !== -1 ||
+    text.indexOf('ревматоид') !== -1 ||
+    text.indexOf('биохим') !== -1 ||
+    text.indexOf('глюкоз') !== -1 ||
+    text.indexOf('креатинин') !== -1 ||
+    text.indexOf('алт') !== -1 ||
+    text.indexOf('аст') !== -1 ||
+    text.indexOf('ферритин') !== -1 ||
+    text.indexOf('витамин') !== -1
+  ) {
+    return 'АНАЛИЗЫ';
+  }
+
+  return 'ПРОЧЕЕ';
+}
+
+
+function buildPlanItemsJson_(group, dealHash) {
+  const items = [];
+
+  (group.uidRows || []).forEach(row => {
+    const raw = String(row.uidPlanItemsJson || row['UID Plan Items JSON'] || '').trim();
+
+    if (!raw) {
+      return;
+    }
+
+    const parsed = parseJsonSafely_(raw);
+
+    if (!parsed || !Array.isArray(parsed.items)) {
+      return;
+    }
+
+    parsed.items.forEach(item => {
+      items.push(item);
+    });
+  });
+
+  return JSON.stringify({
+    version: 1,
+    deal_key: String(group.dealKey || '').trim(),
+    deal_hash: String(dealHash || '').trim(),
+    patient_code: String(group.patientCode || '').trim(),
+    branch: String(group.branch || '').trim(),
+    first_plan_date: group.firstPlanDate ? formatDateKey_(group.firstPlanDate) : '',
+    items: items
+  });
 }
 
 
@@ -953,7 +1115,8 @@ function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient) {
       appointmentComposition,
       Array.from(matchedRequestNumbers).join(', '),
       nearestRequestsText,
-      description
+      description,
+      buildUidPlanItemsJson_(uidGroup)
     ]
   };
 }
@@ -1370,7 +1533,8 @@ function writeDealsOutput_(ss, outputRows) {
     'Состав назначений',
     'Номера найденных заявок',
     'Ближайшие заявки пациента',
-    'Описание сделки'
+    'Описание сделки',
+    'UID Plan Items JSON'
   ];
 
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
@@ -1394,7 +1558,7 @@ function writeDealsOutput_(ss, outputRows) {
   sheet.getRange(2, 9, totalRows, 1).setNumberFormat('dd.MM.yyyy');
 
   if (outputRows.length > 0) {
-    sheet.getRange(2, 12, outputRows.length, 4).setWrap(true);
+    sheet.getRange(2, 12, outputRows.length, 5).setWrap(true);
 
     const statusValues = sheet.getRange(2, 1, outputRows.length, 1).getValues();
 
@@ -1421,6 +1585,7 @@ function writeDealsOutput_(ss, outputRows) {
   sheet.setColumnWidth(12, 450);
   sheet.setColumnWidth(14, 500);
   sheet.setColumnWidth(15, 800);
+  sheet.setColumnWidth(16, 800);
 
   if (sheet.getFilter()) {
     sheet.getFilter().remove();
@@ -1774,8 +1939,21 @@ function getOrCreateSheet_(ss, sheetName) {
 
 const BITRIX_DEAL_CATEGORY_ID = 114;
 const BITRIX_DEAL_ASSIGNED_BY_ID = 22718;
+const BITRIX_DEAL_SMALL_AMOUNT_ASSIGNED_BY_ID = 6108;
+const BITRIX_DEAL_SMALL_AMOUNT_LIMIT = 20000;
 const BITRIX_EMPLOYEES_SHEET_NAME = 'Справочник сотрудников';
 const BITRIX_DEAL_SUCCESS_STATUSES = ['Отправлено', 'sent_to_bitrix', 'Уже существует в Bitrix'];
+
+function getBitrixDealAssignedById_(amount) {
+  const value = Number(amount) || 0;
+
+  if (value < BITRIX_DEAL_SMALL_AMOUNT_LIMIT) {
+    return BITRIX_DEAL_SMALL_AMOUNT_ASSIGNED_BY_ID;
+  }
+
+  return BITRIX_DEAL_ASSIGNED_BY_ID;
+}
+
 
 function addBitrixDealComment_(dealId, text) {
   if (!dealId || !text) {
@@ -2126,11 +2304,13 @@ function createBitrixDealFromRow_(row, doctorUserMap) {
     row['Комментарий администратора'] || ''
   );
   const phone = String(row['Телефон клиента'] || '').trim();
+  const planItemsJson = String(row['Plan Items JSON'] || '').trim();
+  const dealAmount = parseMoney_(row['Сумма сделки']);
   const fields = {
     CATEGORY_ID: BITRIX_DEAL_CATEGORY_ID,
-    ASSIGNED_BY_ID: BITRIX_DEAL_ASSIGNED_BY_ID,
+    ASSIGNED_BY_ID: getBitrixDealAssignedById_(dealAmount),
     TITLE: buildBitrixDealTitle_(row),
-    OPPORTUNITY: parseMoney_(row['Сумма сделки']),
+    OPPORTUNITY: dealAmount,
     CURRENCY_ID: 'RUB',
     UF_CRM_1737550182812: row['ФИО'] || '',
     UF_CRM_1759810401: row['Филиал'] || row['Клиника'] || '',
@@ -2143,6 +2323,10 @@ function createBitrixDealFromRow_(row, doctorUserMap) {
 
   if (phone) {
     fields.UF_CRM_615C18C0D7CD9 = phone;
+  }
+
+  if (planItemsJson) {
+    fields.UF_CRM_1784034617 = planItemsJson;
   }
 
   if (doctorUserId) {
@@ -2176,6 +2360,7 @@ function debugBitrixDealFields() {
     'UF_CRM_1783751996',
     'UF_CRM_1783752197',
     'UF_CRM_1783752297',
+    'UF_CRM_1784034617',
     'UF_CRM_615C18C0D7CD9'
   ];
 
