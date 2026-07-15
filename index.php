@@ -1166,7 +1166,114 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.10/pdfmake.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.10/vfs_fonts.js"></script>
-  <script src="./qrcode.min.js"></script>
+
+
+  <script>
+    (function () {
+      const QR_CODE_SRC = 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js';
+      let qrCodeLoadPromise = null;
+
+      function waitForQrNode(element) {
+        return new Promise((resolve, reject) => {
+          const existingNode = element.querySelector('canvas, img');
+
+          if (existingNode) {
+            resolve(existingNode);
+            return;
+          }
+
+          const observer = new MutationObserver(() => {
+            const qrNode = element.querySelector('canvas, img');
+
+            if (qrNode) {
+              observer.disconnect();
+              resolve(qrNode);
+            }
+          });
+
+          observer.observe(element, { childList: true, subtree: true });
+
+          setTimeout(() => {
+            const qrNode = element.querySelector('canvas, img');
+
+            observer.disconnect();
+
+            if (qrNode) {
+              resolve(qrNode);
+            } else {
+              reject(new Error('QRCode.js не создал canvas или img в контейнере.'));
+            }
+          }, 1000);
+        });
+      }
+
+      function ensureQrCodeLibrary() {
+        if (typeof window.QRCode === 'function') {
+          return Promise.resolve(window.QRCode);
+        }
+
+        if (qrCodeLoadPromise) {
+          return qrCodeLoadPromise;
+        }
+
+        const existingScript = document.querySelector('script[data-temed-qrcode="true"], script[src="' + QR_CODE_SRC + '"]');
+
+        qrCodeLoadPromise = new Promise((resolve, reject) => {
+          const script = existingScript || document.createElement('script');
+
+          script.onload = function () {
+            if (typeof window.QRCode === 'function') {
+              resolve(window.QRCode);
+            } else {
+              const error = new Error('QRCode.js загрузился, но window.QRCode недоступен.');
+              console.error('Не удалось загрузить библиотеку QRCode.js:', error);
+              qrCodeLoadPromise = null;
+              reject(error);
+            }
+          };
+
+          script.onerror = function () {
+            const error = new Error('Не удалось загрузить QRCode.js с CDN: ' + QR_CODE_SRC);
+            console.error('Не удалось загрузить библиотеку QRCode.js:', error);
+            qrCodeLoadPromise = null;
+            reject(error);
+          };
+
+          if (!existingScript) {
+            script.src = QR_CODE_SRC;
+            script.async = true;
+            script.dataset.temedQrcode = 'true';
+            document.head.appendChild(script);
+          }
+        });
+
+        return qrCodeLoadPromise;
+      }
+
+      window.TEMED_createQrCode = async function (element, text, size) {
+        if (!element) {
+          throw new Error('Не передан контейнер для QR-кода.');
+        }
+
+        element.innerHTML = '';
+
+        await ensureQrCodeLibrary();
+
+        const qrSize = size || 62;
+
+        new QRCode(element, {
+          text: String(text || ''),
+          width: qrSize,
+          height: qrSize,
+          colorDark: '#1f2933',
+          colorLight: '#ffffff',
+          correctLevel: QRCode.CorrectLevel.M
+        });
+
+        await waitForQrNode(element);
+      };
+    })();
+  </script>
 
   <script>
     const DEAL_ID = <?= json_encode($dealId, JSON_UNESCAPED_UNICODE) ?>;
@@ -1210,24 +1317,31 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
       return dealId + ' / ' + patientCode;
     }
 
-    function renderPatientQr_() {
+    async function renderPatientQr_() {
       const payload = getQrPayload_();
       const block = document.getElementById('patientQrBlock');
       const root = document.getElementById('patientQrCode');
 
-      if (!block || !root || !payload) {
-        return;
+      if (!block || !root) {
+        return false;
       }
 
       root.innerHTML = '';
+      block.classList.remove('is-visible');
 
-      if (typeof window.TEMED_createQrCode !== 'function') {
-        block.classList.remove('is-visible');
-        return;
+      if (!payload) {
+        return false;
       }
 
-      window.TEMED_createQrCode(root, payload, 62);
-      block.classList.add('is-visible');
+      try {
+        await window.TEMED_createQrCode(root, payload, 62);
+        block.classList.add('is-visible');
+        return true;
+      } catch (error) {
+        console.error('Не удалось сформировать QR-код:', error);
+        block.classList.remove('is-visible');
+        return false;
+      }
     }
 
     function setStatus(id, text, type = '') {
@@ -1608,7 +1722,7 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
       return text;
     }
 
-    function preparePatientPlan() {
+    async function preparePatientPlan() {
       const totals = getTotals();
 
       if (!totals.includedItems.length) {
@@ -1642,7 +1756,7 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
       document.getElementById('patientDiscountMobile').textContent = money(totals.discount);
       document.getElementById('patientGrandTotalMobile').textContent = money(totals.total);
 
-      renderPatientQr_();
+      await renderPatientQr_();
 
       buildComment();
 
@@ -1650,13 +1764,17 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
     }
 
     async function downloadPatientPng() {
-      if (!preparePatientPlan()) {
+      if (!(await preparePatientPlan())) {
         return;
       }
 
       const node = document.getElementById('patientMobileSheet');
 
       try {
+        await new Promise(resolve => {
+          requestAnimationFrame(() => requestAnimationFrame(resolve));
+        });
+
         const canvas = await html2canvas(node, {
           scale: 2,
           backgroundColor: '#ffffff',
@@ -1673,7 +1791,7 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
     }
 
     async function downloadPatientPdf() {
-      if (!preparePatientPlan()) {
+      if (!(await preparePatientPlan())) {
         return;
       }
 
