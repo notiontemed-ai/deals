@@ -169,6 +169,26 @@ function calculateTotals_($items) {
     ];
 }
 
+function normalizeBitrixDate_($value) {
+    $value = trim((string)$value);
+
+    if (!$value) {
+        return '';
+    }
+
+    // Ожидаемый формат из input[type="date"]: YYYY-MM-DD
+    if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)) {
+        return $value;
+    }
+
+    // На случай формата DD.MM.YYYY
+    if (preg_match('/^(\d{2})\.(\d{2})\.(\d{4})$/', $value, $m)) {
+        return $m[3] . '-' . $m[2] . '-' . $m[1];
+    }
+
+    return $value;
+}
+
 function buildQuoteComment_($items, $totals, $validUntil) {
     $lines = [];
 
@@ -254,6 +274,7 @@ function createQuote_($payload) {
     $items = normalizeQuoteItems_($payload['items'] ?? []);
     $totals = calculateTotals_($items);
     $validUntil = trim((string)($payload['valid_until'] ?? ''));
+    $quoteCloseDate = normalizeBitrixDate_($validUntil);
 
     if (count($items) === 0) {
         throw new Exception('Нет выбранных позиций для предложения');
@@ -272,15 +293,21 @@ function createQuote_($payload) {
         $title .= ' — ' . $patientName;
     }
 
+    $quoteFields = [
+        'TITLE' => $title,
+        'DEAL_ID' => $dealId,
+        'ASSIGNED_BY_ID' => $assignedById,
+        'CURRENCY_ID' => CURRENCY_ID,
+        'OPPORTUNITY' => $totals['final_total'],
+        'COMMENTS' => buildQuoteComment_($items, $totals, $validUntil),
+    ];
+
+    if ($quoteCloseDate) {
+        $quoteFields['CLOSEDATE'] = $quoteCloseDate;
+    }
+
     $quoteId = bitrixCall_('crm.quote.add', [
-        'fields' => [
-            'TITLE' => $title,
-            'DEAL_ID' => $dealId,
-            'ASSIGNED_BY_ID' => $assignedById,
-            'CURRENCY_ID' => CURRENCY_ID,
-            'OPPORTUNITY' => $totals['final_total'],
-            'COMMENTS' => buildQuoteComment_($items, $totals, $validUntil),
-        ],
+        'fields' => $quoteFields,
         'params' => [
             'REGISTER_SONET_EVENT' => 'Y',
         ],
