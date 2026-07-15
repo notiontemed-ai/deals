@@ -8,7 +8,6 @@ header_remove('X-Powered-By');
 
 const BITRIX_PLAN_ITEMS_JSON_FIELD = 'UF_CRM_1784034617';
 const BITRIX_PATIENT_NAME_FIELD = 'UF_CRM_1737550182812';
-const BITRIX_DOCTOR_FIELD = 'UF_CRM_1624006506';
 const DEFAULT_ASSIGNED_BY_ID = 22718;
 const CURRENCY_ID = 'RUB';
 
@@ -360,7 +359,6 @@ if ($action === 'load_deal') {
                 'title' => $deal['TITLE'] ?? '',
                 'assigned_by_id' => $deal['ASSIGNED_BY_ID'] ?? '',
                 'patient_name' => $deal[BITRIX_PATIENT_NAME_FIELD] ?? '',
-                'doctor' => $deal[BITRIX_DOCTOR_FIELD] ?? '',
             ],
             'plan' => $plan,
         ]);
@@ -895,142 +893,6 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
       font-weight: 900;
     }
 
-    .a4-render-area {
-      position: absolute;
-      left: -99999px;
-      top: 0;
-      width: 794px;
-      background: #ffffff;
-    }
-
-    .a4-sheet {
-      width: 794px;
-      min-height: 1123px;
-      background: #ffffff;
-      color: var(--text);
-      padding: 42px 46px;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-    }
-
-    .a4-logo {
-      font-size: 24px;
-      font-weight: 900;
-      letter-spacing: 0.08em;
-      color: var(--accent);
-      margin-bottom: 24px;
-    }
-
-    .a4-title {
-      font-size: 34px;
-      font-weight: 900;
-      letter-spacing: -0.04em;
-      margin-bottom: 14px;
-    }
-
-    .a4-lead {
-      font-size: 17px;
-      line-height: 1.5;
-      color: #435363;
-      max-width: 620px;
-      margin-bottom: 28px;
-    }
-
-    .a4-info-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 14px;
-      margin-bottom: 28px;
-    }
-
-    .a4-info-card {
-      padding: 16px 18px;
-      background: #f8fafc;
-      border-radius: 16px;
-    }
-
-    .a4-info-label {
-      color: var(--muted);
-      font-size: 13px;
-      margin-bottom: 6px;
-    }
-
-    .a4-info-value {
-      font-size: 18px;
-      font-weight: 800;
-    }
-
-    .a4-section-title {
-      font-size: 22px;
-      font-weight: 900;
-      margin-bottom: 16px;
-    }
-
-    .a4-list {
-      display: grid;
-      gap: 14px;
-      margin-bottom: 28px;
-    }
-
-    .a4-item {
-      border-bottom: 1px solid var(--line);
-      padding-bottom: 12px;
-    }
-
-    .a4-item:last-child {
-      border-bottom: none;
-    }
-
-    .a4-item-name {
-      font-size: 18px;
-      font-weight: 800;
-      margin-bottom: 4px;
-    }
-
-    .a4-item-meta {
-      color: var(--muted);
-      font-size: 15px;
-    }
-
-    .a4-item-price {
-      margin-top: 6px;
-      font-weight: 900;
-      font-size: 16px;
-    }
-
-    .a4-total {
-      margin-top: 20px;
-      margin-left: auto;
-      width: 360px;
-      background: var(--accent);
-      color: #ffffff;
-      border-radius: 22px;
-      padding: 22px;
-    }
-
-    .a4-total-row {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 10px;
-    }
-
-    .a4-total-final {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      margin-top: 16px;
-      padding-top: 16px;
-      border-top: 1px solid rgba(255,255,255,0.25);
-      font-size: 28px;
-      font-weight: 900;
-    }
-
-    .a4-footer-note {
-      margin-top: 30px;
-      color: var(--muted);
-      font-size: 14px;
-      line-height: 1.5;
-    }
 
     @media (max-width: 920px) {
       .layout {
@@ -1090,10 +952,6 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
               <div class="field-value" id="patientCodeView">—</div>
             </div>
 
-            <div class="field">
-              <div class="field-label">Врач</div>
-              <div class="field-value" id="doctorView">—</div>
-            </div>
 
             <div class="field">
               <div class="field-label">Ответственный</div>
@@ -1217,10 +1075,6 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
           </div>
 
           <div class="patient-info">
-            <div class="patient-info-row">
-              <div class="patient-info-label">Врач</div>
-              <div class="patient-info-value" id="patientDoctorMobile">—</div>
-            </div>
 
             <div class="patient-info-row">
               <div class="patient-info-label">Предложение действительно до</div>
@@ -1255,53 +1109,6 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
       </div>
     </section>
 
-    <section class="a4-render-area">
-      <article class="a4-sheet" id="patientA4Sheet">
-        <div class="a4-logo">TEMED</div>
-
-        <div class="a4-title">План лечения</div>
-
-        <div class="a4-lead" id="patientLeadA4">
-          Для вас подготовлен индивидуальный план лечения.
-        </div>
-
-        <div class="a4-info-grid">
-          <div class="a4-info-card">
-            <div class="a4-info-label">Врач</div>
-            <div class="a4-info-value" id="patientDoctorA4">—</div>
-          </div>
-
-          <div class="a4-info-card">
-            <div class="a4-info-label">Предложение действительно до</div>
-            <div class="a4-info-value" id="patientValidUntilA4">—</div>
-          </div>
-        </div>
-
-        <div class="a4-section-title">В план включено</div>
-        <div class="a4-list" id="patientItemsA4"></div>
-
-        <div class="a4-total">
-          <div class="a4-total-row">
-            <span>Без скидки</span>
-            <strong id="patientSubtotalA4">0 ₽</strong>
-          </div>
-
-          <div class="a4-total-row">
-            <span>Скидка</span>
-            <strong id="patientDiscountA4">0 ₽</strong>
-          </div>
-
-          <div class="a4-total-final">
-            <span>Итого</span>
-            <strong id="patientGrandTotalA4">0 ₽</strong>
-          </div>
-        </div>
-
-        <div class="a4-footer-note">
-          Состав процедур и график посещений могут уточняться с врачом и администратором.
-        </div>
-      </article>
-    </section>
   </main>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
@@ -1315,7 +1122,6 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
       patientFullName: '',
       patientShortName: '',
       patientCode: '',
-      doctor: '',
       assignedBy: ''
     };
 
@@ -1442,7 +1248,6 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
         deal.patientFullName = String(bitrixDeal.patient_name || '');
         deal.patientShortName = getFirstNamePatronymic_(deal.patientFullName);
         deal.patientCode = String(plan.patient_code || '');
-        deal.doctor = String(plan.doctor || bitrixDeal.doctor || '');
         deal.assignedBy = String(bitrixDeal.assigned_by_id || '');
 
         items = planItems.map((item, index) => {
@@ -1464,7 +1269,6 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
 
         document.getElementById('patientNameView').textContent = deal.patientFullName || '—';
         document.getElementById('patientCodeView').textContent = deal.patientCode || '—';
-        document.getElementById('doctorView').textContent = deal.doctor || '—';
         document.getElementById('assignedByView').textContent = deal.assignedBy || '—';
 
         setDefaultValidUntil();
@@ -1696,7 +1500,6 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
       }
 
       lines.push(`Ответственный: ${deal.assignedBy || '—'}`);
-      lines.push(`Врач: ${deal.doctor || '—'}`);
       lines.push('');
       lines.push('Состав предложения:');
       lines.push(...includedLines);
@@ -1738,12 +1541,7 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
       document.getElementById('patientOutput').classList.add('is-visible');
 
       document.getElementById('patientLeadMobile').textContent = leadText;
-      document.getElementById('patientDoctorMobile').textContent = deal.doctor || '—';
       document.getElementById('patientValidUntilMobile').textContent = validUntilText;
-
-      document.getElementById('patientLeadA4').textContent = leadText;
-      document.getElementById('patientDoctorA4').textContent = deal.doctor || '—';
-      document.getElementById('patientValidUntilA4').textContent = validUntilText;
 
       document.getElementById('patientItemsMobile').innerHTML = totals.includedItems.map(item => {
         return `
@@ -1755,23 +1553,9 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
         `;
       }).join('');
 
-      document.getElementById('patientItemsA4').innerHTML = totals.includedItems.map(item => {
-        return `
-          <div class="a4-item">
-            <div class="a4-item-name">${escapeHtml(item.name)}</div>
-            <div class="a4-item-meta">${escapeHtml(item.description)} · ${item.qty} ${item.qty === 1 ? 'позиция' : 'процедур/сеансов'}</div>
-            <div class="a4-item-price">${money(itemFinalSum(item))}</div>
-          </div>
-        `;
-      }).join('');
-
       document.getElementById('patientSubtotalMobile').textContent = money(totals.subtotal);
       document.getElementById('patientDiscountMobile').textContent = money(totals.discount);
       document.getElementById('patientGrandTotalMobile').textContent = money(totals.total);
-
-      document.getElementById('patientSubtotalA4').textContent = money(totals.subtotal);
-      document.getElementById('patientDiscountA4').textContent = money(totals.discount);
-      document.getElementById('patientGrandTotalA4').textContent = money(totals.total);
 
       buildComment();
 
@@ -1806,29 +1590,140 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
         return;
       }
 
-      const node = document.getElementById('patientA4Sheet');
-
       try {
-        const canvas = await html2canvas(node, {
-          scale: 2,
-          backgroundColor: '#ffffff',
-          useCORS: true
-        });
-
-        const imgData = canvas.toDataURL('image/png');
         const { jsPDF } = window.jspdf;
 
         const pdf = new jsPDF({
           orientation: 'portrait',
-          unit: 'px',
-          format: [794, 1123]
+          unit: 'mm',
+          format: 'a4'
         });
 
-        pdf.addImage(imgData, 'PNG', 0, 0, 794, 1123);
+        const totals = getTotals();
+        const validUntil = getValidUntilText();
+
+        const patientLead = deal.patientShortName
+          ? deal.patientShortName + ', для вас подготовлен индивидуальный план лечения.'
+          : 'Для вас подготовлен индивидуальный план лечения.';
+
+        const margin = 18;
+        const pageWidth = 210;
+        const pageHeight = 297;
+        const contentWidth = pageWidth - margin * 2;
+
+        let y = 20;
+
+        pdf.setTextColor(31, 41, 51);
+        pdf.setFont('helvetica', 'bold');
+        pdf.setFontSize(16);
+        pdf.text('TEMED', margin, y);
+
+        y += 14;
+
+        pdf.setFontSize(22);
+        pdf.text('План лечения', margin, y);
+
+        y += 10;
+
+        pdf.setFont('helvetica', 'normal');
+        pdf.setFontSize(11);
+
+        const leadLines = pdf.splitTextToSize(patientLead, contentWidth);
+        pdf.text(leadLines, margin, y);
+        y += leadLines.length * 6 + 6;
+
+        pdf.setFont('helvetica', 'bold');
+        pdf.text('Предложение действительно до: ' + validUntil, margin, y);
+
+        y += 12;
+
+        drawPdfTableHeader_(pdf, margin, y, contentWidth);
+        y += 8;
+
+        totals.includedItems.forEach(item => {
+          const nameLines = pdf.splitTextToSize(item.name, 94);
+          const rowHeight = Math.max(10, nameLines.length * 5 + 4);
+
+          if (y + rowHeight > pageHeight - 38) {
+            pdf.addPage();
+            y = 20;
+            drawPdfTableHeader_(pdf, margin, y, contentWidth);
+            y += 8;
+          }
+
+          pdf.setFont('helvetica', 'normal');
+          pdf.setFontSize(9);
+          pdf.setTextColor(31, 41, 51);
+
+          pdf.text(nameLines, margin, y + 5);
+          pdf.text(String(item.qty), margin + 100, y + 5);
+          pdf.text(moneyPlain_(item.unitPrice), margin + 122, y + 5);
+          pdf.text(moneyPlain_(itemFinalSum(item)), margin + 158, y + 5);
+
+          pdf.setDrawColor(225, 225, 225);
+          pdf.line(margin, y + rowHeight, pageWidth - margin, y + rowHeight);
+
+          y += rowHeight;
+        });
+
+        y += 10;
+
+        if (y > pageHeight - 55) {
+          pdf.addPage();
+          y = 20;
+        }
+
+        pdf.setFontSize(11);
+        pdf.setFont('helvetica', 'normal');
+        pdf.setTextColor(31, 41, 51);
+
+        pdf.text('Стоимость без скидки:', margin + 92, y);
+        pdf.text(moneyPlain_(totals.subtotal), margin + 158, y);
+
+        y += 7;
+
+        pdf.text('Скидка:', margin + 92, y);
+        pdf.text(moneyPlain_(totals.discount), margin + 158, y);
+
+        y += 9;
+
+        pdf.setFont('helvetica', 'bold');
+        pdf.setFontSize(13);
+        pdf.text('Итого к оплате:', margin + 92, y);
+        pdf.text(moneyPlain_(totals.total), margin + 158, y);
+
+        y += 18;
+
+        pdf.setFont('helvetica', 'normal');
+        pdf.setFontSize(9);
+        pdf.setTextColor(105, 117, 134);
+
+        const note = 'Состав процедур и график посещений могут уточняться с врачом и администратором.';
+        const noteLines = pdf.splitTextToSize(note, contentWidth);
+        pdf.text(noteLines, margin, y);
+
         pdf.save('plan-lecheniya-a4.pdf');
       } catch (error) {
         alert('Не удалось сформировать PDF: ' + (error.message || error));
       }
+    }
+
+    function drawPdfTableHeader_(pdf, margin, y, contentWidth) {
+      pdf.setFont('helvetica', 'bold');
+      pdf.setFontSize(9);
+      pdf.setTextColor(31, 41, 51);
+
+      pdf.text('Услуга', margin, y);
+      pdf.text('Кол-во', margin + 100, y);
+      pdf.text('Цена', margin + 122, y);
+      pdf.text('Сумма', margin + 158, y);
+
+      pdf.setDrawColor(31, 41, 51);
+      pdf.line(margin, y + 3, margin + contentWidth, y + 3);
+    }
+
+    function moneyPlain_(value) {
+      return Math.round(Number(value) || 0).toLocaleString('ru-RU') + ' руб.';
     }
 
     async function createQuote() {
