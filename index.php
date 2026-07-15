@@ -1166,7 +1166,7 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.10/pdfmake.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.10/vfs_fonts.js"></script>
-  <script src="/internal/deal-calculator/qrcode.min.js"></script>
+  <script src="./qrcode.min.js"></script>
 
   <script>
     const DEAL_ID = <?= json_encode($dealId, JSON_UNESCAPED_UNICODE) ?>;
