@@ -304,6 +304,7 @@ function createQuote_($payload) {
 
     if ($quoteCloseDate) {
         $quoteFields['CLOSEDATE'] = $quoteCloseDate;
+        $quoteFields['ACTUAL_DATE'] = $quoteCloseDate;
     }
 
     $quoteId = bitrixCall_('crm.quote.add', [
@@ -354,6 +355,8 @@ function createQuote_($payload) {
         'discount_total' => $totals['discount_total'],
         'final_total' => $totals['final_total'],
         'valid_until' => $validUntil,
+        'close_date' => $quoteCloseDate,
+        'actual_date' => $quoteCloseDate,
         'warnings' => $warnings,
     ];
 }
@@ -1103,7 +1106,6 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
           </div>
 
           <div class="buttons">
-            <button class="btn-primary" type="button" onclick="preparePatientPlan()">Подготовить план</button>
             <button class="btn-secondary" type="button" onclick="downloadPatientPng()">Сформировать PNG</button>
             <button class="btn-secondary" type="button" onclick="downloadPatientPdf()">Сформировать PDF</button>
             <button class="btn-outline" type="button" id="createQuoteButton" onclick="createQuote()">Создать предложение в Bitrix</button>
