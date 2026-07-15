@@ -1102,9 +1102,6 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
             </div>
           </div>
 
-          <p class="note">
-            Состав процедур и график посещений могут уточняться с врачом и администратором.
-          </p>
         </article>
       </div>
     </section>
@@ -1112,7 +1109,8 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
   </main>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.10/pdfmake.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.10/vfs_fonts.js"></script>
 
   <script>
     const DEAL_ID = <?= json_encode($dealId, JSON_UNESCAPED_UNICODE) ?>;
@@ -1591,14 +1589,6 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
       }
 
       try {
-        const { jsPDF } = window.jspdf;
-
-        const pdf = new jsPDF({
-          orientation: 'portrait',
-          unit: 'mm',
-          format: 'a4'
-        });
-
         const totals = getTotals();
         const validUntil = getValidUntilText();
 
@@ -1606,123 +1596,145 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
           ? deal.patientShortName + ', для вас подготовлен индивидуальный план лечения.'
           : 'Для вас подготовлен индивидуальный план лечения.';
 
-        const margin = 18;
-        const pageWidth = 210;
-        const pageHeight = 297;
-        const contentWidth = pageWidth - margin * 2;
-
-        let y = 20;
-
-        pdf.setTextColor(31, 41, 51);
-        pdf.setFont('helvetica', 'bold');
-        pdf.setFontSize(16);
-        pdf.text('TEMED', margin, y);
-
-        y += 14;
-
-        pdf.setFontSize(22);
-        pdf.text('План лечения', margin, y);
-
-        y += 10;
-
-        pdf.setFont('helvetica', 'normal');
-        pdf.setFontSize(11);
-
-        const leadLines = pdf.splitTextToSize(patientLead, contentWidth);
-        pdf.text(leadLines, margin, y);
-        y += leadLines.length * 6 + 6;
-
-        pdf.setFont('helvetica', 'bold');
-        pdf.text('Предложение действительно до: ' + validUntil, margin, y);
-
-        y += 12;
-
-        drawPdfTableHeader_(pdf, margin, y, contentWidth);
-        y += 8;
+        const tableBody = [
+          [
+            { text: 'Услуга', bold: true },
+            { text: 'Кол-во', bold: true, alignment: 'right' },
+            { text: 'Цена', bold: true, alignment: 'right' },
+            { text: 'Сумма', bold: true, alignment: 'right' }
+          ]
+        ];
 
         totals.includedItems.forEach(item => {
-          const nameLines = pdf.splitTextToSize(item.name, 94);
-          const rowHeight = Math.max(10, nameLines.length * 5 + 4);
-
-          if (y + rowHeight > pageHeight - 38) {
-            pdf.addPage();
-            y = 20;
-            drawPdfTableHeader_(pdf, margin, y, contentWidth);
-            y += 8;
-          }
-
-          pdf.setFont('helvetica', 'normal');
-          pdf.setFontSize(9);
-          pdf.setTextColor(31, 41, 51);
-
-          pdf.text(nameLines, margin, y + 5);
-          pdf.text(String(item.qty), margin + 100, y + 5);
-          pdf.text(moneyPlain_(item.unitPrice), margin + 122, y + 5);
-          pdf.text(moneyPlain_(itemFinalSum(item)), margin + 158, y + 5);
-
-          pdf.setDrawColor(225, 225, 225);
-          pdf.line(margin, y + rowHeight, pageWidth - margin, y + rowHeight);
-
-          y += rowHeight;
+          tableBody.push([
+            { text: item.name || '' },
+            { text: String(item.qty || ''), alignment: 'right' },
+            { text: moneyPdf_(item.unitPrice), alignment: 'right' },
+            { text: moneyPdf_(itemFinalSum(item)), alignment: 'right' }
+          ]);
         });
 
-        y += 10;
+        const docDefinition = {
+          pageSize: 'A4',
+          pageMargins: [40, 42, 40, 42],
 
-        if (y > pageHeight - 55) {
-          pdf.addPage();
-          y = 20;
-        }
+          defaultStyle: {
+            font: 'Roboto',
+            fontSize: 10,
+            color: '#1f2933'
+          },
 
-        pdf.setFontSize(11);
-        pdf.setFont('helvetica', 'normal');
-        pdf.setTextColor(31, 41, 51);
+          content: [
+            {
+              text: 'TEMED',
+              fontSize: 16,
+              bold: true,
+              margin: [0, 0, 0, 18]
+            },
+            {
+              text: 'План лечения',
+              fontSize: 24,
+              bold: true,
+              margin: [0, 0, 0, 10]
+            },
+            {
+              text: patientLead,
+              fontSize: 11,
+              lineHeight: 1.25,
+              margin: [0, 0, 0, 12]
+            },
+            {
+              text: 'Предложение действительно до: ' + validUntil,
+              fontSize: 11,
+              bold: true,
+              margin: [0, 0, 0, 18]
+            },
+            {
+              table: {
+                headerRows: 1,
+                widths: ['*', 45, 70, 80],
+                body: tableBody
+              },
+              layout: {
+                hLineWidth: function(i, node) {
+                  return i === 0 || i === 1 || i === node.table.body.length ? 0.8 : 0.4;
+                },
+                vLineWidth: function() {
+                  return 0;
+                },
+                hLineColor: function(i) {
+                  return i === 0 || i === 1 ? '#1f2933' : '#e3e8ef';
+                },
+                paddingLeft: function() {
+                  return 0;
+                },
+                paddingRight: function() {
+                  return 8;
+                },
+                paddingTop: function() {
+                  return 6;
+                },
+                paddingBottom: function() {
+                  return 6;
+                }
+              },
+              margin: [0, 0, 0, 18]
+            },
+            {
+              columns: [
+                { text: '', width: '*' },
+                {
+                  width: 230,
+                  stack: [
+                    {
+                      columns: [
+                        { text: 'Стоимость без скидки', width: '*' },
+                        { text: moneyPdf_(totals.subtotal), width: 90, alignment: 'right', bold: true }
+                      ],
+                      margin: [0, 0, 0, 6]
+                    },
+                    {
+                      columns: [
+                        { text: 'Скидка', width: '*' },
+                        { text: moneyPdf_(totals.discount), width: 90, alignment: 'right', bold: true }
+                      ],
+                      margin: [0, 0, 0, 8]
+                    },
+                    {
+                      canvas: [
+                        {
+                          type: 'line',
+                          x1: 0,
+                          y1: 0,
+                          x2: 230,
+                          y2: 0,
+                          lineWidth: 0.8,
+                          lineColor: '#1f2933'
+                        }
+                      ],
+                      margin: [0, 0, 0, 8]
+                    },
+                    {
+                      columns: [
+                        { text: 'Итого к оплате', width: '*', bold: true },
+                        { text: moneyPdf_(totals.total), width: 100, alignment: 'right', bold: true }
+                      ],
+                      fontSize: 13
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        };
 
-        pdf.text('Стоимость без скидки:', margin + 92, y);
-        pdf.text(moneyPlain_(totals.subtotal), margin + 158, y);
-
-        y += 7;
-
-        pdf.text('Скидка:', margin + 92, y);
-        pdf.text(moneyPlain_(totals.discount), margin + 158, y);
-
-        y += 9;
-
-        pdf.setFont('helvetica', 'bold');
-        pdf.setFontSize(13);
-        pdf.text('Итого к оплате:', margin + 92, y);
-        pdf.text(moneyPlain_(totals.total), margin + 158, y);
-
-        y += 18;
-
-        pdf.setFont('helvetica', 'normal');
-        pdf.setFontSize(9);
-        pdf.setTextColor(105, 117, 134);
-
-        const note = 'Состав процедур и график посещений могут уточняться с врачом и администратором.';
-        const noteLines = pdf.splitTextToSize(note, contentWidth);
-        pdf.text(noteLines, margin, y);
-
-        pdf.save('plan-lecheniya-a4.pdf');
+        pdfMake.createPdf(docDefinition).download('plan-lecheniya-a4.pdf');
       } catch (error) {
         alert('Не удалось сформировать PDF: ' + (error.message || error));
       }
     }
 
-    function drawPdfTableHeader_(pdf, margin, y, contentWidth) {
-      pdf.setFont('helvetica', 'bold');
-      pdf.setFontSize(9);
-      pdf.setTextColor(31, 41, 51);
-
-      pdf.text('Услуга', margin, y);
-      pdf.text('Кол-во', margin + 100, y);
-      pdf.text('Цена', margin + 122, y);
-      pdf.text('Сумма', margin + 158, y);
-
-      pdf.setDrawColor(31, 41, 51);
-      pdf.line(margin, y + 3, margin + contentWidth, y + 3);
-    }
-
-    function moneyPlain_(value) {
+    function moneyPdf_(value) {
       return Math.round(Number(value) || 0).toLocaleString('ru-RU') + ' руб.';
     }
 
