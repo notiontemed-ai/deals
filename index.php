@@ -818,12 +818,36 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
     }
 
     .mobile-sheet {
+      position: relative;
       width: 390px;
       max-width: 100%;
       background: #ffffff;
       border-radius: 28px;
       padding: 28px 22px;
       box-shadow: 0 20px 50px rgba(15, 23, 42, 0.18);
+    }
+
+    .patient-qr {
+      position: absolute;
+      top: 24px;
+      right: 22px;
+      width: 62px;
+      height: 62px;
+      background: #ffffff;
+      border-radius: 10px;
+      overflow: hidden;
+      display: none;
+    }
+
+    .patient-qr.is-visible {
+      display: block;
+    }
+
+    .patient-qr img,
+    .patient-qr canvas {
+      display: block;
+      width: 62px !important;
+      height: 62px !important;
     }
 
     .patient-logo {
@@ -1095,6 +1119,10 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
         <article class="mobile-sheet" id="patientMobileSheet">
           <div class="patient-logo">TEMED</div>
 
+          <div class="patient-qr" id="patientQrBlock">
+            <div id="patientQrCode"></div>
+          </div>
+
           <div class="patient-title">План лечения</div>
 
           <div class="patient-lead" id="patientLeadMobile">
@@ -1138,6 +1166,7 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.10/pdfmake.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdfmake/0.2.10/vfs_fonts.js"></script>
+  <script src="/internal/deal-calculator/qrcode.min.js"></script>
 
   <script>
     const DEAL_ID = <?= json_encode($dealId, JSON_UNESCAPED_UNICODE) ?>;
@@ -1168,6 +1197,37 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
         .replaceAll('>', '&gt;')
         .replaceAll('"', '&quot;')
         .replaceAll("'", '&#039;');
+    }
+
+    function getQrPayload_() {
+      const dealId = String(deal.id || '').trim();
+      const patientCode = String(deal.patientCode || '').trim();
+
+      if (!dealId && !patientCode) {
+        return '';
+      }
+
+      return dealId + ' / ' + patientCode;
+    }
+
+    function renderPatientQr_() {
+      const payload = getQrPayload_();
+      const block = document.getElementById('patientQrBlock');
+      const root = document.getElementById('patientQrCode');
+
+      if (!block || !root || !payload) {
+        return;
+      }
+
+      root.innerHTML = '';
+
+      if (typeof window.TEMED_createQrCode !== 'function') {
+        block.classList.remove('is-visible');
+        return;
+      }
+
+      window.TEMED_createQrCode(root, payload, 62);
+      block.classList.add('is-visible');
     }
 
     function setStatus(id, text, type = '') {
@@ -1582,6 +1642,8 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
       document.getElementById('patientDiscountMobile').textContent = money(totals.discount);
       document.getElementById('patientGrandTotalMobile').textContent = money(totals.total);
 
+      renderPatientQr_();
+
       buildComment();
 
       return true;
@@ -1623,6 +1685,8 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
           ? deal.patientShortName + ', для вас подготовлен индивидуальный план лечения.'
           : 'Для вас подготовлен индивидуальный план лечения.';
 
+        const qrPayload = getQrPayload_();
+
         const tableBody = [
           [
             { text: 'Услуга', bold: true },
@@ -1653,16 +1717,37 @@ $dealId = htmlspecialchars($_GET['deal_id'] ?? '', ENT_QUOTES, 'UTF-8');
 
           content: [
             {
-              text: 'TEMED',
-              fontSize: 16,
-              bold: true,
-              margin: [0, 0, 0, 18]
-            },
-            {
-              text: 'План лечения',
-              fontSize: 24,
-              bold: true,
-              margin: [0, 0, 0, 10]
+              columns: [
+                {
+                  stack: [
+                    {
+                      text: 'TEMED',
+                      fontSize: 16,
+                      bold: true,
+                      margin: [0, 0, 0, 18]
+                    },
+                    {
+                      text: 'План лечения',
+                      fontSize: 24,
+                      bold: true,
+                      margin: [0, 0, 0, 10]
+                    }
+                  ],
+                  width: '*'
+                },
+                qrPayload
+                  ? {
+                      qr: qrPayload,
+                      fit: 58,
+                      alignment: 'right',
+                      margin: [0, 0, 0, 0]
+                    }
+                  : {
+                      text: '',
+                      width: 58
+                    }
+              ],
+              columnGap: 20
             },
             {
               text: patientLead,
