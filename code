@@ -31,11 +31,14 @@
 
 const MIN_BITRIX_DEAL_AMOUNT = 20000;
 const AI_PROCESSING_TIMEOUT_SECONDS = 180;
+const APPOINTMENT_TYPE_CODE_ORDER = ['L', 'M', 'S', 'F', 'C', 'D', 'U', 'P'];
+const APPOINTMENT_TYPE_CODE_SET = new Set(APPOINTMENT_TYPE_CODE_ORDER.concat('-'));
 
 const DEALS_CONFIG = {
   appointmentsSheetName: 'Назначения',
   requestsSheetName: 'Заявки',
   outputSheetName: 'Сделки',
+  typeCodesSheetName: 'Коды типов назначений',
   bitrixDealsSheetName: 'Сделки в Битрикс',
   bitrixRegistrySheetName: 'Реестр отправки Bitrix',
   bitrixDealSource: 'google_sheets_appointments',
@@ -54,6 +57,11 @@ const DEALS_CONFIG = {
     treatmentDate: 'Дата лечения',
     nomenclature: 'Номенклатура',
     price: 'Цена'
+  },
+
+  typeCodeColumns: {
+    nomenclature: 'Номенклатура',
+    type: 'Тип'
   },
 
   requestColumns: {
@@ -129,6 +137,183 @@ function onOpen() {
 }
 
 
+/****************************************************
+ * Справочник буквенных типов назначений
+ ****************************************************/
+
+function validateAppointmentTypeCodes_(sheet, appointments, requests) {
+  const dictionary = readAppointmentTypeCodeMap_(sheet);
+
+  if (dictionary.conflictingNomenclature) {
+    return {
+      isValid: false,
+      message: 'На листе «' + DEALS_CONFIG.typeCodesSheetName +
+        '» одна номенклатура имеет разные типы: ' +
+        dictionary.conflictingNomenclature + '.'
+    };
+  }
+
+  const nomenclatures = collectNomenclaturesForTypeValidation_(appointments, requests);
+  const missing = [];
+  let emptyCount = 0;
+  let invalidCount = 0;
+
+  nomenclatures.forEach(item => {
+    const entry = dictionary.map.get(item.normalized);
+    if (!entry) {
+      missing.push(item);
+      return;
+    }
+
+    if (!entry.typeCode) {
+      emptyCount += 1;
+    } else if (!APPOINTMENT_TYPE_CODE_SET.has(entry.typeCode)) {
+      invalidCount += 1;
+    }
+  });
+
+  appendMissingNomenclatures_(sheet, missing);
+
+  if (missing.length || emptyCount || invalidCount) {
+    return {
+      isValid: false,
+      message: [
+        'Не для всей номенклатуры указаны типы.',
+        '',
+        'Добавлено новых позиций: ' + missing.length + '.',
+        'Позиций с пустым типом: ' + emptyCount + '.',
+        'Позиций с ошибочным типом: ' + invalidCount + '.',
+        '',
+        'Заполните колонку «' + DEALS_CONFIG.typeCodeColumns.type +
+          '» на листе «' + DEALS_CONFIG.typeCodesSheetName +
+          '» и повторно запустите «Сформировать лист "Сделки"».'
+      ].join('\n')
+    };
+  }
+
+  return { isValid: true, typeCodeMap: dictionary.map };
+}
+
+
+function readAppointmentTypeCodeMap_(sheet) {
+  const values = sheet.getDataRange().getValues();
+  const headers = values.length ? values[0].map(value => String(value || '').trim()) : [];
+  const nomenclatureColumn = headers.indexOf(DEALS_CONFIG.typeCodeColumns.nomenclature);
+  const typeColumn = headers.indexOf(DEALS_CONFIG.typeCodeColumns.type);
+
+  if (nomenclatureColumn === -1 || typeColumn === -1) {
+    throw new Error(
+      'На листе «' + DEALS_CONFIG.typeCodesSheetName + '» должны быть колонки «' +
+      DEALS_CONFIG.typeCodeColumns.nomenclature + '» и «' + DEALS_CONFIG.typeCodeColumns.type + '».'
+    );
+  }
+
+  const map = new Map();
+  let conflictingNomenclature = '';
+
+  values.slice(1).forEach(row => {
+    const nomenclature = String(row[nomenclatureColumn] || '').trim();
+    const normalized = normalizeTypeNomenclature_(nomenclature);
+    if (!normalized) return;
+
+    const typeCode = String(row[typeColumn] || '').trim().toUpperCase();
+    const existing = map.get(normalized);
+
+    // Пустой дубль не является вторым назначенным типом, но останется
+    // причиной остановки при проверке незаполненных строк справочника.
+    if (existing && existing.typeCode && typeCode && existing.typeCode !== typeCode) {
+      conflictingNomenclature = existing.nomenclature;
+      return;
+    }
+
+    if (!existing || (!existing.typeCode && typeCode)) {
+      map.set(normalized, { nomenclature, typeCode });
+    }
+  });
+
+  return { map, conflictingNomenclature };
+}
+
+
+function collectNomenclaturesForTypeValidation_(appointments, requests) {
+  const found = new Map();
+  const appointmentColumn = DEALS_CONFIG.appointmentColumns.nomenclature;
+  const requestColumn = DEALS_CONFIG.requestColumns.nomenclature;
+
+  appointments.concat(requests).forEach(row => {
+    const sourceColumn = Object.prototype.hasOwnProperty.call(row, appointmentColumn)
+      ? appointmentColumn
+      : requestColumn;
+    const nomenclature = String(row[sourceColumn] || '').trim();
+    const normalized = normalizeTypeNomenclature_(nomenclature);
+
+    if (normalized && !found.has(normalized)) {
+      found.set(normalized, { nomenclature, normalized });
+    }
+  });
+
+  return Array.from(found.values());
+}
+
+
+function appendMissingNomenclatures_(sheet, missing) {
+  if (!missing.length) return;
+
+  const startRow = sheet.getLastRow() + 1;
+  sheet.getRange(startRow, 1, missing.length, 2)
+    .setValues(missing.map(item => [item.nomenclature, '']));
+}
+
+
+function assignAppointmentTypeCodes_(appointments, requests, typeCodeMap) {
+  const appointmentColumn = DEALS_CONFIG.appointmentColumns.nomenclature;
+  const requestColumn = DEALS_CONFIG.requestColumns.nomenclature;
+
+  appointments.forEach(row => {
+    row.typeCode = getAppointmentTypeCode_(row[appointmentColumn], typeCodeMap);
+  });
+  requests.forEach(row => {
+    row.typeCode = getAppointmentTypeCode_(row[requestColumn], typeCodeMap);
+  });
+}
+
+
+function getAppointmentTypeCode_(nomenclature, typeCodeMap) {
+  const entry = typeCodeMap.get(normalizeTypeNomenclature_(nomenclature));
+  return entry ? entry.typeCode : '';
+}
+
+
+function normalizeTypeNomenclature_(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+
+function buildAppointmentTypeCodes_(items) {
+  const found = new Set();
+  (items || []).forEach(item => {
+    const typeCode = String(item.typeCode || '').trim().toUpperCase();
+    if (APPOINTMENT_TYPE_CODE_SET.has(typeCode) && typeCode !== '-') found.add(typeCode);
+  });
+  return APPOINTMENT_TYPE_CODE_ORDER.filter(code => found.has(code)).join('');
+}
+
+
+function mergeAppointmentTypeCodes_(values) {
+  const found = new Set();
+  (values || []).forEach(value => {
+    String(value || '').toUpperCase().split('').forEach(code => {
+      if (APPOINTMENT_TYPE_CODE_ORDER.indexOf(code) !== -1) found.add(code);
+    });
+  });
+  return APPOINTMENT_TYPE_CODE_ORDER.filter(code => found.has(code)).join('');
+}
+
+
 function buildDealsSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
@@ -137,6 +322,17 @@ function buildDealsSheet() {
 
   const appointments = readSheetAsObjects_(appointmentsSheet);
   const requests = readSheetAsObjects_(requestsSheet);
+
+  // Проверяем справочник до любых расчётов и до очистки листа "Сделки".
+  const typeCodesSheet = getRequiredSheet_(ss, DEALS_CONFIG.typeCodesSheetName);
+  const typeValidation = validateAppointmentTypeCodes_(typeCodesSheet, appointments, requests);
+  if (!typeValidation.isValid) {
+    typeCodesSheet.activate();
+    SpreadsheetApp.getUi().alert(typeValidation.message);
+    return;
+  }
+
+  assignAppointmentTypeCodes_(appointments, requests, typeValidation.typeCodeMap);
 
   const requestIndexes = buildRequestIndexes_(requests);
   const nearestRequestsByClient = buildNearestRequestsByClientIndex_(requests);
@@ -190,6 +386,7 @@ const BITRIX_DEALS_HEADERS = [
   'TEMED_DEAL_SOURCE',
   'Кол-во назначений',
   'Состав назначений',
+  'Типы назначений',
   'Ближайшие заявки пациента',
   'Телефон клиента',
   'Комментарий администратора',
@@ -244,6 +441,7 @@ function buildBitrixDealsSheet() {
         doctors: [],
         uids: [],
         compositions: [],
+        typeCodes: new Set(),
         nearestRequests: [],
         uidRows: []
       });
@@ -264,6 +462,10 @@ function buildBitrixDealsSheet() {
     if (row['Состав назначений']) {
       group.compositions.push(String(row['Состав назначений']));
     }
+
+    String(row['Типы назначений'] || '').toUpperCase().split('').forEach(code => {
+      if (APPOINTMENT_TYPE_CODE_ORDER.indexOf(code) !== -1) group.typeCodes.add(code);
+    });
 
     splitLines_(row['Ближайшие заявки пациента']).forEach(line => addUniqueText_(group.nearestRequests, line));
 
@@ -311,6 +513,7 @@ function buildBitrixDealsSheet() {
         DEALS_CONFIG.bitrixDealSource,
         group.uids.length,
         aggregateAppointmentCompositionText_(group.compositions),
+        mergeAppointmentTypeCodes_(Array.from(group.typeCodes)),
         group.nearestRequests.join('\n'),
         '', // Телефон клиента — заполнит n8n
         '', // Комментарий администратора — заполнит n8n
@@ -920,7 +1123,7 @@ function writeBitrixDealsOutput_(ss, outputRows) {
   sheet.getRange(2, aiUpdatedAtColumn, totalRows, 1).setNumberFormat('dd.MM.yyyy HH:mm:ss');
 
   if (outputRows.length > 0) {
-    sheet.getRange(2, 12, outputRows.length, 10).setWrap(true);
+    sheet.getRange(2, 12, outputRows.length, 11).setWrap(true);
   }
 
   sheet.autoResizeColumns(1, BITRIX_DEALS_HEADERS.length);
@@ -929,10 +1132,11 @@ function writeBitrixDealsOutput_(ss, outputRows) {
   sheet.setColumnWidth(14, 180);
   sheet.setColumnWidth(15, 450);
   sheet.setColumnWidth(16, 800);
-  sheet.setColumnWidth(17, 600);
-  sheet.setColumnWidth(18, 800);
-  sheet.setColumnWidth(20, 800);
+  sheet.setColumnWidth(17, 120);
+  sheet.setColumnWidth(18, 600);
+  sheet.setColumnWidth(19, 800);
   sheet.setColumnWidth(21, 800);
+  sheet.setColumnWidth(22, 800);
 
   if (sheet.getFilter()) {
     sheet.getFilter().remove();
@@ -1231,6 +1435,7 @@ function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient) {
     : 0;
 
   const appointmentComposition = buildAppointmentCompositionText_(uidGroup.items);
+  const appointmentTypeCodes = buildAppointmentTypeCodes_(uidGroup.items);
 
   const nearestRequests = nearestRequestsByClient.get(normalizeCode_(uidGroup.patientCode)) || [];
   const nearestRequestsText = nearestRequests
@@ -1274,6 +1479,7 @@ function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient) {
       uidGroup.doctor,
       uidGroup.standard,
       appointmentComposition,
+      appointmentTypeCodes,
       Array.from(matchedRequestNumbers).join(', '),
       nearestRequestsText,
       description,
@@ -1294,11 +1500,11 @@ function testBuildUidDealRowStatusPriority_() {
     standard: 'Тестовый стандарт',
     firstTreatmentDate: baseDate,
     items: [
-      { treatmentDate: baseDate, nomenclature: 'Услуга 1', price: 1000 },
-      { treatmentDate: baseDate, nomenclature: 'Услуга 2', price: 1000 },
-      { treatmentDate: baseDate, nomenclature: 'Услуга 3', price: 1000 },
-      { treatmentDate: baseDate, nomenclature: 'Услуга 4', price: 1000 },
-      { treatmentDate: baseDate, nomenclature: 'Услуга 5', price: 1000 }
+      { treatmentDate: baseDate, nomenclature: 'Услуга 1', price: 1000, typeCode: 'L' },
+      { treatmentDate: baseDate, nomenclature: 'Услуга 2', price: 1000, typeCode: 'M' },
+      { treatmentDate: baseDate, nomenclature: 'Услуга 3', price: 1000, typeCode: 'S' },
+      { treatmentDate: baseDate, nomenclature: 'Услуга 4', price: 1000, typeCode: 'F' },
+      { treatmentDate: baseDate, nomenclature: 'Услуга 5', price: 1000, typeCode: 'C' }
     ]
   };
 
@@ -1371,6 +1577,13 @@ function buildUidStatusPriorityTestRequest_(nomenclature, state, startDate, clie
   row[c.number] = 'TEST-' + nomenclature;
   row[c.nomenclature] = nomenclature;
   row[c.cabinet] = '';
+  row.typeCode = nomenclature === 'Другая услуга' ? 'D' : {
+    'Услуга 1': 'L',
+    'Услуга 2': 'M',
+    'Услуга 3': 'S',
+    'Услуга 4': 'F',
+    'Услуга 5': 'C'
+  }[nomenclature] || '';
 
   return row;
 }
@@ -1378,20 +1591,25 @@ function buildUidStatusPriorityTestRequest_(nomenclature, state, startDate, clie
 
 function findCandidateRequestsForAppointmentItem_(uidGroup, item, requestIndexes) {
   const out = [];
+  const typeCode = String(item.typeCode || '').trim().toUpperCase();
 
-  const exactKey = buildExactServiceMatchKeyWithoutDate_(
+  if (!typeCode || typeCode === '-') {
+    return out;
+  }
+
+  const typeKey = buildTypeServiceMatchKeyWithoutDate_(
     uidGroup.patientCode,
     uidGroup.branch,
-    item.nomenclature
+    typeCode
   );
 
-  const exactRequests = requestIndexes.exact.get(exactKey) || [];
+  const typeRequests = requestIndexes.type.get(typeKey) || [];
 
-  exactRequests.forEach(req => {
+  typeRequests.forEach(req => {
     if (isRequestSuitableByDateAndStatus_(req, item.treatmentDate)) {
       out.push({
         request: req,
-        reason: 'совпадение по номенклатуре'
+        reason: 'совпадение по типу ' + typeCode
       });
     }
   });
@@ -1401,22 +1619,16 @@ function findCandidateRequestsForAppointmentItem_(uidGroup, item, requestIndexes
     return out;
   }
 
-  const appointmentCategory = detectAppointmentServiceCategory_(item.nomenclature);
+  // Резерв по кабинету допустим только для заявок без номенклатуры.
+  const fallbackRequests = requestIndexes.emptyNomenclatureByClientBranch.get(
+    buildClientBranchMatchKeyWithoutDate_(uidGroup.patientCode, uidGroup.branch)
+  ) || [];
 
-  if (!appointmentCategory) {
-    return out;
-  }
-
-  const categoryKey = buildCategoryServiceMatchKeyWithoutDate_(
-    uidGroup.patientCode,
-    uidGroup.branch,
-    appointmentCategory
-  );
-
-  const categoryRequests = requestIndexes.category.get(categoryKey) || [];
-
-  categoryRequests.forEach(req => {
-    if (isRequestSuitableByDateAndStatus_(req, item.treatmentDate)) {
+  fallbackRequests.forEach(req => {
+    if (
+      isEmptyNomenclatureRequestSuitableForType_(req, typeCode) &&
+      isRequestSuitableByDateAndStatus_(req, item.treatmentDate)
+    ) {
       out.push({
         request: req,
         reason: 'совпадение по кабинету ' + req.cabinet
@@ -1425,6 +1637,15 @@ function findCandidateRequestsForAppointmentItem_(uidGroup, item, requestIndexes
   });
 
   return out;
+}
+
+
+function isEmptyNomenclatureRequestSuitableForType_(request, typeCode) {
+  const cabinetCategory = detectRequestServiceCategoryByCabinet_(request.cabinet);
+  return (
+    (typeCode === 'L' && cabinetCategory === 'LASER') ||
+    (typeCode === 'S' && cabinetCategory === 'SIS')
+  );
 }
 
 
@@ -1598,8 +1819,8 @@ function isAnalysisService_(name) {
 function buildRequestIndexes_(requests) {
   const c = DEALS_CONFIG.requestColumns;
 
-  const exact = new Map();
-  const category = new Map();
+  const type = new Map();
+  const emptyNomenclatureByClientBranch = new Map();
 
   requests.forEach(row => {
     const clientCode = row[c.clientCode];
@@ -1626,38 +1847,33 @@ function buildRequestIndexes_(requests) {
       endDateRaw: row[c.endDate]
     };
 
-    if (nomenclature) {
-      const exactKey = buildExactServiceMatchKeyWithoutDate_(
+    const typeCode = String(row.typeCode || '').trim().toUpperCase();
+    req.typeCode = typeCode;
+
+    if (nomenclature && typeCode && typeCode !== '-') {
+      const typeKey = buildTypeServiceMatchKeyWithoutDate_(
         clientCode,
         branch,
-        nomenclature
+        typeCode
       );
 
-      if (!exact.has(exactKey)) {
-        exact.set(exactKey, []);
+      if (!type.has(typeKey)) {
+        type.set(typeKey, []);
       }
 
-      exact.get(exactKey).push(req);
+      type.get(typeKey).push(req);
     }
 
-    const requestCategory = detectRequestServiceCategoryByCabinet_(cabinet);
-
-    if (requestCategory) {
-      const categoryKey = buildCategoryServiceMatchKeyWithoutDate_(
-        clientCode,
-        branch,
-        requestCategory
-      );
-
-      if (!category.has(categoryKey)) {
-        category.set(categoryKey, []);
+    if (!String(nomenclature || '').trim()) {
+      const fallbackKey = buildClientBranchMatchKeyWithoutDate_(clientCode, branch);
+      if (!emptyNomenclatureByClientBranch.has(fallbackKey)) {
+        emptyNomenclatureByClientBranch.set(fallbackKey, []);
       }
-
-      category.get(categoryKey).push(req);
+      emptyNomenclatureByClientBranch.get(fallbackKey).push(req);
     }
   });
 
-  return { exact, category };
+  return { type, emptyNomenclatureByClientBranch };
 }
 
 
@@ -1718,6 +1934,7 @@ function groupAppointmentsByUid_(appointments) {
     const treatmentDate = parseDateOnly_(row[c.treatmentDate]);
     const nomenclature = String(row[c.nomenclature] || '').trim();
     const price = parseNumber_(row[c.price]);
+    const typeCode = String(row.typeCode || '').trim().toUpperCase();
 
     if (!uid || !branch || !patientCode || !patient || !treatmentDate || !nomenclature) {
       return;
@@ -1751,7 +1968,8 @@ function groupAppointmentsByUid_(appointments) {
     groups[uid].items.push({
       treatmentDate,
       nomenclature,
-      price
+      price,
+      typeCode
     });
   });
 
@@ -1785,6 +2003,7 @@ function writeDealsOutput_(ss, outputRows) {
     'Врач',
     'Стандарт лечения',
     'Состав назначений',
+    'Типы назначений',
     'Номера найденных заявок',
     'Ближайшие заявки пациента',
     'Описание сделки',
@@ -1812,7 +2031,7 @@ function writeDealsOutput_(ss, outputRows) {
   sheet.getRange(2, 9, totalRows, 1).setNumberFormat('dd.MM.yyyy');
 
   if (outputRows.length > 0) {
-    sheet.getRange(2, 12, outputRows.length, 5).setWrap(true);
+    sheet.getRange(2, 12, outputRows.length, 6).setWrap(true);
 
     const statusValues = sheet.getRange(2, 1, outputRows.length, 1).getValues();
 
@@ -1840,6 +2059,7 @@ function writeDealsOutput_(ss, outputRows) {
   sheet.setColumnWidth(14, 500);
   sheet.setColumnWidth(15, 800);
   sheet.setColumnWidth(16, 800);
+  sheet.setColumnWidth(17, 800);
 
   if (sheet.getFilter()) {
     sheet.getFilter().remove();
@@ -1935,6 +2155,20 @@ function buildCategoryServiceMatchKeyWithoutDate_(clientCode, branch, category) 
     normalizeText_(branch),
     String(category || '').trim()
   ].join('|');
+}
+
+
+function buildTypeServiceMatchKeyWithoutDate_(clientCode, branch, typeCode) {
+  return [
+    normalizeCode_(clientCode),
+    normalizeText_(branch),
+    String(typeCode || '').trim().toUpperCase()
+  ].join('|');
+}
+
+
+function buildClientBranchMatchKeyWithoutDate_(clientCode, branch) {
+  return [normalizeCode_(clientCode), normalizeText_(branch)].join('|');
 }
 
 
@@ -2554,6 +2788,7 @@ function createBitrixDealFromRow_(row, doctorUserMap) {
     row['Описание назначений'] || row['Назначения'] || ''
   );
   const aiSummary = formatAiSummaryForBitrix_(row['AI справка'] || '');
+  const appointmentTypeCodes = mergeAppointmentTypeCodes_([row['Типы назначений'] || '']);
   const adminComment = normalizeMultilineTextForBitrix_(
     row['Комментарий администратора'] || ''
   );
@@ -2572,6 +2807,7 @@ function createBitrixDealFromRow_(row, doctorUserMap) {
     UF_CRM_1783751372: uids,
     UF_CRM_1783751578: dealHash,
     UF_CRM_1783752197: appointmentsText,
+    UF_CRM_1784225678: appointmentTypeCodes,
     UF_CRM_1783752297: aiSummary
   };
 
@@ -2613,6 +2849,7 @@ function debugBitrixDealFields() {
     'UF_CRM_1783751578',
     'UF_CRM_1783751996',
     'UF_CRM_1783752197',
+    'UF_CRM_1784225678',
     'UF_CRM_1783752297',
     'UF_CRM_1784034617',
     'UF_CRM_615C18C0D7CD9'
