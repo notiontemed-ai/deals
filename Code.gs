@@ -2427,11 +2427,67 @@ function getOrCreateSheet_(ss, sheetName) {
  ****************************************************/
 
 const BITRIX_DEAL_CATEGORY_ID = 114;
+const BITRIX_DEAL_STAGE_CONTACT = 'C114:NEW';
+const BITRIX_DEAL_STAGE_WAITING = 'C114:UC_2ITBVA';
+const BITRIX_DEAL_CONTACT_WINDOW_DAYS = 5;
 const BITRIX_DEAL_ASSIGNED_BY_ID = 22718;
 const BITRIX_DEAL_SMALL_AMOUNT_ASSIGNED_BY_ID = 6108;
 const BITRIX_DEAL_SMALL_AMOUNT_LIMIT = 20000;
 const BITRIX_EMPLOYEES_SHEET_NAME = 'Справочник сотрудников';
 const BITRIX_DEAL_SUCCESS_STATUSES = ['Отправлено', 'sent_to_bitrix', 'Уже существует в Bitrix'];
+
+function getTodayDateOnly_() {
+  const timeZone = Session.getScriptTimeZone();
+  const todayText = Utilities.formatDate(new Date(), timeZone, 'yyyy-MM-dd');
+  return parseDateOnly_(todayText);
+}
+
+function getInitialBitrixDealStageId_(firstPlanDateValue) {
+  const firstPlanDate = parseDateOnly_(firstPlanDateValue);
+  const today = getTodayDateOnly_();
+
+  if (!firstPlanDate || !today) {
+    return BITRIX_DEAL_STAGE_CONTACT;
+  }
+
+  const differenceInCalendarDays = Math.round(
+    (firstPlanDate.getTime() - today.getTime()) /
+    (24 * 60 * 60 * 1000)
+  );
+
+  return differenceInCalendarDays > BITRIX_DEAL_CONTACT_WINDOW_DAYS
+    ? BITRIX_DEAL_STAGE_WAITING
+    : BITRIX_DEAL_STAGE_CONTACT;
+}
+
+function testInitialBitrixDealStageId_() {
+  const today = getTodayDateOnly_();
+  const dateInDays = function(days) {
+    const date = new Date(today.getTime());
+    date.setDate(date.getDate() + days);
+    return date;
+  };
+  const checks = [
+    { name: 'дата через 6 дней', value: dateInDays(6), expected: BITRIX_DEAL_STAGE_WAITING },
+    { name: 'дата через 5 дней', value: dateInDays(5), expected: BITRIX_DEAL_STAGE_CONTACT },
+    { name: 'дата через 4 дня', value: dateInDays(4), expected: BITRIX_DEAL_STAGE_CONTACT },
+    { name: 'сегодня', value: dateInDays(0), expected: BITRIX_DEAL_STAGE_CONTACT },
+    { name: 'дата в прошлом', value: dateInDays(-1), expected: BITRIX_DEAL_STAGE_CONTACT },
+    { name: 'пустая дата', value: '', expected: BITRIX_DEAL_STAGE_CONTACT }
+  ];
+
+  checks.forEach(check => {
+    const actual = getInitialBitrixDealStageId_(check.value);
+    if (actual !== check.expected) {
+      throw new Error(
+        'Ошибка проверки начальной стадии Bitrix для «' + check.name +
+        '»: ожидалось ' + check.expected + ', получено ' + actual + '.'
+      );
+    }
+  });
+
+  return 'Проверка определения начальной стадии Bitrix пройдена.';
+}
 
 function getBitrixDealAssignedById_(amount) {
   const value = Number(amount) || 0;
@@ -2796,8 +2852,11 @@ function createBitrixDealFromRow_(row, doctorUserMap) {
   const phone = String(row['Телефон клиента'] || '').trim();
   const planItemsJson = String(row['Plan Items JSON'] || '').trim();
   const dealAmount = parseMoney_(row['Сумма сделки']);
+  const firstPlanDateValue = row['Первый плановый день'];
+  const initialStageId = getInitialBitrixDealStageId_(firstPlanDateValue);
   const fields = {
     CATEGORY_ID: BITRIX_DEAL_CATEGORY_ID,
+    STAGE_ID: initialStageId,
     ASSIGNED_BY_ID: getBitrixDealAssignedById_(dealAmount),
     TITLE: buildBitrixDealTitle_(row),
     OPPORTUNITY: dealAmount,
@@ -2826,7 +2885,7 @@ function createBitrixDealFromRow_(row, doctorUserMap) {
     warnings.push('Врач не сопоставлен с сотрудником Bitrix: ' + doctorName);
   }
 
-  const firstPlanDate = parseDateForBitrix_(row['Первый плановый день']);
+  const firstPlanDate = parseDateForBitrix_(firstPlanDateValue);
   if (firstPlanDate) {
     fields.UF_CRM_1783751996 = firstPlanDate;
   }
