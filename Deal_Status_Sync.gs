@@ -1,5 +1,5 @@
 /****************************************************
- * TEMED — вечерняя сверка сделок Bitrix с заявками 1С
+ * TEMED — сверка сделок Bitrix с заявками 1С
  *
  * Что делает скрипт:
  * 1. Загружает из Bitrix только сделки TEMED, у которых
@@ -25,9 +25,6 @@
  * BITRIX_WEBHOOK_BASE_URL
  * Пример: https://example.bitrix24.ru/rest/1/xxxxxxxxxxxxxxxx/
  *
- * Скрипт рассчитан на добавление отдельным .gs-файлом в существующий
- * Apps Script проект. Функцию onOpen не объявляет, чтобы не конфликтовать
- * с уже существующим меню проекта.
  ****************************************************/
 
 const TSD_CONFIG = Object.freeze({
@@ -231,7 +228,73 @@ const TSD_LOG_HEADERS = [
  ****************************************************/
 
 /**
- * Основной вечерний запуск: проверяет сделки и обновляет стадии в Bitrix.
+ * Добавляет меню сверки сделок при открытии таблицы.
+ */
+function onOpen(e) {
+  DSS_addDealStatusSyncMenu_();
+}
+
+function DSS_addDealStatusSyncMenu_() {
+  SpreadsheetApp.getUi()
+    .createMenu('Сверка сделок Bitrix')
+    .addItem(
+      'Инициализировать служебные листы',
+      'initializeBitrixDealStageSync'
+    )
+    .addItem(
+      'Предпросмотр сверки',
+      'previewBitrixDealStagesByRequests'
+    )
+    .addSeparator()
+    .addItem(
+      'Выполнить сверку и обновить Bitrix',
+      'DSS_runSyncWithConfirmation_'
+    )
+    .addToUi();
+}
+
+function DSS_runSyncWithConfirmation_() {
+  const ui = SpreadsheetApp.getUi();
+
+  const response = ui.alert(
+    'Обновление стадий Bitrix',
+    'Скрипт выполнит сверку заявок и изменит стадии подходящих сделок в Bitrix. Продолжить?',
+    ui.ButtonSet.YES_NO
+  );
+
+  if (response !== ui.Button.YES) {
+    return;
+  }
+
+  try {
+    syncBitrixDealStagesByRequests();
+  } catch (error) {
+    console.error(error);
+
+    ui.alert(
+      'Ошибка сверки',
+      DSS_getUserSafeErrorMessage_(error),
+      ui.ButtonSet.OK
+    );
+
+    throw error;
+  }
+}
+
+function DSS_getUserSafeErrorMessage_(error) {
+  const message = error && error.message ? error.message : String(error);
+  const missingWebhookProperty =
+    'Не задано свойство скрипта BITRIX_WEBHOOK_BASE_URL.';
+
+  if (message.indexOf(missingWebhookProperty) !== -1) {
+    return missingWebhookProperty;
+  }
+
+  return 'Во время выполнения произошла ошибка. Проверьте журнал выполнения Apps Script.';
+}
+
+/**
+ * Основной запуск: проверяет сделки и обновляет стадии в Bitrix.
  */
 function syncBitrixDealStagesByRequests() {
   return TSD_runSync_(false);
@@ -260,32 +323,6 @@ function initializeBitrixDealStageSync() {
     8
   );
 }
-
-/**
- * Устанавливает ежедневный триггер примерно на 21:00 по часовому поясу проекта.
- * Перед созданием удаляет прежние триггеры этой же функции.
- */
-function installEveningBitrixDealStageSyncTrigger() {
-  const handler = 'syncBitrixDealStagesByRequests';
-  ScriptApp.getProjectTriggers().forEach(trigger => {
-    if (trigger.getHandlerFunction() === handler) {
-      ScriptApp.deleteTrigger(trigger);
-    }
-  });
-
-  ScriptApp.newTrigger(handler)
-    .timeBased()
-    .everyDays(1)
-    .atHour(21)
-    .create();
-
-  SpreadsheetApp.getActive().toast(
-    'Ежедневный триггер установлен примерно на 21:00.',
-    'TEMED — сверка сделок',
-    8
-  );
-}
-
 
 /****************************************************
  * Главный процесс
@@ -455,18 +492,16 @@ function TSD_runSync_(dryRun) {
  ****************************************************/
 
 function TSD_getBitrixWebhookBaseUrl_() {
-  const raw = PropertiesService.getScriptProperties()
-    .getProperty(TSD_CONFIG.scriptProperties.webhookBaseUrl);
+  const raw = String(
+    PropertiesService.getScriptProperties()
+      .getProperty(TSD_CONFIG.scriptProperties.webhookBaseUrl) || ''
+  ).trim();
 
   if (!raw) {
-    throw new Error(
-      'Не задано свойство скрипта ' +
-      TSD_CONFIG.scriptProperties.webhookBaseUrl +
-      '. Укажите полный базовый URL входящего вебхука Bitrix.'
-    );
+    throw new Error('Не задано свойство скрипта BITRIX_WEBHOOK_BASE_URL.');
   }
 
-  return String(raw).trim().replace(/\/+$/, '') + '/';
+  return raw.replace(/\/+$/, '') + '/';
 }
 
 function TSD_resolveBitrixFields_(baseUrl) {
