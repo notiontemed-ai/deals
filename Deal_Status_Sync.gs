@@ -1,5 +1,5 @@
 /****************************************************
- * TEMED — вечерняя сверка сделок Bitrix с заявками 1С
+ * TEMED — сверка сделок Bitrix с заявками 1С
  *
  * Что делает скрипт:
  * 1. Загружает из Bitrix только сделки TEMED, у которых
@@ -26,8 +26,7 @@
  * Пример: https://example.bitrix24.ru/rest/1/xxxxxxxxxxxxxxxx/
  *
  * Скрипт рассчитан на добавление отдельным .gs-файлом в существующий
- * Apps Script проект. Функцию onOpen не объявляет, чтобы не конфликтовать
- * с уже существующим меню проекта.
+ * Apps Script проект.
  ****************************************************/
 
 const TSD_CONFIG = Object.freeze({
@@ -231,7 +230,7 @@ const TSD_LOG_HEADERS = [
  ****************************************************/
 
 /**
- * Основной вечерний запуск: проверяет сделки и обновляет стадии в Bitrix.
+ * Основной запуск: проверяет сделки и обновляет стадии в Bitrix.
  */
 function syncBitrixDealStagesByRequests() {
   return TSD_runSync_(false);
@@ -261,29 +260,61 @@ function initializeBitrixDealStageSync() {
   );
 }
 
-/**
- * Устанавливает ежедневный триггер примерно на 21:00 по часовому поясу проекта.
- * Перед созданием удаляет прежние триггеры этой же функции.
- */
-function installEveningBitrixDealStageSyncTrigger() {
-  const handler = 'syncBitrixDealStagesByRequests';
-  ScriptApp.getProjectTriggers().forEach(trigger => {
-    if (trigger.getHandlerFunction() === handler) {
-      ScriptApp.deleteTrigger(trigger);
-    }
-  });
+function DSS_addDealStatusSyncMenu_() {
+  SpreadsheetApp.getUi()
+    .createMenu('Сверка сделок Bitrix')
+    .addItem(
+      'Инициализировать служебные листы',
+      'initializeBitrixDealStageSync'
+    )
+    .addItem(
+      'Предпросмотр сверки',
+      'previewBitrixDealStagesByRequests'
+    )
+    .addSeparator()
+    .addItem(
+      'Выполнить сверку и обновить Bitrix',
+      'DSS_runSyncWithConfirmation_'
+    )
+    .addToUi();
+}
 
-  ScriptApp.newTrigger(handler)
-    .timeBased()
-    .everyDays(1)
-    .atHour(21)
-    .create();
+function DSS_runSyncWithConfirmation_() {
+  const ui = SpreadsheetApp.getUi();
 
-  SpreadsheetApp.getActive().toast(
-    'Ежедневный триггер установлен примерно на 21:00.',
-    'TEMED — сверка сделок',
-    8
+  const response = ui.alert(
+    'Обновление стадий Bitrix',
+    'Скрипт выполнит сверку заявок и изменит стадии подходящих сделок в Bitrix. Продолжить?',
+    ui.ButtonSet.YES_NO
   );
+
+  if (response !== ui.Button.YES) {
+    return;
+  }
+
+  try {
+    syncBitrixDealStagesByRequests();
+  } catch (error) {
+    const message = DSS_getSafeErrorMessage_(error);
+    console.error(message);
+
+    ui.alert(
+      'Ошибка сверки',
+      'Во время выполнения произошла ошибка:\n\n' + message,
+      ui.ButtonSet.OK
+    );
+
+    throw error;
+  }
+}
+
+function DSS_getSafeErrorMessage_(error) {
+  const message = error && error.message ? error.message : String(error || 'Неизвестная ошибка');
+  const withoutUrls = message.replace(/https?:\/\/[^\s"')]+/gi, '[скрыто]');
+  const withoutSecrets = withoutUrls.replace(/(token|authorization|webhook)\s*[:=]\s*[^\s,;]+/gi, '$1: [скрыто]');
+  return withoutSecrets.length > 500
+    ? withoutSecrets.slice(0, 500) + '…'
+    : withoutSecrets;
 }
 
 
@@ -457,16 +488,13 @@ function TSD_runSync_(dryRun) {
 function TSD_getBitrixWebhookBaseUrl_() {
   const raw = PropertiesService.getScriptProperties()
     .getProperty(TSD_CONFIG.scriptProperties.webhookBaseUrl);
+  const baseUrl = String(raw || '').trim();
 
-  if (!raw) {
-    throw new Error(
-      'Не задано свойство скрипта ' +
-      TSD_CONFIG.scriptProperties.webhookBaseUrl +
-      '. Укажите полный базовый URL входящего вебхука Bitrix.'
-    );
+  if (!baseUrl) {
+    throw new Error('Не задано свойство скрипта BITRIX_WEBHOOK_BASE_URL.');
   }
 
-  return String(raw).trim().replace(/\/+$/, '') + '/';
+  return baseUrl.replace(/\/+$/, '') + '/';
 }
 
 function TSD_resolveBitrixFields_(baseUrl) {
@@ -1780,11 +1808,11 @@ function TSD_elapsedText_(startedAt) {
 
 function TSD_errorText_(error) {
   if (!error) return 'Неизвестная ошибка';
-  if (typeof error === 'string') return error;
-  if (error.message) return String(error.message);
+  if (typeof error === 'string') return DSS_getSafeErrorMessage_(error);
+  if (error.message) return DSS_getSafeErrorMessage_(error);
   try {
-    return JSON.stringify(error);
+    return DSS_getSafeErrorMessage_(JSON.stringify(error));
   } catch (jsonError) {
-    return String(error);
+    return DSS_getSafeErrorMessage_(String(error));
   }
 }

@@ -126,6 +126,8 @@ function onOpen() {
     .addItem('Проверить поля Bitrix', 'debugBitrixDealFields')
     .addItem('Проверить дубли отправки Bitrix', 'checkBitrixDuplicateRegistry')
     .addToUi();
+
+  DSS_addDealStatusSyncMenu_();
 }
 
 
