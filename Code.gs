@@ -131,7 +131,7 @@ function onOpen() {
     .addSeparator()
     .addItem('Обновить справочник сотрудников Bitrix', 'updateBitrixEmployeesDirectory')
     .addItem('Отправить сделки в Bitrix', 'uploadBitrixDeals')
-    .addItem('Заполнить типы в существующих сделках Bitrix', 'backfillBitrixDealAppointmentTypes')
+    .addItem('Заполнить типы и коды пациентов в существующих сделках Bitrix', 'backfillBitrixDealAppointmentTypes')
     .addItem('Проверить поля Bitrix', 'debugBitrixDealFields')
     .addItem('Проверить дубли отправки Bitrix', 'checkBitrixDuplicateRegistry')
     .addToUi();
@@ -842,29 +842,30 @@ function readBitrixSentUidRegistry_(ss) {
   const data = readSheetWithHeaders_(sheet);
   const sentUidSet = new Set();
   const rowsByUid = new Map();
+  const rowsByDealId = new Map();
 
   data.rows.forEach((row, i) => {
     const uid = String(row['УИД'] || '').trim();
     const status = String(row['Статус'] || '').trim();
 
-    if (!uid) {
-      return;
-    }
-
+    const dealId = String(row['Bitrix Deal ID'] || '').trim();
     const enrichedRow = Object.assign({ rowNumber: i + 2 }, row);
 
-    if (!rowsByUid.has(uid)) {
-      rowsByUid.set(uid, []);
+    if (uid) {
+      if (!rowsByUid.has(uid)) rowsByUid.set(uid, []);
+      rowsByUid.get(uid).push(enrichedRow);
     }
-
-    rowsByUid.get(uid).push(enrichedRow);
+    if (dealId) {
+      if (!rowsByDealId.has(dealId)) rowsByDealId.set(dealId, []);
+      rowsByDealId.get(dealId).push(enrichedRow);
+    }
 
     if (BITRIX_REGISTRY_BLOCKING_STATUSES.indexOf(status) !== -1) {
       sentUidSet.add(uid);
     }
   });
 
-  return { sentUidSet, rowsByUid };
+  return { sentUidSet, rowsByUid, rowsByDealId };
 }
 
 function getOrCreateBitrixRegistrySheet_(ss) {
@@ -2427,6 +2428,8 @@ function getOrCreateSheet_(ss, sheetName) {
  ****************************************************/
 
 const BITRIX_DEAL_CATEGORY_ID = 114;
+const BITRIX_DEAL_TYPES_FIELD = 'UF_CRM_1784225678';
+const BITRIX_DEAL_PATIENT_CODE_FIELD = 'UF_CRM_1783751141';
 const BITRIX_DEAL_STAGE_CONTACT = 'C114:NEW';
 const BITRIX_DEAL_STAGE_WAITING = 'C114:UC_2ITBVA';
 const BITRIX_DEAL_CONTACT_WINDOW_DAYS = 5;
@@ -2854,6 +2857,7 @@ function createBitrixDealFromRow_(row, doctorUserMap) {
   const dealAmount = parseMoney_(row['Сумма сделки']);
   const firstPlanDateValue = row['Первый плановый день'];
   const initialStageId = getInitialBitrixDealStageId_(firstPlanDateValue);
+  const patientCode = normalizePatientCodeForBitrix_(row['Пациент.Код']);
   const fields = {
     CATEGORY_ID: BITRIX_DEAL_CATEGORY_ID,
     STAGE_ID: initialStageId,
@@ -2867,9 +2871,15 @@ function createBitrixDealFromRow_(row, doctorUserMap) {
     UF_CRM_1783751372: uids,
     UF_CRM_1783751578: dealHash,
     UF_CRM_1783752197: appointmentsText,
-    UF_CRM_1784225678: appointmentTypeCodes,
+    [BITRIX_DEAL_TYPES_FIELD]: appointmentTypeCodes,
     UF_CRM_1783752297: aiSummary
   };
+
+  if (patientCode) {
+    fields[BITRIX_DEAL_PATIENT_CODE_FIELD] = patientCode;
+  } else {
+    warnings.push('В сделке не указан Пациент.Код.');
+  }
 
   if (phone) {
     fields.UF_CRM_615C18C0D7CD9 = phone;
@@ -2906,9 +2916,8 @@ function createBitrixDealFromRow_(row, doctorUserMap) {
 function backfillBitrixDealAppointmentTypes() {
   const lock = LockService.getScriptLock();
   const ui = SpreadsheetApp.getUi();
-
   if (!lock.tryLock(1)) {
-    ui.alert('Заполнение типов в существующих сделках Bitrix уже выполняется.');
+    ui.alert('Актуализация существующих сделок Bitrix уже выполняется.');
     return;
   }
 
@@ -2918,90 +2927,236 @@ function backfillBitrixDealAppointmentTypes() {
     const dictionary = validateBackfillAppointmentTypeDictionary_(typeCodesSheet);
     const deals = fetchBitrixDealsForTypeBackfill_();
     const registry = readBitrixSentUidRegistry_(ss);
+    const patientCodesByDealId = readPatientCodesByBitrixDealId_(ss);
     const stats = {
-      loaded: deals.length,
-      empty: 0,
-      alreadyFilled: 0,
-      noTypes: 0,
-      noData: 0,
-      updated: 0,
-      errors: []
+      loaded: deals.length, emptyTypes: 0, emptyPatientCodes: 0, alreadyFilled: 0,
+      readyTypes: 0, readyPatientCodes: 0, both: 0, noTypes: 0, noPatientCode: 0,
+      patientCodeConflicts: 0, updated: 0, typesUpdated: 0, patientCodesUpdated: 0,
+      bothUpdated: 0, errors: []
     };
     const unknown = new Map();
     const updates = [];
 
     deals.forEach(deal => {
-      if (!isEmptyBitrixAppointmentTypes_(deal.UF_CRM_1784225678)) {
+      const typesEmpty = isEmptyBitrixValue_(deal[BITRIX_DEAL_TYPES_FIELD]);
+      const patientCodeEmpty = isEmptyBitrixValue_(deal[BITRIX_DEAL_PATIENT_CODE_FIELD]);
+      if (!typesEmpty && !patientCodeEmpty) {
         stats.alreadyFilled += 1;
         return;
       }
+      if (typesEmpty) stats.emptyTypes += 1;
+      if (patientCodeEmpty) stats.emptyPatientCodes += 1;
 
-      stats.empty += 1;
-      if (!isTemedIntegrationDeal_(deal)) return;
-
-      const extracted = extractDealNomenclatures_(deal, registry.rowsByUid);
-      if (!extracted.items.length) {
-        stats.noData += 1;
-        return;
+      const fieldsToUpdate = {};
+      if (typesEmpty) {
+        const extracted = extractDealNomenclatures_(deal, registry.rowsByUid);
+        if (!extracted.items.length) {
+          stats.noTypes += 1;
+        } else {
+          const hasUnknownType = extracted.items.some(item => {
+            const normalized = normalizeTypeNomenclature_(item);
+            if (dictionary.map.has(normalized)) return false;
+            if (!unknown.has(normalized)) unknown.set(normalized, item);
+            return true;
+          });
+          const typeCodes = hasUnknownType ? '' : buildBackfillTypeCodes_(extracted.items, dictionary.map);
+          if (typeCodes) {
+            fieldsToUpdate[BITRIX_DEAL_TYPES_FIELD] = typeCodes;
+            stats.readyTypes += 1;
+          } else {
+            stats.noTypes += 1;
+          }
+        }
       }
 
-      Logger.log('Сделка ' + deal.ID + ' (' + (deal.TITLE || '') + '): источник — ' + extracted.source);
-      extracted.items.forEach(item => {
-        const normalized = normalizeTypeNomenclature_(item);
-        if (!dictionary.map.has(normalized) && !unknown.has(normalized)) {
-          unknown.set(normalized, item);
+      if (patientCodeEmpty) {
+        const patientCodeResult = resolvePatientCodeForBackfill_(deal, registry, patientCodesByDealId);
+        if (patientCodeResult.conflict) {
+          stats.patientCodeConflicts += 1;
+          Logger.log('Сделка ' + deal.ID + ': найдено несколько кодов пациента: ' +
+            patientCodeResult.codes.join(', ') + '. Источники: ' + patientCodeResult.sources.join(', ') + '.');
+        } else if (patientCodeResult.code) {
+          fieldsToUpdate[BITRIX_DEAL_PATIENT_CODE_FIELD] = patientCodeResult.code;
+          stats.readyPatientCodes += 1;
+        } else {
+          stats.noPatientCode += 1;
         }
-      });
+      }
 
-      const typeCodes = buildBackfillTypeCodes_(extracted.items, dictionary.map);
-      if (typeCodes) {
-        updates.push({ id: String(deal.ID), title: String(deal.TITLE || ''), typeCodes: typeCodes });
-        Logger.log('Сделка ' + deal.ID + ': рассчитаны типы ' + typeCodes + '.');
-      } else {
-        stats.noTypes += 1;
+      const updatesTypes = Object.prototype.hasOwnProperty.call(fieldsToUpdate, BITRIX_DEAL_TYPES_FIELD);
+      const updatesPatientCode = Object.prototype.hasOwnProperty.call(fieldsToUpdate, BITRIX_DEAL_PATIENT_CODE_FIELD);
+      if (updatesTypes && updatesPatientCode) stats.both += 1;
+      if (updatesTypes || updatesPatientCode) {
+        updates.push({ id: String(deal.ID), title: String(deal.TITLE || ''), fields: fieldsToUpdate });
+        Logger.log('Сделка ' + deal.ID + ' (' + (deal.TITLE || '') + '): будут заполнены поля ' +
+          Object.keys(fieldsToUpdate).join(', ') + '.');
       }
     });
 
     if (unknown.size) {
       appendMissingNomenclatures_(typeCodesSheet, Array.from(unknown.entries()).map(entry => ({
-        normalized: entry[0],
-        nomenclature: entry[1]
+        normalized: entry[0], nomenclature: entry[1]
       })));
       typeCodesSheet.activate();
-      ui.alert([
-        'Обнаружена номенклатура без присвоенного типа.',
-        '',
-        'Добавлено новых позиций: ' + unknown.size + '.',
-        '',
-        'Заполните колонку «Тип» на листе «Коды типов назначений» и повторно запустите «Заполнить типы в существующих сделках Bitrix».'
-      ].join('\n'));
-      return;
+      ui.alert('Обнаружена номенклатура без присвоенного типа. Добавлено новых позиций: ' + unknown.size +
+        '. Типы для этих сделок не будут записаны до следующего запуска; коды пациентов будут обработаны сейчас.');
     }
 
-    const confirmation = ui.alert([
-      'Найдено сделок с пустым полем типов: ' + stats.empty + '.',
-      '',
-      'Готово к заполнению: ' + updates.length + '.',
-      'Нет учитываемых типов: ' + stats.noTypes + '.',
-      'Нет данных для определения типов: ' + stats.noData + '.',
-      '',
-      'Записать типы назначений в ' + updates.length + ' сделок Bitrix?'
-    ].join('\n'), ui.ButtonSet.YES_NO);
-
+    const confirmation = ui.alert(buildBackfillAppointmentTypesConfirmation_(stats) +
+      '\n\nВыполнить обновление существующих сделок Bitrix?', ui.ButtonSet.YES_NO);
     if (confirmation !== ui.Button.YES) return;
 
     const result = updateBitrixDealTypesBatch_(updates);
     stats.updated = result.updated;
+    stats.typesUpdated = result.typesUpdated;
+    stats.patientCodesUpdated = result.patientCodesUpdated;
+    stats.bothUpdated = result.bothUpdated;
     stats.errors = result.errors;
     ui.alert(buildBackfillAppointmentTypesReport_(stats));
   } catch (err) {
     const message = err && err.message ? err.message : String(err);
-    Logger.log('Ошибка обратного заполнения типов: ' + message);
-    ui.alert('Заполнение типов назначений не выполнено.\n\n' + message);
+    Logger.log('Ошибка актуализации существующих сделок: ' + message);
+    ui.alert('Актуализация существующих сделок Bitrix не выполнена.\n\n' + message);
   } finally {
     lock.releaseLock();
   }
 }
+
+function fetchBitrixDealsForTypeBackfill_() {
+  const deals = [];
+  const select = ['ID', 'TITLE', 'CATEGORY_ID', 'STAGE_ID', BITRIX_DEAL_TYPES_FIELD,
+    BITRIX_DEAL_PATIENT_CODE_FIELD, 'UF_CRM_1784034617', 'UF_CRM_1783751372',
+    'UF_CRM_1783751578', 'UF_CRM_1783752197'];
+  let start = 0;
+  while (true) {
+    const page = bitrixCall_('crm.deal.list', {
+      filter: { CATEGORY_ID: BITRIX_DEAL_CATEGORY_ID }, select: select, start: start
+    });
+    const rows = Array.isArray(page) ? page : [];
+    deals.push.apply(deals, rows);
+    if (rows.length < 50) break;
+    start += 50;
+  }
+  return deals;
+}
+
+function isEmptyBitrixValue_(value) {
+  if (value === null || value === undefined) return true;
+  if (Array.isArray(value)) return value.length === 0;
+  return String(value).trim() === '';
+}
+
+function isEmptyBitrixAppointmentTypes_(value) { return isEmptyBitrixValue_(value); }
+
+function normalizePatientCodeForBitrix_(value) {
+  if (value === null || value === undefined || Array.isArray(value) && !value.length) return '';
+  return String(value).trim();
+}
+
+function resolvePatientCodeForBackfill_(deal, registry, patientCodesByDealId) {
+  const fromPlanItems = collectPatientCodes_([extractPatientCodeFromPlanItemsJson_(deal.UF_CRM_1784034617)], 'Plan Items JSON');
+  if (fromPlanItems.codes.length) return fromPlanItems;
+  const fromDealId = collectPatientCodes_((registry.rowsByDealId.get(String(deal.ID)) || []).map(row => row['Пациент.Код']), 'Реестр отправки Bitrix по Bitrix Deal ID');
+  if (fromDealId.codes.length) return fromDealId;
+  const fromUids = collectPatientCodes_(splitUids_(deal.UF_CRM_1783751372).reduce((codes, uid) =>
+    codes.concat((registry.rowsByUid.get(uid) || []).map(row => row['Пациент.Код'])), []), 'Реестр отправки Bitrix по УИД');
+  if (fromUids.codes.length) return fromUids;
+  return collectPatientCodes_(patientCodesByDealId.get(String(deal.ID)) || [], 'Сделки в Битрикс');
+}
+
+function extractPatientCodeFromPlanItemsJson_(value) {
+  const parsed = parseJsonSafely_(String(value || '').trim());
+  return parsed && typeof parsed === 'object' ? parsed.patient_code : '';
+}
+
+function collectPatientCodes_(values, source) {
+  const codes = Array.from(new Set((values || []).map(normalizePatientCodeForBitrix_).filter(Boolean)));
+  return { code: codes.length === 1 ? codes[0] : '', codes: codes, sources: codes.length ? [source] : [], conflict: codes.length > 1 };
+}
+
+function readPatientCodesByBitrixDealId_(ss) {
+  const sheet = ss.getSheetByName(DEALS_CONFIG.bitrixDealsSheetName);
+  const result = new Map();
+  if (!sheet) return result;
+  const data = readSheetWithHeaders_(sheet);
+  data.rows.forEach(row => {
+    const id = String(row['Bitrix Deal ID'] || '').trim();
+    if (!id) return;
+    if (!result.has(id)) result.set(id, []);
+    result.get(id).push(row['Пациент.Код']);
+  });
+  return result;
+}
+
+function extractDealNomenclatures_(deal, registryRowsByUid) {
+  const fromPlanItems = extractNomenclaturesFromPlanItemsJson_(deal.UF_CRM_1784034617);
+  if (fromPlanItems.length) return { source: 'Plan Items JSON', items: fromPlanItems };
+  const fromRegistry = extractNomenclaturesFromRegistry_(deal.UF_CRM_1783751372, registryRowsByUid);
+  if (fromRegistry.length) return { source: 'Реестр', items: fromRegistry };
+  return { source: 'Состав назначений', items: extractNomenclaturesFromAppointmentText_(deal.UF_CRM_1783752197) };
+}
+
+function updateBitrixDealTypesBatch_(updates) {
+  const result = { updated: 0, typesUpdated: 0, patientCodesUpdated: 0, bothUpdated: 0, errors: [] };
+  const rows = Array.from(new Map((updates || []).map(update => [String(update.id), update])).values());
+  for (let offset = 0; offset < rows.length; offset += 50) {
+    const batch = rows.slice(offset, offset + 50);
+    const commands = {};
+    batch.forEach((update, index) => {
+      const pairs = ['id=' + encodeURIComponent(update.id)];
+      Object.keys(update.fields).forEach(field => pairs.push('fields[' + field + ']=' + encodeURIComponent(update.fields[field])));
+      commands['deal_' + index] = 'crm.deal.update?' + pairs.join('&');
+    });
+    try {
+      const response = bitrixCall_('batch', { cmd: commands });
+      const values = response && response.result ? response.result : {};
+      const errors = response && response.result_error ? response.result_error : {};
+      batch.forEach((update, index) => {
+        const key = 'deal_' + index;
+        if (Object.prototype.hasOwnProperty.call(errors, key) || !Object.prototype.hasOwnProperty.call(values, key)) {
+          const error = errors[key] || { error_description: 'Bitrix не подтвердил обновление.' };
+          const message = String(error.error_description || error.error || 'Неизвестная ошибка Bitrix.');
+          result.errors.push({ id: update.id, message: message });
+          Logger.log('Сделка ' + update.id + ': ошибка обновления — ' + message);
+          return;
+        }
+        const types = Object.prototype.hasOwnProperty.call(update.fields, BITRIX_DEAL_TYPES_FIELD);
+        const code = Object.prototype.hasOwnProperty.call(update.fields, BITRIX_DEAL_PATIENT_CODE_FIELD);
+        result.updated += 1;
+        if (types) result.typesUpdated += 1;
+        if (code) result.patientCodesUpdated += 1;
+        if (types && code) result.bothUpdated += 1;
+        Logger.log('Сделка ' + update.id + ': поля обновлены: ' + Object.keys(update.fields).join(', ') + '.');
+      });
+    } catch (err) {
+      const message = err && err.message ? err.message : String(err);
+      batch.forEach(update => result.errors.push({ id: update.id, message: message }));
+      Logger.log('Ошибка пакета обновления сделок: ' + message);
+    }
+    if (offset + 50 < rows.length) Utilities.sleep(300);
+  }
+  return result;
+}
+
+function buildBackfillAppointmentTypesConfirmation_(stats) {
+  return ['Найдено сделок направления: ' + stats.loaded + '.', '',
+    'Поле типов пустое: ' + stats.emptyTypes + '.', 'Пациент.Код пустой: ' + stats.emptyPatientCodes + '.', '',
+    'Готово к заполнению типов: ' + stats.readyTypes + '.', 'Готово к заполнению кодов пациентов: ' + stats.readyPatientCodes + '.',
+    'Будут обновлены оба поля: ' + stats.both + '.', '', 'Не удалось определить типы: ' + stats.noTypes + '.',
+    'Не удалось определить Пациент.Код: ' + stats.noPatientCode + '.', 'Конфликт кодов пациента: ' + stats.patientCodeConflicts + '.'].join('\n');
+}
+
+function buildBackfillAppointmentTypesReport_(stats) {
+  const lines = ['Актуализация существующих сделок Bitrix завершена.', '', 'Сделок направления загружено: ' + stats.loaded + '.',
+    'Сделок уже с обоими заполненными полями: ' + stats.alreadyFilled + '.', 'Обновлено сделок всего: ' + stats.updated + '.',
+    'Заполнены типы назначений: ' + stats.typesUpdated + '.', 'Заполнены коды пациентов: ' + stats.patientCodesUpdated + '.',
+    'В одной операции заполнены оба поля: ' + stats.bothUpdated + '.', 'Не удалось определить типы: ' + stats.noTypes + '.',
+    'Не удалось определить Пациент.Код: ' + stats.noPatientCode + '.', 'Конфликтов кодов пациента: ' + stats.patientCodeConflicts + '.',
+    'Ошибок Bitrix: ' + stats.errors.length + '.'];
+  if (stats.errors.length) lines.push('', 'ID сделок с ошибками: ' + stats.errors.map(item => item.id).join(', ') + '.');
+  return lines.join('\n');
+}
+
 
 function validateBackfillAppointmentTypeDictionary_(sheet) {
   const dictionary = readAppointmentTypeCodeMap_(sheet);
@@ -3033,54 +3188,6 @@ function validateBackfillAppointmentTypeDictionary_(sheet) {
   });
 
   return dictionary;
-}
-
-function fetchBitrixDealsForTypeBackfill_() {
-  const deals = [];
-  const select = [
-    'ID', 'TITLE', 'CATEGORY_ID', 'STAGE_ID', 'UF_CRM_1784225678',
-    'UF_CRM_1784034617', 'UF_CRM_1783751372', 'UF_CRM_1783751578',
-    'UF_CRM_1783752197'
-  ];
-  let start = 0;
-
-  while (true) {
-    const page = bitrixCall_('crm.deal.list', {
-      filter: { CATEGORY_ID: BITRIX_DEAL_CATEGORY_ID },
-      select: select,
-      start: start
-    });
-    const rows = Array.isArray(page) ? page : [];
-    deals.push.apply(deals, rows);
-    if (rows.length < 50) break;
-    start += 50;
-  }
-  return deals;
-}
-
-function isEmptyBitrixAppointmentTypes_(value) {
-  if (value === null || value === undefined) return true;
-  if (Array.isArray(value)) return value.length === 0;
-  return String(value).trim() === '';
-}
-
-function isTemedIntegrationDeal_(deal) {
-  return !isEmptyBitrixAppointmentTypes_(deal.UF_CRM_1783751372) ||
-    !isEmptyBitrixAppointmentTypes_(deal.UF_CRM_1783751578) ||
-    !isEmptyBitrixAppointmentTypes_(deal.UF_CRM_1784034617);
-}
-
-function extractDealNomenclatures_(deal, registryRowsByUid) {
-  const fromPlanItems = extractNomenclaturesFromPlanItemsJson_(deal.UF_CRM_1784034617);
-  if (fromPlanItems.length) return { source: 'Plan Items JSON', items: fromPlanItems };
-
-  const fromRegistry = extractNomenclaturesFromRegistry_(deal.UF_CRM_1783751372, registryRowsByUid);
-  if (fromRegistry.length) return { source: 'Реестр', items: fromRegistry };
-
-  return {
-    source: 'Состав назначений',
-    items: extractNomenclaturesFromAppointmentText_(deal.UF_CRM_1783752197)
-  };
 }
 
 function uniqueCompositionNomenclatures_(items) {
@@ -3137,64 +3244,6 @@ function buildBackfillTypeCodes_(nomenclatures, typeCodeMap) {
   }));
 }
 
-function updateBitrixDealTypesBatch_(updates) {
-  const result = { updated: 0, errors: [] };
-  const unique = new Map();
-  (updates || []).forEach(update => unique.set(String(update.id), update));
-  const rows = Array.from(unique.values());
-
-  for (let offset = 0; offset < rows.length; offset += 50) {
-    const batch = rows.slice(offset, offset + 50);
-    const commands = {};
-    batch.forEach((update, index) => {
-      const key = 'deal_' + index;
-      commands[key] = 'crm.deal.update?id=' + encodeURIComponent(update.id) +
-        '&fields[UF_CRM_1784225678]=' + encodeURIComponent(update.typeCodes);
-    });
-
-    try {
-      const response = bitrixCall_('batch', { cmd: commands });
-      const values = response && response.result ? response.result : {};
-      const errors = response && response.result_error ? response.result_error : {};
-      batch.forEach((update, index) => {
-        const key = 'deal_' + index;
-        if (Object.prototype.hasOwnProperty.call(errors, key) ||
-            !Object.prototype.hasOwnProperty.call(values, key)) {
-          const error = errors[key] || { error_description: 'Bitrix не подтвердил обновление.' };
-          const message = String(error.error_description || error.error || 'Неизвестная ошибка Bitrix.');
-          result.errors.push({ id: update.id, message: message });
-          Logger.log('Сделка ' + update.id + ': ошибка обновления — ' + message);
-        } else {
-          result.updated += 1;
-          Logger.log('Сделка ' + update.id + ': типы ' + update.typeCodes + ' обновлены.');
-        }
-      });
-    } catch (err) {
-      const message = err && err.message ? err.message : String(err);
-      batch.forEach(update => result.errors.push({ id: update.id, message: message }));
-      Logger.log('Ошибка пакета обновления типов: ' + message);
-    }
-
-    if (offset + 50 < rows.length) Utilities.sleep(300);
-  }
-  return result;
-}
-
-function buildBackfillAppointmentTypesReport_(stats) {
-  const lines = [
-    'Заполнение типов назначений завершено.',
-    '',
-    'Сделок направления загружено: ' + stats.loaded + '.',
-    'С пустым полем типов: ' + stats.empty + '.',
-    'Успешно обновлено: ' + stats.updated + '.',
-    'Уже были заполнены: ' + stats.alreadyFilled + '.',
-    'Нет учитываемых типов: ' + stats.noTypes + '.',
-    'Нет данных для определения типов: ' + stats.noData + '.',
-    'Ошибок Bitrix: ' + stats.errors.length + '.'
-  ];
-  if (stats.errors.length) lines.push('', 'ID сделок с ошибками: ' + stats.errors.map(item => item.id).join(', ') + '.');
-  return lines.join('\n');
-}
 
 
 function debugBitrixDealFields() {
@@ -3208,7 +3257,8 @@ function debugBitrixDealFields() {
     'UF_CRM_1783751578',
     'UF_CRM_1783751996',
     'UF_CRM_1783752197',
-    'UF_CRM_1784225678',
+    BITRIX_DEAL_TYPES_FIELD,
+    BITRIX_DEAL_PATIENT_CODE_FIELD,
     'UF_CRM_1783752297',
     'UF_CRM_1784034617',
     'UF_CRM_615C18C0D7CD9'
