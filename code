@@ -39,7 +39,8 @@ const DEALS_CONFIG = {
   bitrixDealsSheetName: 'Сделки в Битрикс',
   bitrixRegistrySheetName: 'Реестр отправки Bitrix',
   bitrixDealSource: 'google_sheets_appointments',
-  aiWebhookUrl: 'https://n8n-x3.tech.temed.ru/webhook/deal-patient-context-v2',
+  // Production URL from the activated n8n workflow deal-patient-context-v3-batch.
+  aiWebhookUrl: 'https://n8n-x3.tech.temed.ru/webhook/deal-patient-context-v3-batch',
   minBitrixDealAmount: MIN_BITRIX_DEAL_AMOUNT,
 
   appointmentColumns: {
@@ -333,7 +334,9 @@ function requestAiSummariesForBitrixDeals() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = getRequiredSheet_(ss, DEALS_CONFIG.bitrixDealsSheetName);
   const data = readSheetWithHeaders_(sheet);
-  const now = new Date();
+  const items = [];
+  const addedDealKeys = new Set();
+  const addedRowNumbers = new Set();
 
   data.rows.forEach((row, i) => {
     const sendStatus = String(row['Статус отправки'] || '').trim();
@@ -348,18 +351,21 @@ function requestAiSummariesForBitrixDeals() {
       return;
     }
 
+    // Preserve the physical Sheets row before filtering any candidate deals.
     const rowNumber = i + 2;
-    const dealAmount = parseNumber_(row['Сумма сделки']);
+    const dealKey = String(row['DealKey'] || '').trim();
 
-    const payload = {
-      spreadsheet_id: ss.getId(),
-      sheet_name: DEALS_CONFIG.bitrixDealsSheetName,
+    if (addedDealKeys.has(dealKey) || addedRowNumbers.has(rowNumber)) {
+      return;
+    }
+
+    items.push({
       row_number: rowNumber,
-      deal_key: row['DealKey'] || '',
+      deal_key: dealKey,
       patient_code: row['Пациент.Код'] || '',
       patient_name: row['ФИО'] || '',
       branch: row['Филиал'] || '',
-      deal_amount: dealAmount,
+      deal_amount: parseNumber_(row['Сумма сделки']),
       first_plan_date: formatDateTimeForText_(row['Первый плановый день']),
       doctor: row['Врач'] || '',
       uids: row['УИДы'] || '',
@@ -367,34 +373,130 @@ function requestAiSummariesForBitrixDeals() {
       nearest_requests: row['Ближайшие заявки пациента'] || '',
       deal_description: row['Описание назначений'] || '',
       booking_execution_context: 'По данным текущей выгрузки по связанным назначениям требуется создание сделки.'
-    };
+    });
+    addedDealKeys.add(dealKey);
+    addedRowNumbers.add(rowNumber);
+  });
 
-    try {
-      const response = UrlFetchApp.fetch(DEALS_CONFIG.aiWebhookUrl, {
-        method: 'post',
-        contentType: 'application/json',
-        payload: JSON.stringify(payload),
-        muteHttpExceptions: true
-      });
-      const code = response.getResponseCode();
-      const body = response.getContentText() || '';
-      const parsed = parseJsonSafely_(body);
+  const batches = chunkArray_(items, 10);
 
-      if (code >= 200 && code < 300) {
-        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI статус', 'processing');
-        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI request_id', getAiRequestId_(parsed));
-        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI updated_at', now);
-      } else {
-        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI статус', 'error');
-        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', extractErrorText_(parsed, body, code));
-        setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI updated_at', now);
-      }
-    } catch (err) {
-      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI статус', 'error');
-      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'Ошибка', err && err.message ? err.message : String(err));
-      setSheetValueByHeader_(sheet, data.headerMap, rowNumber, 'AI updated_at', now);
+  batches.forEach((batch, batchIndex) => {
+    const result = sendAiContextBatchWithRetry_(DEALS_CONFIG.aiWebhookUrl, ss.getId(), sheet.getName(), batch);
+    logAiContextBatch_(batchIndex + 1, batch, result);
+
+    if (result.exhausted) {
+      writeAiBatchSendError_(sheet, data.headerMap, batch, result.errorText);
+    }
+
+    if (batchIndex < batches.length - 1) {
+      Utilities.sleep(1000 + Math.floor(Math.random() * 501));
     }
   });
+}
+
+
+function chunkArray_(items, size) {
+  const chunks = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+
+function sendAiContextBatch_(webhookUrl, spreadsheetId, sheetName, items) {
+  const response = UrlFetchApp.fetch(webhookUrl, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify({ spreadsheet_id: spreadsheetId, sheet_name: sheetName, items: items }),
+    muteHttpExceptions: true
+  });
+  const responseText = response.getContentText() || '';
+
+  return {
+    statusCode: response.getResponseCode(),
+    responseText: responseText,
+    responseJson: parseJsonSafely_(responseText)
+  };
+}
+
+
+function sendAiContextBatchWithRetry_(webhookUrl, spreadsheetId, sheetName, items) {
+  const retryDelays = [2000, 4000, 8000, 16000];
+  let retries = 0;
+  let lastResult = null;
+
+  // Retry only transient HTTP failures and fetch exceptions with the same batch.
+  while (true) {
+    try {
+      lastResult = sendAiContextBatch_(webhookUrl, spreadsheetId, sheetName, items);
+      if (lastResult.statusCode === 202 && lastResult.responseJson && lastResult.responseJson.ok === true) {
+        return Object.assign(lastResult, { retries: retries, exhausted: false, errorText: '' });
+      }
+
+      if ([429, 500, 502, 503, 504].indexOf(lastResult.statusCode) === -1) {
+        return Object.assign(lastResult, { retries: retries, exhausted: false, errorText: formatAiBatchError_(lastResult.responseJson, lastResult.responseText, lastResult.statusCode) });
+      }
+    } catch (err) {
+      lastResult = { statusCode: null, responseText: '', responseJson: null, errorText: err && err.message ? err.message : String(err) };
+    }
+
+    if (retries === retryDelays.length) {
+      return Object.assign(lastResult, { retries: retries, exhausted: true, errorText: lastResult.errorText || formatAiBatchError_(lastResult.responseJson, lastResult.responseText, lastResult.statusCode) });
+    }
+
+    Utilities.sleep(retryDelays[retries] + Math.floor(Math.random() * 1001));
+    retries += 1;
+  }
+}
+
+
+function formatAiBatchError_(responseJson, responseText, statusCode) {
+  if (!responseJson) {
+    return extractErrorText_(responseJson, responseText, statusCode);
+  }
+
+  const parts = [];
+  if (responseJson.error_code) parts.push('error_code=' + responseJson.error_code);
+  if (responseJson.message) parts.push('message=' + responseJson.message);
+  if (responseJson.details) parts.push('details=' + JSON.stringify(responseJson.details));
+  if (responseJson.missing_columns) parts.push('missing_columns=' + JSON.stringify(responseJson.missing_columns));
+
+  return parts.join('; ') || extractErrorText_(responseJson, responseText, statusCode);
+}
+
+
+function writeAiBatchSendError_(sheet, headerMap, items, errorText) {
+  const requiredHeaders = ['AI статус', 'Ошибка', 'AI updated_at'];
+  requiredHeaders.forEach(header => {
+    if (!headerMap[header]) throw new Error('Не найдена колонка "' + header + '" на листе "' + sheet.getName() + '".');
+  });
+  const rowNumbers = items.map(item => item.row_number).sort((a, b) => a - b);
+  const firstRow = rowNumbers[0];
+  const lastRow = rowNumbers[rowNumbers.length - 1];
+  const firstColumn = Math.min(headerMap['AI статус'], headerMap['Ошибка'], headerMap['AI updated_at']);
+  const lastColumn = Math.max(headerMap['AI статус'], headerMap['Ошибка'], headerMap['AI updated_at']);
+  const existingValues = sheet.getRange(firstRow, firstColumn, lastRow - firstRow + 1, lastColumn - firstColumn + 1).getValues();
+  const selectedRows = new Set(rowNumbers);
+  const now = new Date();
+
+  // A single setValues call updates this batch while preserving skipped rows between it.
+  existingValues.forEach((values, index) => {
+    if (!selectedRows.has(firstRow + index)) return;
+    values[headerMap['AI статус'] - firstColumn] = 'error';
+    values[headerMap['Ошибка'] - firstColumn] = String(errorText || 'Ошибка отправки пакета в n8n').slice(0, 500);
+    values[headerMap['AI updated_at'] - firstColumn] = now;
+  });
+  sheet.getRange(firstRow, firstColumn, existingValues.length, existingValues[0].length).setValues(existingValues);
+}
+
+
+function logAiContextBatch_(batchNumber, items, result) {
+  const rowNumbers = items.map(item => item.row_number).join(',');
+  const dealKeys = items.map(item => item.deal_key).join(',');
+  const batchId = result.responseJson && result.responseJson.batch_id ? result.responseJson.batch_id : '';
+  const errorText = result.errorText ? ' error=' + result.errorText : '';
+  Logger.log('AI context batch=' + batchNumber + ' count=' + items.length + ' rows=' + rowNumbers + ' deal_keys=' + dealKeys + ' http=' + (result.statusCode || 'fetch_exception') + ' batch_id=' + batchId + ' retries=' + result.retries + errorText);
 }
 
 
