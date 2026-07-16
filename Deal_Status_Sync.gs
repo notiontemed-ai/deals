@@ -8,7 +8,6 @@ const DSS_CONFIG = Object.freeze({
   sheets: {
     requests: 'Заявки',
     registry: 'Реестр отправки Bitrix',
-    nomenclature: 'Коды номенклатуры',
     aggregated: 'Заявки агрегированные',
     deals: 'Сделки Bitrix',
     actualization: 'Актуализация сделок',
@@ -25,16 +24,24 @@ const DSS_CONFIG = Object.freeze({
   dealCheckDaysAfterTreatmentStart: 30,
   requestMatchWindowDays: 30,
   stageNames: { booked: 'Записался', attended: 'Дошёл' },
-  ignoredCode: '-', consultationCode: 'C', serviceCodeOrder: 'CLFMSUIPDABEGHJKNOQRTVWXYZ', batchSize: 50,
+  ignoredCode: '-', consultationCode: 'C', serviceCodeOrder: 'LMSFCDUP', batchSize: 50,
   doneStates: ['Начато', 'Выполнена', 'Выполнено', 'Завершена', 'Завершено', 'Оказана', 'Оказано', 'Прием состоялся', 'Приём состоялся', 'Состоялась', 'Состоялся'],
   plannedStates: ['Запланирована', 'Запланировано', 'Подтвердил запись', 'Подтверждена', 'Подтверждено', 'Записан', 'Записана', 'Недозвон. Отправить смс'],
   cancelledMarkers: ['отменена', 'отменено', 'отменен', 'отменён', 'отказ', 'не состоялась', 'не состоялся', 'неявка', 'не явился', 'не явилась', 'удалена', 'удалено']
 });
 
-const DSS_MAP_HEADERS = ['Номенклатура', 'Код', 'Источник', 'Количество строк', 'Последнее появление', 'Комментарий'];
+const DSS_TYPE_CODES_SPREADSHEET_ID =
+  '1Q1iPI7z4DteweJT1lg5lyO35AwBU5NtxANIUjSyd1-M';
+const DSS_TYPE_CODES_SHEET_NAME =
+  'Коды типов назначений';
+const DSS_DEAL_TYPE_CODES_FIELD =
+  'UF_CRM_1784225678';
+const DSS_ALLOWED_TYPE_CODES = [
+  'L', 'M', 'S', 'F', 'C', 'D', 'U', 'P', '-'
+];
 const DSS_REQUEST_HEADERS = ['КлиентКод', 'Пациент', 'Дата', 'Запланированы', 'Выполнены', 'Дата обработки'];
-const DSS_DEAL_HEADERS = ['ID сделки', 'Название', 'CATEGORY_ID', 'Текущая стадия ID', 'Текущая стадия', 'Код пациента', 'Первый день лечения', 'Состав назначения', 'Коды назначения', 'Дата загрузки', 'Ошибка данных'];
-const DSS_ACTUALIZATION_HEADERS = ['Отправить', 'ID сделки', 'Название сделки', 'Код пациента', 'Первый день лечения', 'Коды назначения', 'Найденные запланированные коды', 'Найденные выполненные коды', 'Текущая стадия ID', 'Текущая стадия', 'Предлагаемая стадия ID', 'Предлагаемая стадия', 'Результат проверки', 'Причина', 'Дата загрузки сделок', 'Дата обработки заявок', 'Дата актуализации', 'Статус отправки', 'Ошибка отправки'];
+const DSS_DEAL_HEADERS = ['ID сделки', 'Название', 'CATEGORY_ID', 'Текущая стадия ID', 'Текущая стадия', 'Код пациента', 'Первый день лечения', 'Состав назначения', 'Типы назначений', 'Дата загрузки', 'Ошибка данных'];
+const DSS_ACTUALIZATION_HEADERS = ['Отправить', 'ID сделки', 'Название сделки', 'Код пациента', 'Первый день лечения', 'Типы назначений', 'Найденные запланированные типы', 'Найденные выполненные типы', 'Текущая стадия ID', 'Текущая стадия', 'Предлагаемая стадия ID', 'Предлагаемая стадия', 'Результат проверки', 'Причина', 'Дата загрузки сделок', 'Дата обработки заявок', 'Дата актуализации', 'Статус отправки', 'Ошибка отправки'];
 const DSS_STAGE_HEADERS = ['Название стадии', 'Код стадии'];
 
 function onOpen(e) { DSS_addDealStatusSyncMenu_(); }
@@ -50,7 +57,6 @@ function DSS_addDealStatusSyncMenu_() {
 
 function initializeBitrixDealStageSync() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  DSS_ensureMapSheet_(ss);
   DSS_prepareSheet_(ss, DSS_CONFIG.sheets.aggregated, DSS_REQUEST_HEADERS);
   DSS_prepareSheet_(ss, DSS_CONFIG.sheets.deals, DSS_DEAL_HEADERS);
   DSS_prepareSheet_(ss, DSS_CONFIG.sheets.actualization, DSS_ACTUALIZATION_HEADERS);
@@ -61,47 +67,72 @@ function initializeBitrixDealStageSync() {
 function DSS_processRequests() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const requests = DSS_readObjects_(DSS_requiredSheet_(ss, DSS_CONFIG.sheets.requests));
-  const map = DSS_loadMap_(ss); const now = new Date(); const groups = new Map();
-  let excluded = 0; let unknown = 0;
+  let directory;
+  try { directory = DSS_readSharedTypeCodesMap_(); }
+  catch (e) { DSS_alert_('Обработка заявок остановлена', DSS_safeError_(e)); return; }
+
+  const nomenclatures = new Map();
+  requests.forEach(row => {
+    const name = String(row[DSS_CONFIG.requestColumns.nomenclature] || '').trim();
+    const key = DSS_normalizeTypeNomenclature_(name);
+    if (key && !nomenclatures.has(key)) nomenclatures.set(key, name);
+  });
+  let added = 0;
+  try { added = DSS_appendMissingSharedTypeCodes_(directory, nomenclatures); }
+  catch (e) { DSS_alert_('Обработка заявок остановлена', DSS_safeError_(e)); return; }
+  // Re-read after writing so concurrent additions and current types are evaluated consistently.
+  try { directory = DSS_readSharedTypeCodesMap_(); }
+  catch (e) { DSS_alert_('Обработка заявок остановлена', DSS_safeError_(e)); return; }
+  let empty = 0, invalid = 0;
+  nomenclatures.forEach((name, key) => {
+    const type = directory.map.get(key);
+    if (!type) empty += 1;
+    else if (DSS_ALLOWED_TYPE_CODES.indexOf(type) === -1) invalid += 1;
+  });
+  if (added || empty || invalid) {
+    DSS_alert_('Обработка заявок остановлена', DSS_incompleteTypeCodesMessage_(added, empty, invalid));
+    return;
+  }
+
+  const now = new Date(), groups = new Map(); let excluded = 0;
   requests.forEach(row => {
     const code = DSS_patientCode_(row[DSS_CONFIG.requestColumns.patientCode]);
     const date = DSS_date_(row[DSS_CONFIG.requestColumns.startDate]);
-    const name = DSS_cleanName_(row[DSS_CONFIG.requestColumns.nomenclature]);
+    const name = String(row[DSS_CONFIG.requestColumns.nomenclature] || '').trim();
     const state = DSS_requestState_(row[DSS_CONFIG.requestColumns.state]);
     if (state === 'CANCEL') { excluded += 1; return; }
     if (!code || !date || !name || !state) return;
-    const lookup = DSS_mapCode_(map, name, 'Заявки');
-    if (lookup.created) unknown += 1;
-    if (!lookup.code || lookup.code === DSS_CONFIG.ignoredCode) return;
+    const typeCode = directory.map.get(DSS_normalizeTypeNomenclature_(name));
+    if (!typeCode || typeCode === DSS_CONFIG.ignoredCode) return;
     const key = code + '|' + DSS_iso_(date);
     if (!groups.has(key)) groups.set(key, { code, patient: String(row[DSS_CONFIG.requestColumns.patientName] || '').trim(), date, planned: new Set(), done: new Set() });
-    groups.get(key)[state === 'DONE' ? 'done' : 'planned'].add(lookup.code);
+    groups.get(key)[state === 'DONE' ? 'done' : 'planned'].add(typeCode);
   });
   const rows = Array.from(groups.values()).sort((a,b) => a.code.localeCompare(b.code) || a.date - b.date).map(x => [x.code, x.patient, x.date, DSS_codes_(x.planned), DSS_codes_(x.done), now]);
-  DSS_saveMap_(ss, map); DSS_writeSheet_(ss, DSS_CONFIG.sheets.aggregated, DSS_REQUEST_HEADERS, rows, { dates: [3], dateTimes: [6] });
+  DSS_writeSheet_(ss, DSS_CONFIG.sheets.aggregated, DSS_REQUEST_HEADERS, rows, { dates: [3], dateTimes: [6] });
   DSS_log_(ss, 'Обработка заявок', now);
-  DSS_alert_('Обработка заявок завершена.', ['Строк исходного листа обработано: ' + requests.length + '.', 'Агрегированных строк создано: ' + rows.length + '.', 'Отменённых строк исключено: ' + excluded + '.', 'Неизвестных номенклатур обнаружено: ' + unknown + '.'].join('\n'));
+  DSS_alert_('Обработка заявок завершена.', ['Строк исходного листа обработано: ' + requests.length + '.', 'Агрегированных строк создано: ' + rows.length + '.', 'Отменённых строк исключено: ' + excluded + '.'].join('\n'));
 }
-
 function DSS_loadDealsFromBitrix() {
   const ss = SpreadsheetApp.getActiveSpreadsheet(); const now = new Date(); const base = DSS_webhook_();
   const fields = DSS_fields_(base); const threshold = DSS_addDays_(DSS_today_(), -DSS_CONFIG.dealCheckDaysAfterTreatmentStart);
-  const raw = DSS_list_(base, 'crm.deal.list', { order: { ID: 'ASC' }, filter: { ['>=' + fields.firstPlanDate]: DSS_iso_(threshold) }, select: ['ID','TITLE','CATEGORY_ID','STAGE_ID',fields.firstPlanDate,fields.composition].concat(fields.patientCode ? [fields.patientCode] : []) });
-  const registry = DSS_registryCodes_(ss); const map = DSS_loadMap_(ss); const stages = DSS_stageDirectory_(base, raw);
+  const raw = DSS_list_(base, 'crm.deal.list', { order: { ID: 'ASC' }, filter: { ['>=' + fields.firstPlanDate]: DSS_iso_(threshold) }, select: ['ID','TITLE','CATEGORY_ID','STAGE_ID',fields.firstPlanDate,fields.composition,DSS_DEAL_TYPE_CODES_FIELD].concat(fields.patientCode ? [fields.patientCode] : []) });
+  const registry = DSS_registryCodes_(ss); const stages = DSS_stageDirectory_(base, raw);
   let noPatient = 0; let incomplete = 0;
   const rows = raw.map(item => {
     const id = String(item.ID || ''); const date = DSS_date_(item[fields.firstPlanDate]);
     let patient = fields.patientCode ? DSS_patientCode_(item[fields.patientCode]) : ''; patient = patient || registry.get(id) || '';
-    const names = DSS_compositionNames_(item[fields.composition]); const codes = new Set(); const unknown = [];
-    names.forEach(name => { const m = DSS_mapCode_(map, name, 'Сделки Bitrix'); if (!m.code) unknown.push(name); else if (m.code !== DSS_CONFIG.ignoredCode) codes.add(m.code); });
-    const errors = []; if (!patient) { noPatient += 1; errors.push('Не найден код пациента.'); } if (unknown.length) { incomplete += 1; errors.push('Неизвестная номенклатура: ' + unknown.join(', ') + '.'); }
+    const rawTypeCodes = String(item[DSS_DEAL_TYPE_CODES_FIELD] || '').replace(/\s+/g, '');
+    const codes = DSS_normalizeDealTypeCodes_(rawTypeCodes);
+    const errors = []; if (!patient) { noPatient += 1; errors.push('Не найден код пациента.'); }
+    if (!rawTypeCodes) { incomplete += 1; errors.push('В сделке Bitrix не заполнено поле типов назначений UF_CRM_1784225678.'); }
+    else if (!codes) { incomplete += 1; errors.push('Поле типов назначений UF_CRM_1784225678 не содержит допустимых типов.'); }
     const category = Number(item.CATEGORY_ID || 0); const stageId = String(item.STAGE_ID || ''); const stage = (stages.get(category) || { byId: new Map() }).byId.get(stageId) || stageId;
-    return [id, String(item.TITLE || ''), category, stageId, stage, patient, date || '', String(item[fields.composition] || ''), DSS_codes_(codes), now, errors.join(' ')];
+    return [id, String(item.TITLE || ''), category, stageId, stage, patient, date || '', String(item[fields.composition] || ''), codes, now, errors.join(' ')];
   }).filter(row => row[0] && row[6]);
-  DSS_saveMap_(ss, map); DSS_saveStageDirectory_(stages); DSS_writeSheet_(ss, DSS_CONFIG.sheets.deals, DSS_DEAL_HEADERS, rows, { dates: [7], dateTimes: [10] }); DSS_log_(ss, 'Загрузка сделок Bitrix', now);
-  DSS_alert_('Загрузка сделок из Bitrix завершена.', 'Сделок получено: ' + raw.length + '.\nСделок записано на лист: ' + rows.length + '.\nБез кода пациента: ' + noPatient + '.\nС неполными кодами назначений: ' + incomplete + '.');
+  DSS_saveStageDirectory_(stages); DSS_writeSheet_(ss, DSS_CONFIG.sheets.deals, DSS_DEAL_HEADERS, rows, { dates: [7], dateTimes: [10] }); DSS_log_(ss, 'Загрузка сделок Bitrix', now);
+  DSS_alert_('Загрузка сделок из Bitrix завершена.', 'Сделок получено: ' + raw.length + '.\nСделок записано на лист: ' + rows.length + '.\nБез кода пациента: ' + noPatient + '.\nБез заполненных типов назначений: ' + incomplete + '.');
 }
-
 function DSS_loadStagesFromBitrix() {
   const ss = SpreadsheetApp.getActiveSpreadsheet(); const base = DSS_webhook_(); const categoryId = DSS_CONFIG.categoryId;
   const entityId = categoryId === 0 ? 'DEAL_STAGE' : 'DEAL_STAGE_' + categoryId;
@@ -119,7 +150,7 @@ function DSS_actualizeDeals() {
   const index = new Map(); requests.forEach(r => { const code = DSS_patientCode_(r['КлиентКод']); if (!index.has(code)) index.set(code, []); index.get(code).push(r); });
   const stageInfo = DSS_loadStageDirectory_(); const now = new Date(); let booked = 0, attended = 0, unchanged = 0, errors = 0;
   const rows = deals.map(d => {
-    const id = String(d['ID сделки'] || ''); const patient = DSS_patientCode_(d['Код пациента']); const date = DSS_date_(d['Первый день лечения']); const codes = DSS_codeSet_(d['Коды назначения']);
+    const id = String(d['ID сделки'] || ''); const patient = DSS_patientCode_(d['Код пациента']); const date = DSS_date_(d['Первый день лечения']); const codes = DSS_codeSet_(d['Типы назначений']);
     let planned = new Set(), done = new Set(), targetId = '', targetName = '', result = 'Без изменений', reason = '';
     if (!patient) { result = 'Не найден код пациента'; reason = 'В сделке отсутствует код пациента.'; errors += 1; }
     else if (!date || !codes.size) { result = d['Ошибка данных'] ? 'Неизвестная номенклатура' : 'Недостаточно данных'; reason = String(d['Ошибка данных'] || 'Не указан первый день лечения или коды назначения.'); errors += 1; }
@@ -164,11 +195,40 @@ function DSS_list_(base, method, params) { let start = 0, guard = 0, result = []
 function DSS_stageDirectory_(base, deals) { const categories = Array.from(new Set(deals.map(d => Number(d.CATEGORY_ID || 0)))); const out = new Map(); categories.forEach(c => { const statuses = DSS_list_(base, 'crm.status.list', { order: { SORT: 'ASC' }, filter: { ENTITY_ID: c ? 'DEAL_STAGE_' + c : 'DEAL_STAGE' } }); const byId = new Map(), byName = new Map(); statuses.forEach(s => { byId.set(String(s.STATUS_ID), String(s.NAME)); byName.set(DSS_text_(s.NAME), String(s.STATUS_ID)); }); out.set(c, { byId, bookedId: byName.get(DSS_text_(DSS_CONFIG.stageNames.booked)), attendedId: byName.get(DSS_text_(DSS_CONFIG.stageNames.attended)) }); }); return out; }
 function DSS_stageDirectoryFromDeals_(deals) { const out = new Map(); deals.forEach(d => { const c = Number(d.CATEGORY_ID || 0); if (!out.has(c)) out.set(c, { byId: new Map(), bookedId: '', attendedId: '' }); const x = out.get(c), id = String(d['Текущая стадия ID'] || ''), name = String(d['Текущая стадия'] || ''); if (id) x.byId.set(id, name); if (DSS_text_(name) === DSS_text_(DSS_CONFIG.stageNames.booked)) x.bookedId = id; if (DSS_text_(name) === DSS_text_(DSS_CONFIG.stageNames.attended)) x.attendedId = id; }); return out; }
 function DSS_registryCodes_(ss) { const sheet = ss.getSheetByName(DSS_CONFIG.sheets.registry), out = new Map(); if (!sheet || sheet.getLastRow() < 2) return out; DSS_readObjects_(sheet).forEach(r => { const id = String(r['Bitrix Deal ID'] || r['ID сделки'] || '').trim(), code = DSS_patientCode_(r['Пациент.Код'] || r['Код пациента']); if (id && code && !out.has(id)) out.set(id, code); }); return out; }
-function DSS_compositionNames_(value) { return String(value || '').split(/[\r\n;,]+/).map(x => DSS_cleanName_(x.replace(/^[-•*\d.)\s]+/, '').replace(/\s+[xх]\s*\d+(?:[.,]\d+)?\s*$/i, ''))).filter(Boolean); }
-function DSS_loadMap_(ss) { const sheet = DSS_ensureMapSheet_(ss), rows = DSS_readObjects_(sheet), entries = new Map(); rows.forEach(r => { const name = DSS_cleanName_(r['Номенклатура']); if (name) entries.set(DSS_text_(name), { name, code: DSS_serviceCode_(r['Код']), existed: true, sources: new Set(), count: 0, last: r['Последнее появление'], comment: String(r['Комментарий'] || '') }); }); return { entries }; }
-function DSS_mapCode_(map, name, source) { const key = DSS_text_(name); let entry = map.entries.get(key), created = false; if (!entry) { created = true; entry = { name, code: '', existed: false, sources: new Set(), count: 0, last: '', comment: '' }; map.entries.set(key, entry); } entry.sources.add(source); entry.count += 1; entry.last = new Date(); return { code: entry.code, created }; }
-function DSS_saveMap_(ss, map) { const sheet = DSS_ensureMapSheet_(ss); const old = DSS_readObjects_(sheet); const oldByName = new Map(old.map(r => [DSS_text_(r['Номенклатура']), r])); const rows = Array.from(map.entries.values()).sort((a,b) => a.name.localeCompare(b.name, 'ru')).map(e => { const p = oldByName.get(DSS_text_(e.name)) || {}; return [e.name, e.code, Array.from(e.sources).join(', '), e.count, e.last || p['Последнее появление'] || '', e.comment || p['Комментарий'] || '']; }); sheet.clearContents(); sheet.getRange(1,1,1,DSS_MAP_HEADERS.length).setValues([DSS_MAP_HEADERS]); if(rows.length) sheet.getRange(2,1,rows.length,DSS_MAP_HEADERS.length).setValues(rows); sheet.setFrozenRows(1); sheet.getRange(1,1,1,DSS_MAP_HEADERS.length).setFontWeight('bold'); }
-function DSS_ensureMapSheet_(ss) { let s = ss.getSheetByName(DSS_CONFIG.sheets.nomenclature); if (!s) s = ss.insertSheet(DSS_CONFIG.sheets.nomenclature); if (!s.getLastRow()) s.getRange(1,1,1,DSS_MAP_HEADERS.length).setValues([DSS_MAP_HEADERS]); return s; }
+function DSS_normalizeTypeNomenclature_(value) {
+  return String(value || '').toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+}
+function DSS_normalizeSharedTypeCode_(value) { return String(value || '').replace(/\s+/g, '').toUpperCase(); }
+function DSS_readSharedTypeCodesMap_() {
+  let spreadsheet;
+  try { spreadsheet = SpreadsheetApp.openById(DSS_TYPE_CODES_SPREADSHEET_ID); }
+  catch (e) { throw new Error('Не удалось открыть общий справочник типов назначений.\n\nПроверьте, что аккаунт, от имени которого выполняется Deal_Status_Sync.gs, имеет доступ на редактирование таблицы:\n' + DSS_TYPE_CODES_SPREADSHEET_ID); }
+  const sheet = spreadsheet.getSheetByName(DSS_TYPE_CODES_SHEET_NAME);
+  if (!sheet) throw new Error('В общем справочнике не найден лист «' + DSS_TYPE_CODES_SHEET_NAME + '».');
+  const values = sheet.getDataRange().getValues(); const headers = (values[0] || []).map(x => String(x || '').trim());
+  const nameColumn = headers.indexOf('Номенклатура'), typeColumn = headers.indexOf('Тип');
+  if (nameColumn === -1 || typeColumn === -1) throw new Error('В листе «' + DSS_TYPE_CODES_SHEET_NAME + '» должны быть колонки «Номенклатура» и «Тип».');
+  const map = new Map();
+  values.slice(1).forEach(row => { const key = DSS_normalizeTypeNomenclature_(row[nameColumn]); if (key && !map.has(key)) map.set(key, DSS_normalizeSharedTypeCode_(row[typeColumn])); });
+  return { sheet, nameColumn, typeColumn, map };
+}
+function DSS_appendMissingSharedTypeCodes_(directory, nomenclatures) {
+  // Read again immediately before appending to avoid duplicating entries added by Code.gs.
+  const current = DSS_readSharedTypeCodesMap_(); const missing = [];
+  nomenclatures.forEach((name, key) => { if (!current.map.has(key)) missing.push(name); });
+  if (!missing.length) return 0;
+  const width = Math.max(current.sheet.getLastColumn(), current.nameColumn + 1, current.typeColumn + 1);
+  const rows = missing.map(name => { const row = Array(width).fill(''); row[current.nameColumn] = name; return row; });
+  current.sheet.getRange(current.sheet.getLastRow() + 1, 1, rows.length, width).setValues(rows);
+  return rows.length;
+}
+function DSS_incompleteTypeCodesMessage_(added, empty, invalid) {
+  return 'Не для всей номенклатуры заявок указаны типы.\n\nДобавлено новых позиций в общий справочник: ' + added + '.\nПозиций с пустым типом: ' + empty + '.\nПозиций с ошибочным типом: ' + invalid + '.\n\nОткройте таблицу:\n' + DSS_TYPE_CODES_SPREADSHEET_ID + '\n\nЛист:\n«' + DSS_TYPE_CODES_SHEET_NAME + '»\n\nЗаполните колонку «Тип» и повторно выполните «1. Обработать заявки».\n\nНе продолжать обработку с неполным справочником, поскольку это может привести к неправильному переводу стадий сделок.';
+}
+function DSS_normalizeDealTypeCodes_(value) {
+  const raw = String(value || '').replace(/\s+/g, '').toUpperCase(); const present = new Set(raw.split(''));
+  return DSS_ALLOWED_TYPE_CODES.filter(code => code !== '-' && present.has(code)).join('');
+}
 function DSS_requestState_(v) { const t = DSS_text_(v); if (DSS_CONFIG.cancelledMarkers.some(x => t.indexOf(DSS_text_(x)) !== -1)) return 'CANCEL'; if (DSS_CONFIG.doneStates.some(x => t === DSS_text_(x))) return 'DONE'; if (DSS_CONFIG.plannedStates.some(x => t === DSS_text_(x))) return 'PLAN'; return ''; }
 function DSS_writeSheet_(ss, name, headers, rows, formats) { const s = DSS_prepareSheet_(ss, name, headers); if(rows.length) s.getRange(2,1,rows.length,headers.length).setValues(rows); s.setFrozenRows(1); s.getRange(1,1,1,headers.length).setFontWeight('bold'); (formats && formats.dates || []).forEach(c => s.getRange(2,c,Math.max(rows.length,1),1).setNumberFormat('dd.MM.yyyy')); (formats && formats.dateTimes || []).forEach(c => s.getRange(2,c,Math.max(rows.length,1),1).setNumberFormat('dd.MM.yyyy HH:mm')); }
 function DSS_writeActualization_(ss, rows) { DSS_writeSheet_(ss, DSS_CONFIG.sheets.actualization, DSS_ACTUALIZATION_HEADERS, rows, { dates: [5], dateTimes: [15,16,17] }); const s = ss.getSheetByName(DSS_CONFIG.sheets.actualization); s.getRange(2,1,Math.max(rows.length,1),1).insertCheckboxes(); }
@@ -182,8 +242,8 @@ function DSS_alert_(title, text) { SpreadsheetApp.getUi().alert(title, text, Spr
 function DSS_cleanName_(v) { return String(v || '').replace(/\s*\|.*$/,'').replace(/\s+/g,' ').trim(); }
 function DSS_text_(v) { return String(v || '').toLowerCase().replace(/ё/g,'е').replace(/[^a-zа-я0-9]+/g,' ').replace(/\s+/g,' ').trim(); }
 function DSS_patientCode_(v) { const x = String(v == null ? '' : v).replace(/\D/g,''); return x ? (x.replace(/^0+/,'') || '0') : ''; }
-function DSS_serviceCode_(v) { const x = String(v || '').trim().toUpperCase(); if(x === '-') return x; const m = x.match(/[A-ZА-Я]/); return m ? m[0] : ''; }
-function DSS_codeSet_(v) { return new Set(String(v || '').split('').map(DSS_serviceCode_).filter(Boolean)); }
+function DSS_serviceCode_(v) { const x = String(v || '').trim().toUpperCase(); return DSS_ALLOWED_TYPE_CODES.indexOf(x) !== -1 ? x : ''; }
+function DSS_codeSet_(v) { return new Set(String(v || '').split('').map(DSS_serviceCode_).filter(x => x && x !== DSS_CONFIG.ignoredCode)); }
 function DSS_codes_(set) { return Array.from(set || []).filter(x => x && x !== '-').sort((a,b) => DSS_CONFIG.serviceCodeOrder.indexOf(a) - DSS_CONFIG.serviceCodeOrder.indexOf(b)).join(''); }
 function DSS_date_(v) { if(v instanceof Date && !isNaN(v)) return new Date(v.getFullYear(),v.getMonth(),v.getDate()); const t = String(v || '').trim(), m = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/) || t.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})/); if(m) return m[1].length === 4 ? new Date(+m[1],+m[2]-1,+m[3]) : new Date(+m[3],+m[2]-1,+m[1]); const d = new Date(t); return isNaN(d) ? null : new Date(d.getFullYear(),d.getMonth(),d.getDate()); }
 function DSS_today_() { return DSS_date_(Utilities.formatDate(new Date(), DSS_CONFIG.timezone, 'yyyy-MM-dd')); }
