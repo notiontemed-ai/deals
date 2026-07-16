@@ -12,8 +12,10 @@ const DSS_CONFIG = Object.freeze({
     aggregated: 'Заявки агрегированные',
     deals: 'Сделки Bitrix',
     actualization: 'Актуализация сделок',
-    log: 'Журнал статусов Bitrix'
+    log: 'Журнал статусов Bitrix',
+    stages: 'Стадии Bitrix'
   },
+  categoryId: 114,
   requestColumns: { patientCode: 'КлиентКод', patientName: 'Клиент', startDate: 'ДатаНачала', state: 'Состояние', nomenclature: 'НоменклатураНаименование' },
   fieldOverrides: { patientCode: '', firstPlanDate: 'UF_CRM_1783751996', composition: 'UF_CRM_1783752197' },
   fieldAliases: {
@@ -33,6 +35,7 @@ const DSS_MAP_HEADERS = ['Номенклатура', 'Код', 'Источник
 const DSS_REQUEST_HEADERS = ['КлиентКод', 'Пациент', 'Дата', 'Запланированы', 'Выполнены', 'Дата обработки'];
 const DSS_DEAL_HEADERS = ['ID сделки', 'Название', 'CATEGORY_ID', 'Текущая стадия ID', 'Текущая стадия', 'Код пациента', 'Первый день лечения', 'Состав назначения', 'Коды назначения', 'Дата загрузки', 'Ошибка данных'];
 const DSS_ACTUALIZATION_HEADERS = ['Отправить', 'ID сделки', 'Название сделки', 'Код пациента', 'Первый день лечения', 'Коды назначения', 'Найденные запланированные коды', 'Найденные выполненные коды', 'Текущая стадия ID', 'Текущая стадия', 'Предлагаемая стадия ID', 'Предлагаемая стадия', 'Результат проверки', 'Причина', 'Дата загрузки сделок', 'Дата обработки заявок', 'Дата актуализации', 'Статус отправки', 'Ошибка отправки'];
+const DSS_STAGE_HEADERS = ['Название стадии', 'Код стадии'];
 
 function onOpen(e) { DSS_addDealStatusSyncMenu_(); }
 function DSS_addDealStatusSyncMenu_() {
@@ -41,6 +44,7 @@ function DSS_addDealStatusSyncMenu_() {
     .addItem('1. Обработать заявки', 'DSS_processRequests')
     .addItem('2. Загрузить сделки из Bitrix', 'DSS_loadDealsFromBitrix')
     .addItem('3. Актуализировать сделки по заявкам', 'DSS_actualizeDeals').addSeparator()
+    .addItem('Загрузить стадии Bitrix', 'DSS_loadStagesFromBitrix')
     .addItem('4. Отправить изменения в Bitrix', 'DSS_sendChangesToBitrixWithConfirmation').addToUi();
 }
 
@@ -96,6 +100,14 @@ function DSS_loadDealsFromBitrix() {
   }).filter(row => row[0] && row[6]);
   DSS_saveMap_(ss, map); DSS_saveStageDirectory_(stages); DSS_writeSheet_(ss, DSS_CONFIG.sheets.deals, DSS_DEAL_HEADERS, rows, { dates: [7], dateTimes: [10] }); DSS_log_(ss, 'Загрузка сделок Bitrix', now);
   DSS_alert_('Загрузка сделок из Bitrix завершена.', 'Сделок получено: ' + raw.length + '.\nСделок записано на лист: ' + rows.length + '.\nБез кода пациента: ' + noPatient + '.\nС неполными кодами назначений: ' + incomplete + '.');
+}
+
+function DSS_loadStagesFromBitrix() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet(); const base = DSS_webhook_(); const categoryId = DSS_CONFIG.categoryId;
+  const entityId = categoryId === 0 ? 'DEAL_STAGE' : 'DEAL_STAGE_' + categoryId;
+  const statuses = DSS_list_(base, 'crm.status.list', { order: { SORT: 'ASC' }, filter: { ENTITY_ID: entityId } });
+  const rows = statuses.map(status => [String(status.NAME || ''), String(status.STATUS_ID || '')]);
+  DSS_writeSheet_(ss, DSS_CONFIG.sheets.stages, DSS_STAGE_HEADERS, rows);
 }
 
 function DSS_actualizeDeals() {
