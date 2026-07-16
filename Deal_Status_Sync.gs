@@ -109,9 +109,17 @@ function DSS_processRequests() {
 function DSS_loadDealsFromBitrix() {
   const ss = SpreadsheetApp.getActiveSpreadsheet(); const now = new Date(); const base = DSS_webhook_();
   // Patient code is deliberately read only from this explicit Bitrix field.
-  const raw = DSS_list_(base, 'crm.deal.list', { order: { ID: 'ASC' }, select: ['ID', 'TITLE', 'CATEGORY_ID', 'STAGE_ID', 'OPPORTUNITY', 'DATE_CREATE', 'UF_CRM_1737550182812', 'UF_CRM_1783751141', 'UF_CRM_1783751996', 'UF_CRM_1783752197', DSS_DEAL_TYPE_CODES_FIELD] });
-  const stages = DSS_stageDirectory_(base, raw); let noPatient = 0; let incomplete = 0;
-  const rows = raw.map(item => {
+  const raw = DSS_list_(base, 'crm.deal.list', {
+    order: { ID: 'ASC' },
+    filter: { CATEGORY_ID: DSS_CONFIG.categoryId },
+    select: ['ID', 'TITLE', 'CATEGORY_ID', 'STAGE_ID', 'OPPORTUNITY', 'DATE_CREATE', 'UF_CRM_1737550182812', 'UF_CRM_1783751141', 'UF_CRM_1783751996', 'UF_CRM_1783752197', DSS_DEAL_TYPE_CODES_FIELD]
+  });
+  const categoryId = Number(DSS_CONFIG.categoryId);
+  const deals = raw.filter(item => Number(item.CATEGORY_ID || 0) === categoryId);
+  const unexpectedDeals = raw.length - deals.length;
+  if (unexpectedDeals) Logger.log('Bitrix вернул сделки вне CATEGORY_ID ' + categoryId + ': ' + unexpectedDeals + '.');
+  const stages = DSS_stageDirectory_(base, deals); let noPatient = 0; let incomplete = 0;
+  const rows = deals.map(item => {
     const id = String(item.ID || ''); const firstTreatment = DSS_date_(item.UF_CRM_1783751996); const createdAt = DSS_date_(item.DATE_CREATE);
     const title = String(item.TITLE || ''); const patientName = String(item.UF_CRM_1737550182812 || '').trim();
     const patient = DSS_normalizePatientCode_(item.UF_CRM_1783751141);
@@ -129,7 +137,7 @@ function DSS_loadDealsFromBitrix() {
     return [id, title, patientName || title, category, stageId, stage, patient, opportunity, createdAt || '', firstTreatment || '', String(item.UF_CRM_1783752197 || ''), codes, now, errors.join('\n')];
   }).filter(row => row[0]);
   DSS_saveStageDirectory_(stages); DSS_writeSheet_(ss, DSS_CONFIG.sheets.deals, DSS_DEAL_HEADERS, rows, { numbers: [8], dateTimes: [9, 13], dates: [10], wraps: [11, 14], widths: { 1: 110, 2: 220, 3: 220, 7: 120, 8: 120, 9: 165, 10: 120, 11: 300, 12: 130, 13: 165, 14: 360 } }); DSS_log_(ss, 'Загрузка сделок Bitrix', now);
-  DSS_alert_('Загрузка сделок из Bitrix завершена.', 'Сделок получено: ' + raw.length + '.\nСделок записано на лист: ' + rows.length + '.\nБез кода пациента: ' + noPatient + '.\nБез заполненных типов назначений: ' + incomplete + '.');
+  DSS_alert_('Загрузка сделок из Bitrix завершена.', 'Направление: ' + categoryId + '.\nПолучено сделок направления: ' + deals.length + '.\nЗаписано на лист: ' + rows.length + '.\nБез кода пациента: ' + noPatient + '.\nБез заполненных типов назначений: ' + incomplete + '.');
 }
 function DSS_loadStagesFromBitrix() {
   const ss = SpreadsheetApp.getActiveSpreadsheet(); const base = DSS_webhook_(); const categoryId = DSS_CONFIG.categoryId;
@@ -187,7 +195,26 @@ function DSS_sendChangesToBitrixWithConfirmation() {
 /* Внутренние функции */
 function DSS_webhook_() { const v = String(PropertiesService.getScriptProperties().getProperty('BITRIX_WEBHOOK_BASE_URL') || '').trim(); if (!v) throw new Error('Не задано свойство скрипта BITRIX_WEBHOOK_BASE_URL.'); return v.replace(/\/+$/, '') + '/'; }
 function DSS_call_(base, method, payload) { const response = UrlFetchApp.fetch(base + method + '.json', { method: 'post', contentType: 'application/json; charset=utf-8', payload: JSON.stringify(payload || {}), muteHttpExceptions: true }); const body = response.getContentText() || ''; let parsed; try { parsed = body ? JSON.parse(body) : {}; } catch (e) { throw new Error('Bitrix вернул некорректный ответ. HTTP ' + response.getResponseCode() + '.'); } if (response.getResponseCode() < 200 || response.getResponseCode() >= 300 || parsed.error) throw new Error('Ошибка Bitrix: ' + String(parsed.error_description || parsed.error || 'HTTP ' + response.getResponseCode()).slice(0, 500)); return parsed; }
-function DSS_list_(base, method, params) { let start = 0, guard = 0, result = []; while (guard++ < 10000) { const out = DSS_call_(base, method, Object.assign({}, params, { start })); result = result.concat(Array.isArray(out.result) ? out.result : []); if (out.next === undefined || out.next === null || out.next === '') break; start = Number(out.next); } return result; }
+function DSS_list_(base, method, params) {
+  let start = 0, guard = 0, result = [];
+  while (guard++ < 10000) {
+    let out;
+    try {
+      out = DSS_call_(base, method, Object.assign({}, params, { start }));
+    } catch (error) {
+      throw new Error('Ошибка при выполнении ' + method + ', start=' + start + ', уже загружено=' + result.length + '. ' + DSS_safeError_(error));
+    }
+    const page = Array.isArray(out.result) ? out.result : [];
+    result = result.concat(page);
+    if (out.next === undefined || out.next === null || out.next === '') break;
+    const next = Number(out.next);
+    if (!Number.isFinite(next) || next <= start) {
+      throw new Error('Bitrix вернул некорректное значение next для ' + method + ': ' + String(out.next));
+    }
+    start = next;
+  }
+  return result;
+}
 function DSS_stageDirectory_(base, deals) { const categories = Array.from(new Set(deals.map(d => Number(d.CATEGORY_ID || 0)))); const out = new Map(); categories.forEach(c => { const statuses = DSS_list_(base, 'crm.status.list', { order: { SORT: 'ASC' }, filter: { ENTITY_ID: c ? 'DEAL_STAGE_' + c : 'DEAL_STAGE' } }); const byId = new Map(), byName = new Map(); statuses.forEach(s => { byId.set(String(s.STATUS_ID), String(s.NAME)); byName.set(DSS_text_(s.NAME), String(s.STATUS_ID)); }); out.set(c, { byId, bookedId: byName.get(DSS_text_(DSS_CONFIG.stageNames.booked)), attendedId: byName.get(DSS_text_(DSS_CONFIG.stageNames.attended)) }); }); return out; }
 function DSS_stageDirectoryFromDeals_(deals) { const out = new Map(); deals.forEach(d => { const c = Number(d.CATEGORY_ID || 0); if (!out.has(c)) out.set(c, { byId: new Map(), bookedId: '', attendedId: '' }); const x = out.get(c), id = String(d['Текущая стадия ID'] || ''), name = String(d['Текущая стадия'] || ''); if (id) x.byId.set(id, name); if (DSS_text_(name) === DSS_text_(DSS_CONFIG.stageNames.booked)) x.bookedId = id; if (DSS_text_(name) === DSS_text_(DSS_CONFIG.stageNames.attended)) x.attendedId = id; }); return out; }
 function DSS_normalizeTypeNomenclature_(value) {
