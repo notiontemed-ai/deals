@@ -54,6 +54,7 @@ const DEALS_CONFIG = {
     standard: 'Стандарт лечения',
     standardCode: 'Стандарт лечения.Код',
     uid: 'УИД',
+    appointmentDate: 'Дата',
     treatmentDate: 'Дата лечения',
     nomenclature: 'Номенклатура',
     price: 'Цена'
@@ -131,7 +132,7 @@ function onOpen() {
     .addSeparator()
     .addItem('Обновить справочник сотрудников Bitrix', 'updateBitrixEmployeesDirectory')
     .addItem('Отправить сделки в Bitrix', 'uploadBitrixDeals')
-    .addItem('Заполнить типы и коды пациентов в существующих сделках Bitrix', 'backfillBitrixDealAppointmentTypes')
+    .addItem('Заполнить типы, коды пациентов и даты назначений в существующих сделках Bitrix', 'backfillBitrixDealAppointmentTypes')
     .addItem('Проверить поля Bitrix', 'debugBitrixDealFields')
     .addItem('Проверить дубли отправки Bitrix', 'checkBitrixDuplicateRegistry')
     .addToUi();
@@ -378,6 +379,7 @@ const BITRIX_DEALS_HEADERS = [
   'ФИО',
   'Филиал',
   'Сумма сделки',
+  'Дата назначения',
   'Первый плановый день',
   'Врач',
   'УИДы',
@@ -439,6 +441,7 @@ function buildBitrixDealsSheet() {
         branch,
         amount: 0,
         firstPlanDate: null,
+        appointmentDate: null,
         doctors: [],
         uids: [],
         compositions: [],
@@ -450,8 +453,11 @@ function buildBitrixDealsSheet() {
 
     const group = groups.get(dealKey);
     const planDate = parseBitrixDealPlanDate_(row);
+    const appointmentDate = parseDateOnly_(row['Дата назначения']);
 
     group.amount += parseNumber_(row['Сумма к продаже']);
+
+    if (appointmentDate && (!group.appointmentDate || appointmentDate > group.appointmentDate)) group.appointmentDate = appointmentDate;
 
     if (planDate && (!group.firstPlanDate || planDate < group.firstPlanDate)) {
       group.firstPlanDate = planDate;
@@ -472,6 +478,7 @@ function buildBitrixDealsSheet() {
 
     group.uidRows.push({
       uid,
+      appointmentDate: appointmentDate || '',
       firstPlanDate: planDate,
       doctor: String(row['Врач'] || '').trim(),
       composition: String(row['Состав назначений'] || '').trim(),
@@ -505,6 +512,7 @@ function buildBitrixDealsSheet() {
         group.patientName,
         group.branch,
         group.amount,
+        group.appointmentDate || '',
         group.firstPlanDate || '',
         group.doctors.join(', '),
         uidsText,
@@ -828,6 +836,7 @@ const BITRIX_REGISTRY_HEADERS = [
   'Состав назначения',
   'Сумма',
   'Дата лечения',
+  'Дата назначения',
   'Bitrix Deal ID',
   'Дата отправки',
   'Статус',
@@ -888,10 +897,15 @@ function ensureBitrixRegistryHeaders_(sheet) {
   if (existingHeaders.length === 0 || existingHeaders.every(header => !header)) {
     sheet.getRange(1, 1, 1, BITRIX_REGISTRY_HEADERS.length).setValues([BITRIX_REGISTRY_HEADERS]);
   } else {
-    const missingHeaders = BITRIX_REGISTRY_HEADERS.filter(header => existingHeaders.indexOf(header) === -1);
-    if (missingHeaders.length > 0) {
-      sheet.getRange(1, existingHeaders.length + 1, 1, missingHeaders.length).setValues([missingHeaders]);
+    // Insert this date before Bitrix Deal ID so legacy registry values remain aligned.
+    if (existingHeaders.indexOf('Дата назначения') === -1) {
+      const beforeDealId = existingHeaders.indexOf('Bitrix Deal ID');
+      if (beforeDealId !== -1) sheet.insertColumnBefore(beforeDealId + 1);
+      sheet.getRange(1, beforeDealId === -1 ? existingHeaders.length + 1 : beforeDealId + 1).setValue('Дата назначения');
+      existingHeaders.splice(beforeDealId === -1 ? existingHeaders.length : beforeDealId, 0, 'Дата назначения');
     }
+    const missingHeaders = BITRIX_REGISTRY_HEADERS.filter(header => existingHeaders.indexOf(header) === -1);
+    if (missingHeaders.length > 0) sheet.getRange(1, existingHeaders.length + 1, 1, missingHeaders.length).setValues([missingHeaders]);
   }
 
   sheet.setFrozenRows(1);
@@ -945,6 +959,7 @@ function appendUidsToBitrixRegistry_(ss, dealRow, bitrixDealId, status, comment)
     dealRow['Состав назначений'] || '',
     dealRow['Сумма сделки'] || '',
     dealRow['Первый плановый день'] || '',
+    dealRow['Дата назначения'] || '',
     bitrixDealId || '',
     now,
     status,
@@ -1120,7 +1135,7 @@ function writeBitrixDealsOutput_(ss, outputRows) {
 
   const totalRows = Math.max(outputRows.length, 1);
   sheet.getRange(2, 7, totalRows, 1).setNumberFormat('#,##0.00');
-  sheet.getRange(2, 8, totalRows, 1).setNumberFormat('dd.MM.yyyy');
+  sheet.getRange(2, 8, totalRows, 2).setNumberFormat('dd.MM.yyyy');
   const aiUpdatedAtColumn = BITRIX_DEALS_HEADERS.indexOf('AI updated_at') + 1;
   sheet.getRange(2, aiUpdatedAtColumn, totalRows, 1).setNumberFormat('dd.MM.yyyy HH:mm:ss');
 
@@ -1477,6 +1492,7 @@ function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient) {
       uidGroup.items.length,
       amountTotal,
       amountToSell,
+      uidGroup.appointmentDate || '',
       uidGroup.firstTreatmentDate,
       uidGroup.doctor,
       uidGroup.standard,
@@ -1934,6 +1950,7 @@ function groupAppointmentsByUid_(appointments) {
     const doctor = String(row[c.doctor] || '').trim();
     const standard = String(row[c.standard] || '').trim();
     const treatmentDate = parseDateOnly_(row[c.treatmentDate]);
+    const appointmentDate = parseDateOnly_(row[c.appointmentDate]);
     const nomenclature = String(row[c.nomenclature] || '').trim();
     const price = parseNumber_(row[c.price]);
     const typeCode = String(row.typeCode || '').trim().toUpperCase();
@@ -1951,8 +1968,15 @@ function groupAppointmentsByUid_(appointments) {
         doctor,
         standard,
         firstTreatmentDate: treatmentDate,
+        appointmentDates: [],
+        appointmentDate: null,
         items: []
       };
+    }
+
+    if (appointmentDate) {
+      groups[uid].appointmentDates.push(appointmentDate);
+      if (!groups[uid].appointmentDate || appointmentDate > groups[uid].appointmentDate) groups[uid].appointmentDate = appointmentDate;
     }
 
     if (treatmentDate < groups[uid].firstTreatmentDate) {
@@ -1975,6 +1999,10 @@ function groupAppointmentsByUid_(appointments) {
     });
   });
 
+  Object.keys(groups).forEach(uid => {
+    const dates = Array.from(new Set(groups[uid].appointmentDates.map(formatDateForBitrix_)));
+    if (dates.length > 1) Logger.log('УИД ' + uid + ': обнаружено несколько дат назначения: ' + dates.join(', ') + '. Использована самая поздняя дата.');
+  });
   return groups;
 }
 
@@ -2001,6 +2029,7 @@ function writeDealsOutput_(ss, outputRows) {
     'Кол-во услуг',
     'Сумма назначений',
     'Сумма к продаже',
+    'Дата назначения',
     'Первый плановый день',
     'Врач',
     'Стандарт лечения',
@@ -2030,7 +2059,7 @@ function writeDealsOutput_(ss, outputRows) {
   sheet.getRange(2, 6, totalRows, 1).setNumberFormat('0');
   sheet.getRange(2, 7, totalRows, 1).setNumberFormat('#,##0.00');
   sheet.getRange(2, 8, totalRows, 1).setNumberFormat('#,##0.00');
-  sheet.getRange(2, 9, totalRows, 1).setNumberFormat('dd.MM.yyyy');
+  sheet.getRange(2, 9, totalRows, 2).setNumberFormat('dd.MM.yyyy');
 
   if (outputRows.length > 0) {
     sheet.getRange(2, 12, outputRows.length, 6).setWrap(true);
@@ -2430,6 +2459,7 @@ function getOrCreateSheet_(ss, sheetName) {
 const BITRIX_DEAL_CATEGORY_ID = 114;
 const BITRIX_DEAL_TYPES_FIELD = 'UF_CRM_1784225678';
 const BITRIX_DEAL_PATIENT_CODE_FIELD = 'UF_CRM_1783751141';
+const BITRIX_DEAL_APPOINTMENT_DATE_FIELD = 'UF_CRM_1784267448';
 const BITRIX_DEAL_STAGE_CONTACT = 'C114:NEW';
 const BITRIX_DEAL_STAGE_WAITING = 'C114:UC_2ITBVA';
 const BITRIX_DEAL_CONTACT_WINDOW_DAYS = 5;
@@ -2856,6 +2886,7 @@ function createBitrixDealFromRow_(row, doctorUserMap) {
   const planItemsJson = String(row['Plan Items JSON'] || '').trim();
   const dealAmount = parseMoney_(row['Сумма сделки']);
   const firstPlanDateValue = row['Первый плановый день'];
+  const appointmentDate = parseDateOnly_(row['Дата назначения']);
   const initialStageId = getInitialBitrixDealStageId_(firstPlanDateValue);
   const patientCode = normalizePatientCodeForBitrix_(row['Пациент.Код']);
   const fields = {
@@ -2874,6 +2905,12 @@ function createBitrixDealFromRow_(row, doctorUserMap) {
     [BITRIX_DEAL_TYPES_FIELD]: appointmentTypeCodes,
     UF_CRM_1783752297: aiSummary
   };
+
+  if (appointmentDate) {
+    fields[BITRIX_DEAL_APPOINTMENT_DATE_FIELD] = formatDateForBitrix_(appointmentDate);
+  } else {
+    warnings.push('В сделке не определена дата назначения из колонки «Назначения.Дата».');
+  }
 
   if (patientCode) {
     fields[BITRIX_DEAL_PATIENT_CODE_FIELD] = patientCode;
@@ -2928,10 +2965,11 @@ function backfillBitrixDealAppointmentTypes() {
     const deals = fetchBitrixDealsForTypeBackfill_();
     const registry = readBitrixSentUidRegistry_(ss);
     const patientCodesByDealId = readPatientCodesByBitrixDealId_(ss);
+    const appointmentDatesByUid = readAppointmentDatesByUid_(ss);
     const stats = {
-      loaded: deals.length, emptyTypes: 0, emptyPatientCodes: 0, alreadyFilled: 0,
-      readyTypes: 0, readyPatientCodes: 0, both: 0, noTypes: 0, noPatientCode: 0,
-      patientCodeConflicts: 0, updated: 0, typesUpdated: 0, patientCodesUpdated: 0,
+      loaded: deals.length, emptyTypes: 0, emptyPatientCodes: 0, emptyAppointmentDates: 0, alreadyFilled: 0,
+      readyTypes: 0, readyPatientCodes: 0, readyAppointmentDates: 0, both: 0, noTypes: 0, noPatientCode: 0, noAppointmentDate: 0,
+      patientCodeConflicts: 0, updated: 0, typesUpdated: 0, patientCodesUpdated: 0, appointmentDatesUpdated: 0,
       bothUpdated: 0, errors: []
     };
     const unknown = new Map();
@@ -2940,12 +2978,14 @@ function backfillBitrixDealAppointmentTypes() {
     deals.forEach(deal => {
       const typesEmpty = isEmptyBitrixValue_(deal[BITRIX_DEAL_TYPES_FIELD]);
       const patientCodeEmpty = isEmptyBitrixValue_(deal[BITRIX_DEAL_PATIENT_CODE_FIELD]);
-      if (!typesEmpty && !patientCodeEmpty) {
+      const appointmentDateEmpty = isEmptyBitrixValue_(deal[BITRIX_DEAL_APPOINTMENT_DATE_FIELD]);
+      if (!typesEmpty && !patientCodeEmpty && !appointmentDateEmpty) {
         stats.alreadyFilled += 1;
         return;
       }
       if (typesEmpty) stats.emptyTypes += 1;
       if (patientCodeEmpty) stats.emptyPatientCodes += 1;
+      if (appointmentDateEmpty) stats.emptyAppointmentDates += 1;
 
       const fieldsToUpdate = {};
       if (typesEmpty) {
@@ -2983,10 +3023,21 @@ function backfillBitrixDealAppointmentTypes() {
         }
       }
 
+      if (appointmentDateEmpty) {
+        const appointmentDate = resolveAppointmentDateForBackfill_(deal, registry, appointmentDatesByUid);
+        if (appointmentDate) {
+          fieldsToUpdate[BITRIX_DEAL_APPOINTMENT_DATE_FIELD] = formatDateForBitrix_(appointmentDate);
+          stats.readyAppointmentDates += 1;
+        } else {
+          stats.noAppointmentDate += 1;
+        }
+      }
+
       const updatesTypes = Object.prototype.hasOwnProperty.call(fieldsToUpdate, BITRIX_DEAL_TYPES_FIELD);
       const updatesPatientCode = Object.prototype.hasOwnProperty.call(fieldsToUpdate, BITRIX_DEAL_PATIENT_CODE_FIELD);
+      const updatesAppointmentDate = Object.prototype.hasOwnProperty.call(fieldsToUpdate, BITRIX_DEAL_APPOINTMENT_DATE_FIELD);
       if (updatesTypes && updatesPatientCode) stats.both += 1;
-      if (updatesTypes || updatesPatientCode) {
+      if (updatesTypes || updatesPatientCode || updatesAppointmentDate) {
         updates.push({ id: String(deal.ID), title: String(deal.TITLE || ''), fields: fieldsToUpdate });
         Logger.log('Сделка ' + deal.ID + ' (' + (deal.TITLE || '') + '): будут заполнены поля ' +
           Object.keys(fieldsToUpdate).join(', ') + '.');
@@ -3010,6 +3061,7 @@ function backfillBitrixDealAppointmentTypes() {
     stats.updated = result.updated;
     stats.typesUpdated = result.typesUpdated;
     stats.patientCodesUpdated = result.patientCodesUpdated;
+    stats.appointmentDatesUpdated = result.appointmentDatesUpdated;
     stats.bothUpdated = result.bothUpdated;
     stats.errors = result.errors;
     ui.alert(buildBackfillAppointmentTypesReport_(stats));
@@ -3025,7 +3077,7 @@ function backfillBitrixDealAppointmentTypes() {
 function fetchBitrixDealsForTypeBackfill_() {
   const deals = [];
   const select = ['ID', 'TITLE', 'CATEGORY_ID', 'STAGE_ID', BITRIX_DEAL_TYPES_FIELD,
-    BITRIX_DEAL_PATIENT_CODE_FIELD, 'UF_CRM_1784034617', 'UF_CRM_1783751372',
+    BITRIX_DEAL_PATIENT_CODE_FIELD, BITRIX_DEAL_APPOINTMENT_DATE_FIELD, 'UF_CRM_1784034617', 'UF_CRM_1783751372',
     'UF_CRM_1783751578', 'UF_CRM_1783752197'];
   let start = 0;
   while (true) {
@@ -3096,8 +3148,30 @@ function extractDealNomenclatures_(deal, registryRowsByUid) {
   return { source: 'Состав назначений', items: extractNomenclaturesFromAppointmentText_(deal.UF_CRM_1783752197) };
 }
 
+function readAppointmentDatesByUid_(ss) {
+  const result = new Map();
+  const sheet = getRequiredSheet_(ss, DEALS_CONFIG.appointmentsSheetName);
+  readSheetWithHeaders_(sheet).rows.forEach(row => {
+    const uid = String(row[DEALS_CONFIG.appointmentColumns.uid] || '').trim();
+    const date = parseDateOnly_(row[DEALS_CONFIG.appointmentColumns.appointmentDate]);
+    if (!uid || !date) return;
+    if (!result.has(uid)) result.set(uid, []);
+    result.get(uid).push(date);
+  });
+  return result;
+}
+function resolveAppointmentDateForBackfill_(deal, registry, datesByUid) {
+  let dates = splitUids_(deal.UF_CRM_1783751372).reduce((all, uid) => all.concat(datesByUid.get(uid) || []), []);
+  if (!dates.length) dates = (registry.rowsByDealId.get(String(deal.ID)) || []).map(row => parseDateOnly_(row['Дата назначения'])).filter(Boolean);
+  if (!dates.length) dates = splitUids_(deal.UF_CRM_1783751372).reduce((all, uid) => all.concat((registry.rowsByUid.get(uid) || []).map(row => parseDateOnly_(row['Дата назначения'])).filter(Boolean)), []);
+  if (!dates.length) { const parsed = parseJsonSafely_(String(deal.UF_CRM_1784034617 || '')); if (parsed) dates = [parseDateOnly_(parsed.appointment_date)].filter(Boolean); }
+  const unique = Array.from(new Set(dates.map(formatDateForBitrix_)));
+  if (unique.length > 1) Logger.log('Сделка ' + deal.ID + ': найдены даты назначения ' + unique.join(', ') + '; использована ' + unique.sort().pop() + '.');
+  return dates.sort((a, b) => b - a)[0] || null;
+}
+
 function updateBitrixDealTypesBatch_(updates) {
-  const result = { updated: 0, typesUpdated: 0, patientCodesUpdated: 0, bothUpdated: 0, errors: [] };
+  const result = { updated: 0, typesUpdated: 0, patientCodesUpdated: 0, appointmentDatesUpdated: 0, bothUpdated: 0, errors: [] };
   const rows = Array.from(new Map((updates || []).map(update => [String(update.id), update])).values());
   for (let offset = 0; offset < rows.length; offset += 50) {
     const batch = rows.slice(offset, offset + 50);
@@ -3122,9 +3196,11 @@ function updateBitrixDealTypesBatch_(updates) {
         }
         const types = Object.prototype.hasOwnProperty.call(update.fields, BITRIX_DEAL_TYPES_FIELD);
         const code = Object.prototype.hasOwnProperty.call(update.fields, BITRIX_DEAL_PATIENT_CODE_FIELD);
+        const appointmentDate = Object.prototype.hasOwnProperty.call(update.fields, BITRIX_DEAL_APPOINTMENT_DATE_FIELD);
         result.updated += 1;
         if (types) result.typesUpdated += 1;
         if (code) result.patientCodesUpdated += 1;
+        if (appointmentDate) result.appointmentDatesUpdated += 1;
         if (types && code) result.bothUpdated += 1;
         Logger.log('Сделка ' + update.id + ': поля обновлены: ' + Object.keys(update.fields).join(', ') + '.');
       });
@@ -3139,19 +3215,15 @@ function updateBitrixDealTypesBatch_(updates) {
 }
 
 function buildBackfillAppointmentTypesConfirmation_(stats) {
-  return ['Найдено сделок направления: ' + stats.loaded + '.', '',
-    'Поле типов пустое: ' + stats.emptyTypes + '.', 'Пациент.Код пустой: ' + stats.emptyPatientCodes + '.', '',
-    'Готово к заполнению типов: ' + stats.readyTypes + '.', 'Готово к заполнению кодов пациентов: ' + stats.readyPatientCodes + '.',
-    'Будут обновлены оба поля: ' + stats.both + '.', '', 'Не удалось определить типы: ' + stats.noTypes + '.',
-    'Не удалось определить Пациент.Код: ' + stats.noPatientCode + '.', 'Конфликт кодов пациента: ' + stats.patientCodeConflicts + '.'].join('\n');
+  return ['Найдено сделок направления: ' + stats.loaded + '.', '', 'Поле типов пустое: ' + stats.emptyTypes + '.', 'Код пациента пустой: ' + stats.emptyPatientCodes + '.', 'Дата назначения пустая: ' + stats.emptyAppointmentDates + '.', '', 'Готово к заполнению типов: ' + stats.readyTypes + '.', 'Готово к заполнению кодов пациентов: ' + stats.readyPatientCodes + '.', 'Готово к заполнению дат назначения: ' + stats.readyAppointmentDates + '.', '', 'Не удалось определить типы: ' + stats.noTypes + '.', 'Не удалось определить код пациента: ' + stats.noPatientCode + '.', 'Не удалось определить дату назначения: ' + stats.noAppointmentDate + '.', 'Будет обновлено сделок: ' + (stats.readyTypes + stats.readyPatientCodes + stats.readyAppointmentDates) + '.'].join('\n');
 }
 
 function buildBackfillAppointmentTypesReport_(stats) {
   const lines = ['Актуализация существующих сделок Bitrix завершена.', '', 'Сделок направления загружено: ' + stats.loaded + '.',
     'Сделок уже с обоими заполненными полями: ' + stats.alreadyFilled + '.', 'Обновлено сделок всего: ' + stats.updated + '.',
-    'Заполнены типы назначений: ' + stats.typesUpdated + '.', 'Заполнены коды пациентов: ' + stats.patientCodesUpdated + '.',
+    'Заполнены типы назначений: ' + stats.typesUpdated + '.', 'Заполнены коды пациентов: ' + stats.patientCodesUpdated + '.', 'Заполнены даты назначений: ' + stats.appointmentDatesUpdated + '.',
     'В одной операции заполнены оба поля: ' + stats.bothUpdated + '.', 'Не удалось определить типы: ' + stats.noTypes + '.',
-    'Не удалось определить Пациент.Код: ' + stats.noPatientCode + '.', 'Конфликтов кодов пациента: ' + stats.patientCodeConflicts + '.',
+    'Не удалось определить код пациента: ' + stats.noPatientCode + '.', 'Не удалось определить дату назначения: ' + stats.noAppointmentDate + '.', 'Конфликтов кодов пациента: ' + stats.patientCodeConflicts + '.',
     'Ошибок Bitrix: ' + stats.errors.length + '.'];
   if (stats.errors.length) lines.push('', 'ID сделок с ошибками: ' + stats.errors.map(item => item.id).join(', ') + '.');
   return lines.join('\n');
@@ -3246,6 +3318,14 @@ function buildBackfillTypeCodes_(nomenclatures, typeCodeMap) {
 
 
 
+function testBitrixDealAppointmentDate_() {
+  const dates = ['17.07.2026', '19.07.2026'].map(parseDateOnly_).sort((a, b) => b - a);
+  if (formatDateForBitrix_(dates[0]) !== '2026-07-19') throw new Error('Не выбрана поздняя дата назначения.');
+  if (formatDateForBitrix_(parseDateOnly_('17.07.2026')) !== '2026-07-17') throw new Error('Неверный формат даты Bitrix.');
+  if (isEmptyBitrixValue_('2026-07-17')) throw new Error('Заполненное поле даты не должно перезаписываться.');
+  return 'testBitrixDealAppointmentDate_: OK';
+}
+
 function debugBitrixDealFields() {
   const fields = bitrixCall_('crm.deal.fields', {});
   const needed = [
@@ -3259,6 +3339,7 @@ function debugBitrixDealFields() {
     'UF_CRM_1783752197',
     BITRIX_DEAL_TYPES_FIELD,
     BITRIX_DEAL_PATIENT_CODE_FIELD,
+    BITRIX_DEAL_APPOINTMENT_DATE_FIELD,
     'UF_CRM_1783752297',
     'UF_CRM_1784034617',
     'UF_CRM_615C18C0D7CD9'
@@ -3271,6 +3352,12 @@ function debugBitrixDealFields() {
 
 function splitUids_(value) {
   return String(value || '').split(/[\n,;]+/).map(s => s.trim()).filter(Boolean);
+}
+
+
+function formatDateForBitrix_(date) {
+  if (Object.prototype.toString.call(date) !== '[object Date]' || isNaN(date)) return '';
+  return Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd');
 }
 
 function parseMoney_(value) {

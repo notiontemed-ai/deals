@@ -29,12 +29,14 @@ const DSS_TYPE_CODES_SHEET_NAME =
   'Коды типов назначений';
 const DSS_DEAL_TYPE_CODES_FIELD =
   'UF_CRM_1784225678';
+const DSS_DEAL_APPOINTMENT_DATE_FIELD =
+  'UF_CRM_1784267448';
 const DSS_ALLOWED_TYPE_CODES = [
   'L', 'M', 'S', 'F', 'C', 'D', 'U', 'P', '-'
 ];
 const DSS_REQUEST_HEADERS = ['КлиентКод', 'Пациент', 'Дата', 'Запланированы', 'Выполнены', 'Дата обработки'];
-const DSS_DEAL_HEADERS = ['ID сделки', 'Название', 'ФИО пациента', 'CATEGORY_ID', 'Текущая стадия ID', 'Текущая стадия', 'Код пациента', 'Сумма сделки', 'Дата создания сделки', 'Первый день лечения', 'Состав назначения', 'Типы назначений', 'Дата загрузки', 'Ошибка данных'];
-const DSS_ACTUALIZATION_HEADERS = ['Отправить', 'ID сделки', 'Название сделки', 'Код пациента', 'Первый день лечения', 'Типы назначений', 'Найденные запланированные типы', 'Найденные выполненные типы', 'Текущая стадия ID', 'Текущая стадия', 'Предлагаемая стадия ID', 'Предлагаемая стадия', 'Результат проверки', 'Причина', 'Дата загрузки сделок', 'Дата обработки заявок', 'Дата актуализации', 'Статус отправки', 'Ошибка отправки'];
+const DSS_DEAL_HEADERS = ['ID сделки', 'Название', 'ФИО пациента', 'CATEGORY_ID', 'Текущая стадия ID', 'Текущая стадия', 'Код пациента', 'Сумма сделки', 'Дата создания сделки', 'Дата назначения', 'Первый день лечения', 'Состав назначения', 'Типы назначений', 'Дата загрузки', 'Ошибка данных'];
+const DSS_ACTUALIZATION_HEADERS = ['Отправить', 'ID сделки', 'Название сделки', 'Код пациента', 'Дата назначения', 'Первый день лечения', 'Типы назначений', 'Найденные запланированные типы', 'Найденные выполненные типы', 'Текущая стадия ID', 'Текущая стадия', 'Предлагаемая стадия ID', 'Предлагаемая стадия', 'Результат проверки', 'Причина', 'Дата загрузки сделок', 'Дата обработки заявок', 'Дата актуализации', 'Статус отправки', 'Ошибка отправки'];
 const DSS_STAGE_HEADERS = ['Название стадии', 'Код стадии'];
 
 function onOpen(e) { DSS_addDealStatusSyncMenu_(); }
@@ -112,7 +114,7 @@ function DSS_loadDealsFromBitrix() {
   const raw = DSS_list_(base, 'crm.deal.list', {
     order: { ID: 'ASC' },
     filter: { CATEGORY_ID: DSS_CONFIG.categoryId },
-    select: ['ID', 'TITLE', 'CATEGORY_ID', 'STAGE_ID', 'OPPORTUNITY', 'DATE_CREATE', 'UF_CRM_1737550182812', 'UF_CRM_1783751141', 'UF_CRM_1783751996', 'UF_CRM_1783752197', DSS_DEAL_TYPE_CODES_FIELD]
+    select: ['ID', 'TITLE', 'CATEGORY_ID', 'STAGE_ID', 'OPPORTUNITY', 'DATE_CREATE', 'UF_CRM_1737550182812', 'UF_CRM_1783751141', DSS_DEAL_APPOINTMENT_DATE_FIELD, 'UF_CRM_1783751996', 'UF_CRM_1783752197', DSS_DEAL_TYPE_CODES_FIELD]
   });
   const categoryId = Number(DSS_CONFIG.categoryId);
   const deals = raw.filter(item => Number(item.CATEGORY_ID || 0) === categoryId);
@@ -120,23 +122,22 @@ function DSS_loadDealsFromBitrix() {
   if (unexpectedDeals) Logger.log('Bitrix вернул сделки вне CATEGORY_ID ' + categoryId + ': ' + unexpectedDeals + '.');
   const stages = DSS_stageDirectory_(base, deals); let noPatient = 0; let incomplete = 0;
   const rows = deals.map(item => {
-    const id = String(item.ID || ''); const firstTreatment = DSS_date_(item.UF_CRM_1783751996); const createdAt = DSS_date_(item.DATE_CREATE);
+    const id = String(item.ID || ''); const firstTreatment = DSS_date_(item.UF_CRM_1783751996); const appointmentDate = DSS_date_(item[DSS_DEAL_APPOINTMENT_DATE_FIELD]); const createdAt = DSS_date_(item.DATE_CREATE);
     const title = String(item.TITLE || ''); const patientName = String(item.UF_CRM_1737550182812 || '').trim();
     const patient = DSS_normalizePatientCode_(item.UF_CRM_1783751141);
     const rawTypeCodes = String(item[DSS_DEAL_TYPE_CODES_FIELD] || '').replace(/\s+/g, ''); const codes = DSS_normalizeDealTypeCodes_(rawTypeCodes);
     const errors = [];
     if (!patientName) errors.push('В сделке Bitrix не заполнено поле ФИО пациента UF_CRM_1737550182812.');
     if (!patient) { noPatient += 1; errors.push('В сделке Bitrix не заполнен код пациента UF_CRM_1783751141.'); }
-    if (!createdAt) errors.push('В сделке Bitrix не заполнена дата создания сделки DATE_CREATE.');
     if (!firstTreatment) errors.push('В сделке Bitrix не заполнен первый день лечения UF_CRM_1783751996.');
-    if (!createdAt && !firstTreatment) errors.push('Невозможно определить период поиска заявок: отсутствуют дата создания сделки и первый день лечения.');
+    if (!appointmentDate) errors.push('В сделке Bitrix не заполнена дата назначения UF_CRM_1784267448.');
     if (!rawTypeCodes) { incomplete += 1; errors.push('В сделке Bitrix не заполнено поле типов назначений UF_CRM_1784225678.'); }
     else if (!codes) { incomplete += 1; errors.push('Поле типов назначений UF_CRM_1784225678 не содержит допустимых типов.'); }
     const category = Number(item.CATEGORY_ID || 0); const stageId = String(item.STAGE_ID || ''); const stage = (stages.get(category) || { byId: new Map() }).byId.get(stageId) || stageId;
     const opportunity = item.OPPORTUNITY === undefined || item.OPPORTUNITY === null || item.OPPORTUNITY === '' ? 0 : Number(item.OPPORTUNITY) || 0;
-    return [id, title, patientName || title, category, stageId, stage, patient, opportunity, createdAt || '', firstTreatment || '', String(item.UF_CRM_1783752197 || ''), codes, now, errors.join('\n')];
+    return [id, title, patientName || title, category, stageId, stage, patient, opportunity, createdAt || '', appointmentDate || '', firstTreatment || '', String(item.UF_CRM_1783752197 || ''), codes, now, errors.join('\n')];
   }).filter(row => row[0]);
-  DSS_saveStageDirectory_(stages); DSS_writeSheet_(ss, DSS_CONFIG.sheets.deals, DSS_DEAL_HEADERS, rows, { numbers: [8], dateTimes: [9, 13], dates: [10], wraps: [11, 14], widths: { 1: 110, 2: 220, 3: 220, 7: 120, 8: 120, 9: 165, 10: 120, 11: 300, 12: 130, 13: 165, 14: 360 } }); DSS_log_(ss, 'Загрузка сделок Bitrix', now);
+  DSS_saveStageDirectory_(stages); DSS_writeSheet_(ss, DSS_CONFIG.sheets.deals, DSS_DEAL_HEADERS, rows, { numbers: [8], dateTimes: [9, 14], dates: [10, 11], wraps: [12, 15], widths: { 1: 110, 2: 220, 3: 220, 7: 120, 8: 120, 9: 165, 10: 120, 11: 120, 12: 300, 13: 130, 14: 165, 15: 360 } }); DSS_log_(ss, 'Загрузка сделок Bitrix', now);
   DSS_alert_('Загрузка сделок из Bitrix завершена.', 'Направление: ' + categoryId + '.\nПолучено сделок направления: ' + deals.length + '.\nЗаписано на лист: ' + rows.length + '.\nБез кода пациента: ' + noPatient + '.\nБез заполненных типов назначений: ' + incomplete + '.');
 }
 function DSS_loadStagesFromBitrix() {
@@ -156,10 +157,10 @@ function DSS_actualizeDeals() {
   const index = new Map(); requests.forEach(r => { const code = DSS_normalizePatientCode_(r['КлиентКод']); if (!code) return; if (!index.has(code)) index.set(code, []); index.get(code).push(r); });
   const stageInfo = DSS_loadStageDirectory_(); const now = new Date(); let booked = 0, attended = 0, unchanged = 0, errors = 0;
   const rows = deals.map(d => {
-    const id = String(d['ID сделки'] || ''); const patient = DSS_normalizePatientCode_(d['Код пациента']); const firstTreatment = DSS_date_(d['Первый день лечения']); const createdAt = DSS_date_(d['Дата создания сделки']); const codes = DSS_codeSet_(d['Типы назначений']);
-    const startDate = DSS_getRequestMatchingStartDate_(createdAt, firstTreatment); let planned = new Set(), done = new Set(), targetId = '', targetName = '', result = 'Без изменений', reason = '';
+    const id = String(d['ID сделки'] || ''); const patient = DSS_normalizePatientCode_(d['Код пациента']); const appointmentDate = DSS_date_(d['Дата назначения']); const firstTreatment = DSS_date_(d['Первый день лечения']); const codes = DSS_codeSet_(d['Типы назначений']);
+    const startDate = DSS_getRequestMatchingStartDate_(appointmentDate, firstTreatment); let planned = new Set(), done = new Set(), targetId = '', targetName = '', result = 'Без изменений', reason = '';
     if (!patient) { result = 'Не найден код пациента'; reason = 'В сделке отсутствует код пациента UF_CRM_1783751141.'; errors += 1; }
-    else if (!startDate) { result = 'Недостаточно данных'; reason = 'Невозможно определить период поиска заявок: отсутствуют дата создания сделки и первый день лечения.'; errors += 1; }
+    else if (!startDate) { result = 'Недостаточно данных'; reason = 'Невозможно проверить заявки: отсутствует дата назначения.'; errors += 1; }
     else if (!codes.size) { result = d['Ошибка данных'] ? 'Неизвестная номенклатура' : 'Недостаточно данных'; reason = String(d['Ошибка данных'] || 'Не указаны коды назначения.'); errors += 1; }
     else {
       const effective = new Set(codes); if (effective.size > 1) effective.delete(DSS_CONFIG.consultationCode);
@@ -174,7 +175,7 @@ function DSS_actualizeDeals() {
       if (targetId) targetName = si.byId.get(targetId) || result;
     }
     if (result === 'Записался' && targetId) booked += 1; else if (result === 'Дошёл' && targetId) attended += 1; else unchanged += 1;
-    return [Boolean(targetId), id, d['Название'], patient, firstTreatment || '', DSS_codes_(codes), DSS_codes_(planned), DSS_codes_(done), d['Текущая стадия ID'], d['Текущая стадия'], targetId, targetName, result, reason, d['Дата загрузки'], requestTime || '', now, '', ''];
+    return [Boolean(targetId), id, d['Название'], patient, appointmentDate || '', firstTreatment || '', DSS_codes_(codes), DSS_codes_(planned), DSS_codes_(done), d['Текущая стадия ID'], d['Текущая стадия'], targetId, targetName, result, reason, d['Дата загрузки'], requestTime || '', now, '', ''];
   });
   DSS_writeActualization_(ss, rows); DSS_log_(ss, 'Актуализация сделок', now);
   DSS_alert_('Актуализация сделок завершена.', 'Сделок проверено: ' + deals.length + '.\nПредлагается «Записался»: ' + booked + '.\nПредлагается «Дошёл»: ' + attended + '.\nБез изменений: ' + unchanged + '.\nСтрок с ошибками данных: ' + errors + '.');
@@ -266,11 +267,11 @@ function DSS_writeSheet_(ss, name, headers, rows, formats) {
   if (s.getFilter()) s.getFilter().remove();
   s.getRange(1, 1, Math.max(rows.length + 1, 1), headers.length).createFilter();
 }
-function DSS_writeActualization_(ss, rows) { DSS_writeSheet_(ss, DSS_CONFIG.sheets.actualization, DSS_ACTUALIZATION_HEADERS, rows, { dates: [5], dateTimes: [15,16,17] }); const s = ss.getSheetByName(DSS_CONFIG.sheets.actualization); s.getRange(2,1,Math.max(rows.length,1),1).insertCheckboxes(); }
+function DSS_writeActualization_(ss, rows) { DSS_writeSheet_(ss, DSS_CONFIG.sheets.actualization, DSS_ACTUALIZATION_HEADERS, rows, { dates: [5,6], dateTimes: [16,17,18] }); const s = ss.getSheetByName(DSS_CONFIG.sheets.actualization); s.getRange(2,1,Math.max(rows.length,1),1).insertCheckboxes(); }
 function DSS_prepareSheet_(ss, name, headers) { let s = ss.getSheetByName(name); if(!s) s = ss.insertSheet(name); if (s.getFilter()) s.getFilter().remove(); s.clear(); s.getRange(1,1,1,headers.length).setValues([headers]); return s; }
 function DSS_requiredSheet_(ss, name) { const s = ss.getSheetByName(name); if(!s) throw new Error('Не найден обязательный лист "' + name + '".'); return s; }
 function DSS_readObjects_(sheet) { const values = sheet.getDataRange().getValues(), display = sheet.getDataRange().getDisplayValues(); if(!values.length) return []; const h = display[0].map(x => String(x || '').trim()); return values.slice(1).map((row,i) => { const x = {}; h.forEach((k,j) => x[k] = row[j]); return x; }); }
-function DSS_sendStatus_(sheet, row, status, error) { sheet.getRange(row,18,1,2).setValues([[status,error]]); }
+function DSS_sendStatus_(sheet, row, status, error) { sheet.getRange(row,19,1,2).setValues([[status,error]]); }
 function DSS_ensureLogSheet_(ss) { let s = ss.getSheetByName(DSS_CONFIG.sheets.log); if(!s) s = ss.insertSheet(DSS_CONFIG.sheets.log); if(!s.getLastRow()) s.appendRow(['Дата и время','Этап']); return s; }
 function DSS_log_(ss, stage, date) { DSS_ensureLogSheet_(ss).appendRow([date, stage]); }
 function DSS_alert_(title, text) { SpreadsheetApp.getUi().alert(title, text, SpreadsheetApp.getUi().ButtonSet.OK); }
@@ -282,31 +283,26 @@ function DSS_serviceCode_(v) { const x = String(v || '').trim().toUpperCase(); r
 function DSS_codeSet_(v) { return new Set(String(v || '').split('').map(DSS_serviceCode_).filter(x => x && x !== DSS_CONFIG.ignoredCode)); }
 function DSS_codes_(set) { return Array.from(set || []).filter(x => x && x !== '-').sort((a,b) => DSS_CONFIG.serviceCodeOrder.indexOf(a) - DSS_CONFIG.serviceCodeOrder.indexOf(b)).join(''); }
 function DSS_date_(v) { if(v instanceof Date && !isNaN(v)) return new Date(v.getFullYear(),v.getMonth(),v.getDate()); const t = String(v || '').trim(), m = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/) || t.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})/); if(m) return m[1].length === 4 ? new Date(+m[1],+m[2]-1,+m[3]) : new Date(+m[3],+m[2]-1,+m[1]); const d = new Date(t); return isNaN(d) ? null : new Date(d.getFullYear(),d.getMonth(),d.getDate()); }
-function DSS_getRequestMatchingStartDate_(dealCreatedAt, firstTreatmentDate) {
-  const created = DSS_date_(dealCreatedAt); const treatment = DSS_date_(firstTreatmentDate);
-  if (!created && !treatment) return null;
-  if (!treatment) return created;
+function DSS_getRequestMatchingStartDate_(appointmentDate, firstTreatmentDate) {
+  const appointment = DSS_date_(appointmentDate);
+  if (!appointment) return null;
+  const nextDay = new Date(appointment.getFullYear(), appointment.getMonth(), appointment.getDate());
+  nextDay.setDate(nextDay.getDate() + 1);
+  const treatment = DSS_date_(firstTreatmentDate);
+  if (!treatment) return nextDay;
   const treatmentMinus30 = new Date(treatment.getFullYear(), treatment.getMonth(), treatment.getDate());
   treatmentMinus30.setDate(treatmentMinus30.getDate() - 30);
-  return !created || treatmentMinus30 > created ? treatmentMinus30 : created;
+  return treatmentMinus30 > nextDay ? treatmentMinus30 : nextDay;
 }
 function DSS_testRequestMatchingStartDate_() {
   const d = (year, month, day) => new Date(year, month - 1, day);
   const equalDate = (actual, expected, message) => { if (!actual || actual.getTime() !== expected.getTime()) throw new Error(message); };
-  const laterCreation = DSS_getRequestMatchingStartDate_(d(2026, 7, 10), d(2026, 8, 1));
-  equalDate(laterCreation, d(2026, 7, 10), 'DATE_CREATE должен быть нижней границей, если он позже.');
-  const laterTreatmentLimit = DSS_getRequestMatchingStartDate_(d(2026, 6, 1), d(2026, 8, 1));
-  equalDate(laterTreatmentLimit, d(2026, 7, 2), 'Первый день лечения минус 30 дней должен быть нижней границей, если он позже.');
-  if (!(d(2026, 7, 10) >= laterCreation) || !(d(2026, 7, 9) < laterCreation)) throw new Error('Нижняя граница должна быть включительной.');
-  // Planned and done requests before the treatment date are valid once they pass the lower bound.
-  const plannedBeforeTreatment = d(2026, 7, 15), doneBeforeTreatment = d(2026, 7, 18), treatment = d(2026, 8, 1);
-  if (!(plannedBeforeTreatment >= laterCreation && plannedBeforeTreatment < treatment)) throw new Error('Плановая заявка до первого дня лечения должна учитываться после нижней границы.');
-  if (!(doneBeforeTreatment >= laterCreation && doneBeforeTreatment < treatment)) throw new Error('Выполненная заявка до первого дня лечения должна учитываться после нижней границы.');
-  equalDate(DSS_getRequestMatchingStartDate_(null, d(2026, 8, 1)), d(2026, 7, 2), 'При пустом DATE_CREATE используется первый день минус 30 дней.');
-  equalDate(DSS_getRequestMatchingStartDate_(d(2026, 7, 10), null), d(2026, 7, 10), 'При пустом первом дне используется DATE_CREATE.');
-  if (DSS_getRequestMatchingStartDate_(null, null) !== null) throw new Error('Без обеих дат нижняя граница должна отсутствовать.');
-  if (DSS_normalizePatientCode_(' 000123 ') !== DSS_normalizePatientCode_('000123')) throw new Error('Код пациента должен сопоставляться с КлиентКод с сохранением ведущих нулей.');
-  if (DSS_normalizePatientCode_('') !== '') throw new Error('Сделка без кода пациента не должна актуализироваться.');
+  equalDate(DSS_getRequestMatchingStartDate_(d(2026, 7, 17), d(2026, 8, 1)), d(2026, 7, 18), 'Дата назначения должна сдвигаться на следующий день.');
+  equalDate(DSS_getRequestMatchingStartDate_(d(2026, 6, 1), d(2026, 8, 1)), d(2026, 7, 2), 'Должен использоваться максимум с первым днём минус 30.');
+  equalDate(DSS_getRequestMatchingStartDate_(d(2026, 7, 17), null), d(2026, 7, 18), 'Без первого дня используется следующий день назначения.');
+  if (DSS_getRequestMatchingStartDate_(null, d(2026, 8, 1)) !== null) throw new Error('Без даты назначения нижняя граница должна отсутствовать.');
+  const start = DSS_getRequestMatchingStartDate_(d(2026, 7, 17), null);
+  if (!(d(2026, 7, 17) < start && d(2026, 7, 18) >= start)) throw new Error('Заявки в дату назначения исключаются, со следующего дня учитываются для всех типов.');
   return 'DSS_testRequestMatchingStartDate_: OK';
 }
 function DSS_scriptTimeZone_() { return Session.getScriptTimeZone(); }
