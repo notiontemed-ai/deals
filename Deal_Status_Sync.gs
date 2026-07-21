@@ -28,7 +28,7 @@ const DSS_CONFIG = Object.freeze({
   categoryId: 114,
   requestColumns: { patientCode: 'КлиентКод', patientName: 'Клиент', startDate: 'ДатаНачала', state: 'Состояние', nomenclature: 'НоменклатураНаименование', cabinet: 'Кабинет' },
   stageNames: { booked: 'Записался', attended: 'Дошёл' },
-  ignoredCode: '-', consultationCode: 'C', serviceCodeOrder: 'LMSFCDUP', batchSize: 50,
+  ignoredCode: '-', consultationCode: 'C', serviceCodeOrder: 'LMSFCDUPB', batchSize: 50,
   doneStates: ['Начато', 'Выполнена', 'Выполнено', 'Завершена', 'Завершено', 'Оказана', 'Оказано', 'Прием состоялся', 'Приём состоялся', 'Состоялась', 'Состоялся'],
   plannedStates: ['Запланирована', 'Запланировано', 'Подтвердил запись', 'Подтверждена', 'Подтверждено', 'Записан', 'Записана', 'Недозвон. Отправить смс'],
   cancelledMarkers: ['отменена', 'отменено', 'отменен', 'отменён', 'отказ', 'не состоялась', 'не состоялся', 'неявка', 'не явился', 'не явилась', 'удалена', 'удалено']
@@ -43,7 +43,7 @@ const DSS_DEAL_TYPE_CODES_FIELD =
 const DSS_DEAL_APPOINTMENT_DATE_FIELD =
   'UF_CRM_1784267448';
 const DSS_ALLOWED_TYPE_CODES = [
-  'L', 'M', 'S', 'F', 'C', 'D', 'U', 'P', '-'
+  'L', 'M', 'S', 'F', 'C', 'D', 'U', 'P', 'B', '-'
 ];
 const DSS_REQUEST_HEADERS = ['КлиентКод', 'Пациент', 'Дата', 'Запланированы', 'Выполнены', 'Дата обработки'];
 const DSS_DEAL_HEADERS = ['ID сделки', 'Название', 'ФИО пациента', 'CATEGORY_ID', 'Текущая стадия ID', 'Текущая стадия', 'Код пациента', 'Сумма сделки', 'Дата создания сделки', 'Дата назначения', 'Первый день лечения', 'Состав назначения', 'Типы назначений', 'Дата загрузки', 'Ошибка данных'];
@@ -375,6 +375,37 @@ function DSS_testCabinetPriorityTypeDetection_() {
   // Филиал не участвует в сопоставлении заявок со сделками.
   return 'DSS_testCabinetPriorityTypeDetection_: OK';
 }
+
+function DSS_testBotulinumTypeCode_() {
+  const assertEqual = (actual, expected, message) => {
+    if (actual !== expected) throw new Error(message + ' Ожидалось: ' + expected + ', получено: ' + actual + '.');
+  };
+  const assertTrue = (actual, message) => { if (!actual) throw new Error(message); };
+  const resolveResult = (dealCodes, requests) => {
+    const effective = DSS_codeSet_(dealCodes);
+    if (effective.size > 1) effective.delete(DSS_CONFIG.consultationCode);
+    const planned = new Set(), done = new Set();
+    requests.forEach(r => {
+      DSS_codeSet_(r.planned).forEach(c => { if (effective.has(c)) planned.add(c); });
+      DSS_codeSet_(r.done).forEach(c => { if (effective.has(c)) done.add(c); });
+    });
+    if (done.size) return 'Дошёл';
+    if (planned.size) return 'Записался';
+    return 'Подходящие заявки не найдены';
+  };
+
+  assertEqual(DSS_serviceCode_('B'), 'B', 'B должен быть допустимым кодом.');
+  assertEqual(DSS_normalizeDealTypeCodes_('LB'), 'LB', 'Нормализация LB должна сохранять B.');
+  assertTrue(DSS_codeSet_('B').has('B'), 'Набор кодов должен содержать B.');
+  assertEqual(DSS_codes_(new Set(['B', 'L'])), 'LB', 'Сортировка B, L должна давать LB.');
+  assertEqual(resolveResult('B', [{ planned: 'B', done: '' }]), 'Записался', 'Плановая заявка B должна давать Записался.');
+  assertEqual(resolveResult('B', [{ planned: '', done: 'B' }]), 'Дошёл', 'Выполненная заявка B должна давать Дошёл.');
+  assertEqual(resolveResult('B', [{ planned: 'L', done: '' }]), 'Подходящие заявки не найдены', 'Заявка L не должна подходить к сделке B.');
+  assertEqual(resolveResult('B', [{ planned: 'B', done: '', branch: 'Другой филиал' }]), 'Записался', 'Филиал не должен препятствовать сопоставлению B.');
+
+  return 'DSS_testBotulinumTypeCode_: OK';
+}
+
 function DSS_scriptTimeZone_() { return Session.getScriptTimeZone(); }
 function DSS_today_() { return DSS_date_(Utilities.formatDate(new Date(), DSS_scriptTimeZone_(), 'yyyy-MM-dd')); }
 function DSS_iso_(d) { return Utilities.formatDate(d, DSS_scriptTimeZone_(), 'yyyy-MM-dd'); }

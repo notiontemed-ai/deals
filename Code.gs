@@ -31,7 +31,7 @@
 
 const MIN_BITRIX_DEAL_AMOUNT = 20000;
 const AI_PROCESSING_TIMEOUT_SECONDS = 180;
-const APPOINTMENT_TYPE_CODE_ORDER = ['L', 'M', 'S', 'F', 'C', 'D', 'U', 'P'];
+const APPOINTMENT_TYPE_CODE_ORDER = ['L', 'M', 'S', 'F', 'C', 'D', 'U', 'P', 'B'];
 const APPOINTMENT_TYPE_CODE_SET = new Set(APPOINTMENT_TYPE_CODE_ORDER.concat('-'));
 
 const DEALS_CONFIG = {
@@ -1312,6 +1312,14 @@ function detectPlanServiceClass_(name) {
     text.indexOf('тромбоцит') !== -1
   ) {
     return 'ПЛАЗМА';
+  }
+
+  if (
+    text.indexOf('ботулин') !== -1 ||
+    text.indexOf('ботулотокс') !== -1 ||
+    text.indexOf('ботокс') !== -1
+  ) {
+    return 'БОТУЛИНОТЕРАПИЯ';
   }
 
   if (
@@ -3455,6 +3463,41 @@ function buildBackfillTypeCodes_(nomenclatures, typeCodeMap) {
   }));
 }
 
+
+
+function testBotulinumAppointmentType_() {
+  const assertEqual = (actual, expected, message) => {
+    if (actual !== expected) {
+      throw new Error(message + ' Ожидалось: ' + expected + ', получено: ' + actual + '.');
+    }
+  };
+  const assertTrue = (actual, message) => {
+    if (!actual) throw new Error(message);
+  };
+
+  assertTrue(APPOINTMENT_TYPE_CODE_SET.has('B'), 'Тип B должен быть допустимым.');
+  assertEqual(buildAppointmentTypeCodes_([{ typeCode: 'B' }]), 'B', 'Один тип B должен сохраняться.');
+  assertEqual(
+    buildAppointmentTypeCodes_([{ typeCode: 'B' }, { typeCode: 'L' }, { typeCode: 'B' }]),
+    'LB',
+    'Типы B, L, B должны сортироваться и дедублицироваться.'
+  );
+  assertEqual(mergeAppointmentTypeCodes_(['L', 'B']), 'LB', 'Объединение L и B должно давать LB.');
+  assertEqual(
+    buildBackfillTypeCodes_(['Ботулинотерапия'], new Map([
+      [normalizeTypeNomenclature_('Ботулинотерапия'), { typeCode: 'B' }]
+    ])),
+    'B',
+    'Справочник с Ботулинотерапия | B должен приниматься без ошибки.'
+  );
+  assertEqual(
+    detectPlanServiceClass_('Введение ботулинического токсина'),
+    'БОТУЛИНОТЕРАПИЯ',
+    'Класс услуги ботулинотерапии должен определяться для Plan Items JSON.'
+  );
+
+  return 'testBotulinumAppointmentType_: OK';
+}
 
 
 function testBitrixDealAppointmentDate_() {
