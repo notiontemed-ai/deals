@@ -17,11 +17,11 @@
  *
  * Сопоставление:
  * - Пациент.Код = КлиентКод
- * - Филиал = Филиал
- * - Номенклатура = НоменклатураНаименование
- *   ИЛИ резерв:
- *     кабинет содержит "ФТЛ"    → MLS / лазеротерапия
+ * - сначала кабинет заявки:
+ *     кабинет содержит "ФТЛ"    → LASER / лазеротерапия
  *     кабинет содержит "Магнит" → SIS / магнитотерапия
+ * - затем тип номенклатуры заявки
+ * - филиал заявки не участвует в поиске существующей заявки
  *
  * Состав назначений:
  * - однотипные назначения объединяются;
@@ -1582,6 +1582,113 @@ function testBuildUidDealRowStatusPriority_() {
 }
 
 
+
+
+function testCrossBranchRequestMatching_() {
+  const treatmentDate = new Date(2026, 7, 10);
+  const uidGroup = {
+    uid: 'TEST-UID-CROSS-BRANCH',
+    branch: 'Темед Казань',
+    patient: 'Тестовый пациент',
+    patientCode: 'P-001',
+    doctor: 'Тестовый врач',
+    standard: 'Тестовый стандарт',
+    firstTreatmentDate: treatmentDate,
+    items: [
+      { treatmentDate, nomenclature: 'Лазеротерапия', price: 1000, typeCode: 'L' }
+    ]
+  };
+
+  const row = buildUidDealRow_(
+    uidGroup,
+    buildRequestIndexes_([
+      buildCrossBranchMatchingTestRequest_({
+        number: 'TEST-7',
+        branch: 'Темед Уфа',
+        clientCode: 'P-001',
+        state: 'Запланирована',
+        startDate: new Date(2026, 7, 12),
+        nomenclature: '',
+        cabinet: '4 ФТЛ-К',
+        typeCode: '-'
+      })
+    ]),
+    new Map()
+  );
+
+  if (row.status !== DEALS_CONFIG.resultStatuses.planned) {
+    throw new Error(
+      'Тест 7 не пройден: заявка в другом филиале с кабинетом ФТЛ должна подходить. Получено: ' +
+      row.status
+    );
+  }
+
+  return 'Тест 7 пройден: заявка в другом филиале сопоставлена по кабинету ФТЛ.';
+}
+
+
+function testCrossBranchTypeRequestMatching_() {
+  const treatmentDate = new Date(2026, 7, 10);
+  const uidGroup = {
+    uid: 'TEST-UID-CROSS-BRANCH-TYPE',
+    branch: 'Темед Казань',
+    patient: 'Тестовый пациент',
+    patientCode: 'P-001',
+    doctor: 'Тестовый врач',
+    standard: 'Тестовый стандарт',
+    firstTreatmentDate: treatmentDate,
+    items: [
+      { treatmentDate, nomenclature: 'Массаж', price: 1000, typeCode: 'M' }
+    ]
+  };
+
+  const row = buildUidDealRow_(
+    uidGroup,
+    buildRequestIndexes_([
+      buildCrossBranchMatchingTestRequest_({
+        number: 'TEST-8',
+        branch: 'Темед Москва',
+        clientCode: 'P-001',
+        state: 'Запланирована',
+        startDate: new Date(2026, 7, 12),
+        nomenclature: 'Массаж',
+        cabinet: 'Кабинет 1',
+        typeCode: 'M'
+      })
+    ]),
+    new Map()
+  );
+
+  if (row.status !== DEALS_CONFIG.resultStatuses.planned) {
+    throw new Error(
+      'Тест 8 не пройден: заявка в другом филиале должна сопоставляться по типу M. Получено: ' +
+      row.status
+    );
+  }
+
+  return 'Тест 8 пройден: заявка в другом филиале сопоставлена по типу номенклатуры.';
+}
+
+
+function buildCrossBranchMatchingTestRequest_(options) {
+  const c = DEALS_CONFIG.requestColumns;
+  const row = {};
+
+  row[c.branch] = options.branch;
+  row[c.client] = 'Тестовый пациент';
+  row[c.clientCode] = options.clientCode;
+  row[c.state] = options.state;
+  row[c.startDate] = options.startDate;
+  row[c.endDate] = '';
+  row[c.number] = options.number;
+  row[c.nomenclature] = options.nomenclature;
+  row[c.cabinet] = options.cabinet;
+  row.typeCode = options.typeCode;
+
+  return row;
+}
+
+
 function buildUidStatusPriorityTestRequest_(nomenclature, state, startDate, clientCode) {
   const c = DEALS_CONFIG.requestColumns;
   const row = {};
@@ -1609,48 +1716,44 @@ function buildUidStatusPriorityTestRequest_(nomenclature, state, startDate, clie
 
 function findCandidateRequestsForAppointmentItem_(uidGroup, item, requestIndexes) {
   const out = [];
+  const usedRequestNumbers = new Set();
   const typeCode = String(item.typeCode || '').trim().toUpperCase();
 
   if (!typeCode || typeCode === '-') {
     return out;
   }
 
-  const typeKey = buildTypeServiceMatchKeyWithoutDate_(
-    uidGroup.patientCode,
-    uidGroup.branch,
-    typeCode
-  );
+  const cabinetCategory = getCabinetCategoryForAppointmentType_(typeCode);
 
-  const typeRequests = requestIndexes.type.get(typeKey) || [];
+  if (cabinetCategory) {
+    const categoryKey = buildCategoryServiceMatchKey_(
+      uidGroup.patientCode,
+      cabinetCategory
+    );
+    const categoryRequests = requestIndexes.cabinetCategory.get(categoryKey) || [];
 
-  typeRequests.forEach(req => {
-    if (isRequestSuitableByDateAndStatus_(req, item.treatmentDate)) {
-      out.push({
-        request: req,
-        reason: 'совпадение по типу ' + typeCode
-      });
-    }
-  });
+    categoryRequests.forEach(req => {
+      if (isRequestSuitableByDateAndStatus_(req, item.treatmentDate)) {
+        addCandidateRequestMatch_(out, usedRequestNumbers, req, 'совпадение по кабинету ' + req.cabinet);
+      }
+    });
+  }
 
-  // Если точные совпадения уже есть, резерв по кабинету не нужен.
+  // Если совпадения по кабинету уже есть, поиск по типу номенклатуры не нужен:
+  // кабинет ФТЛ/магнит имеет приоритет над типом номенклатуры заявки.
   if (out.length > 0) {
     return out;
   }
 
-  // Резерв по кабинету допустим только для заявок без номенклатуры.
-  const fallbackRequests = requestIndexes.emptyNomenclatureByClientBranch.get(
-    buildClientBranchMatchKeyWithoutDate_(uidGroup.patientCode, uidGroup.branch)
-  ) || [];
+  const typeKey = buildTypeServiceMatchKey_(
+    uidGroup.patientCode,
+    typeCode
+  );
+  const typeRequests = requestIndexes.type.get(typeKey) || [];
 
-  fallbackRequests.forEach(req => {
-    if (
-      isEmptyNomenclatureRequestSuitableForType_(req, typeCode) &&
-      isRequestSuitableByDateAndStatus_(req, item.treatmentDate)
-    ) {
-      out.push({
-        request: req,
-        reason: 'совпадение по кабинету ' + req.cabinet
-      });
+  typeRequests.forEach(req => {
+    if (isRequestSuitableByDateAndStatus_(req, item.treatmentDate)) {
+      addCandidateRequestMatch_(out, usedRequestNumbers, req, 'совпадение по типу ' + typeCode);
     }
   });
 
@@ -1658,12 +1761,31 @@ function findCandidateRequestsForAppointmentItem_(uidGroup, item, requestIndexes
 }
 
 
-function isEmptyNomenclatureRequestSuitableForType_(request, typeCode) {
-  const cabinetCategory = detectRequestServiceCategoryByCabinet_(request.cabinet);
-  return (
-    (typeCode === 'L' && cabinetCategory === 'LASER') ||
-    (typeCode === 'S' && cabinetCategory === 'SIS')
-  );
+function addCandidateRequestMatch_(out, usedRequestNumbers, req, reason) {
+  const requestKey = req.number || [req.clientCode, req.branch, req.startDateRaw, req.nomenclature, req.cabinet].join('|');
+
+  if (usedRequestNumbers.has(requestKey)) {
+    return;
+  }
+
+  usedRequestNumbers.add(requestKey);
+  out.push({
+    request: req,
+    reason
+  });
+}
+
+
+function getCabinetCategoryForAppointmentType_(typeCode) {
+  if (typeCode === 'L') {
+    return 'LASER';
+  }
+
+  if (typeCode === 'S') {
+    return 'SIS';
+  }
+
+  return '';
 }
 
 
@@ -1837,8 +1959,8 @@ function isAnalysisService_(name) {
 function buildRequestIndexes_(requests) {
   const c = DEALS_CONFIG.requestColumns;
 
+  const cabinetCategory = new Map();
   const type = new Map();
-  const emptyNomenclatureByClientBranch = new Map();
 
   requests.forEach(row => {
     const clientCode = row[c.clientCode];
@@ -1848,7 +1970,7 @@ function buildRequestIndexes_(requests) {
     const cabinet = row[c.cabinet];
     const state = String(row[c.state] || '').trim();
 
-    if (!clientCode || !branch || !startDate) {
+    if (!clientCode || !startDate) {
       return;
     }
 
@@ -1865,15 +1987,24 @@ function buildRequestIndexes_(requests) {
       endDateRaw: row[c.endDate]
     };
 
+    const requestCabinetCategory = detectRequestServiceCategoryByCabinet_(cabinet);
+    req.cabinetCategory = requestCabinetCategory;
+
+    if (requestCabinetCategory) {
+      const categoryKey = buildCategoryServiceMatchKey_(clientCode, requestCabinetCategory);
+
+      if (!cabinetCategory.has(categoryKey)) {
+        cabinetCategory.set(categoryKey, []);
+      }
+
+      cabinetCategory.get(categoryKey).push(req);
+    }
+
     const typeCode = String(row.typeCode || '').trim().toUpperCase();
     req.typeCode = typeCode;
 
-    if (nomenclature && typeCode && typeCode !== '-') {
-      const typeKey = buildTypeServiceMatchKeyWithoutDate_(
-        clientCode,
-        branch,
-        typeCode
-      );
+    if (!requestCabinetCategory && nomenclature && typeCode && typeCode !== '-') {
+      const typeKey = buildTypeServiceMatchKey_(clientCode, typeCode);
 
       if (!type.has(typeKey)) {
         type.set(typeKey, []);
@@ -1881,17 +2012,9 @@ function buildRequestIndexes_(requests) {
 
       type.get(typeKey).push(req);
     }
-
-    if (!String(nomenclature || '').trim()) {
-      const fallbackKey = buildClientBranchMatchKeyWithoutDate_(clientCode, branch);
-      if (!emptyNomenclatureByClientBranch.has(fallbackKey)) {
-        emptyNomenclatureByClientBranch.set(fallbackKey, []);
-      }
-      emptyNomenclatureByClientBranch.get(fallbackKey).push(req);
-    }
   });
 
-  return { type, emptyNomenclatureByClientBranch };
+  return { cabinetCategory, type };
 }
 
 
@@ -2189,10 +2312,26 @@ function buildCategoryServiceMatchKeyWithoutDate_(clientCode, branch, category) 
 }
 
 
+function buildCategoryServiceMatchKey_(clientCode, category) {
+  return [
+    normalizeCode_(clientCode),
+    String(category || '').trim()
+  ].join('|');
+}
+
+
 function buildTypeServiceMatchKeyWithoutDate_(clientCode, branch, typeCode) {
   return [
     normalizeCode_(clientCode),
     normalizeText_(branch),
+    String(typeCode || '').trim().toUpperCase()
+  ].join('|');
+}
+
+
+function buildTypeServiceMatchKey_(clientCode, typeCode) {
+  return [
+    normalizeCode_(clientCode),
     String(typeCode || '').trim().toUpperCase()
   ].join('|');
 }
