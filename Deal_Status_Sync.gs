@@ -1,6 +1,17 @@
 /****************************************************
  * TEMED — пошаговая сверка сделок Bitrix с заявками.
  * Каждый публичный этап запускается только вручную из меню.
+ *
+ * Для заявок с кабинетами ФТЛ и магнитотерапии тип
+ * определяется по кабинету независимо от номенклатуры:
+ *
+ * ФТЛ    → L
+ * Магнит → S
+ *
+ * Для остальных заявок тип определяется по общему
+ * справочнику номенклатуры.
+ *
+ * Филиал заявки при сопоставлении со сделкой не проверяется.
  ****************************************************/
 
 const DSS_CONFIG = Object.freeze({
@@ -15,7 +26,7 @@ const DSS_CONFIG = Object.freeze({
     stages: 'Стадии Bitrix'
   },
   categoryId: 114,
-  requestColumns: { patientCode: 'КлиентКод', patientName: 'Клиент', startDate: 'ДатаНачала', state: 'Состояние', nomenclature: 'НоменклатураНаименование' },
+  requestColumns: { patientCode: 'КлиентКод', patientName: 'Клиент', startDate: 'ДатаНачала', state: 'Состояние', nomenclature: 'НоменклатураНаименование', cabinet: 'Кабинет' },
   stageNames: { booked: 'Записался', attended: 'Дошёл' },
   ignoredCode: '-', consultationCode: 'C', serviceCodeOrder: 'LMSFCDUP', batchSize: 50,
   doneStates: ['Начато', 'Выполнена', 'Выполнено', 'Завершена', 'Завершено', 'Оказана', 'Оказано', 'Прием состоялся', 'Приём состоялся', 'Состоялась', 'Состоялся'],
@@ -68,6 +79,10 @@ function DSS_processRequests() {
 
   const nomenclatures = new Map();
   requests.forEach(row => {
+    const cabinet = String(row[DSS_CONFIG.requestColumns.cabinet] || '').trim();
+    const cabinetTypeCode = DSS_serviceCodeByCabinet_(cabinet);
+    if (cabinetTypeCode) return;
+
     const name = String(row[DSS_CONFIG.requestColumns.nomenclature] || '').trim();
     const key = DSS_normalizeTypeNomenclature_(name);
     if (key && !nomenclatures.has(key)) nomenclatures.set(key, name);
@@ -89,16 +104,33 @@ function DSS_processRequests() {
     return;
   }
 
-  const now = new Date(), groups = new Map(); let excluded = 0;
+  const now = new Date(), groups = new Map(); let excluded = 0, byCabinetFtl = 0, byCabinetMagnet = 0, byDirectory = 0;
   requests.forEach(row => {
     const code = DSS_patientCode_(row[DSS_CONFIG.requestColumns.patientCode]);
     const date = DSS_date_(row[DSS_CONFIG.requestColumns.startDate]);
     const name = String(row[DSS_CONFIG.requestColumns.nomenclature] || '').trim();
+    const cabinet = String(row[DSS_CONFIG.requestColumns.cabinet] || '').trim();
+    const cabinetTypeCode = DSS_serviceCodeByCabinet_(cabinet);
     const state = DSS_requestState_(row[DSS_CONFIG.requestColumns.state]);
     if (state === 'CANCEL') { excluded += 1; return; }
-    if (!code || !date || !name || !state) return;
-    const typeCode = directory.map.get(DSS_normalizeTypeNomenclature_(name));
+    if (!code || !date || !state) return;
+    if (!cabinetTypeCode && !name) return;
+
+    // Для ФТЛ и магнитотерапии кабинет является
+    // приоритетным источником типа. Номенклатура,
+    // включая тип "-", в этих случаях игнорируется.
+    const nomenclatureTypeCode = directory.map.get(DSS_normalizeTypeNomenclature_(name));
+    const typeCode = cabinetTypeCode || nomenclatureTypeCode;
     if (!typeCode || typeCode === DSS_CONFIG.ignoredCode) return;
+    if (cabinetTypeCode) {
+      if (cabinetTypeCode === 'L') byCabinetFtl += 1;
+      else if (cabinetTypeCode === 'S') byCabinetMagnet += 1;
+      if (nomenclatureTypeCode && nomenclatureTypeCode !== cabinetTypeCode) {
+        Logger.log('Заявка пациента ' + code + ': кабинет «' + cabinet + '» определил тип ' + cabinetTypeCode + '; тип номенклатуры «' + nomenclatureTypeCode + '» проигнорирован.');
+      }
+    } else {
+      byDirectory += 1;
+    }
     const key = code + '|' + DSS_iso_(date);
     if (!groups.has(key)) groups.set(key, { code, patient: String(row[DSS_CONFIG.requestColumns.patientName] || '').trim(), date, planned: new Set(), done: new Set() });
     groups.get(key)[state === 'DONE' ? 'done' : 'planned'].add(typeCode);
@@ -106,7 +138,7 @@ function DSS_processRequests() {
   const rows = Array.from(groups.values()).sort((a,b) => a.code.localeCompare(b.code) || a.date - b.date).map(x => [x.code, x.patient, x.date, DSS_codes_(x.planned), DSS_codes_(x.done), now]);
   DSS_writeSheet_(ss, DSS_CONFIG.sheets.aggregated, DSS_REQUEST_HEADERS, rows, { dates: [3], dateTimes: [6] });
   DSS_log_(ss, 'Обработка заявок', now);
-  DSS_alert_('Обработка заявок завершена.', ['Строк исходного листа обработано: ' + requests.length + '.', 'Агрегированных строк создано: ' + rows.length + '.', 'Отменённых строк исключено: ' + excluded + '.'].join('\n'));
+  DSS_alert_('Обработка заявок завершена.', ['Строк исходного листа обработано: ' + requests.length + '.', 'Агрегированных строк создано: ' + rows.length + '.', 'Отменённых строк исключено: ' + excluded + '.', 'Определено по кабинету ФТЛ: ' + byCabinetFtl + '.', 'Определено по кабинету магнитотерапии: ' + byCabinetMagnet + '.', 'Определено по справочнику номенклатуры: ' + byDirectory + '.'].join('\n'));
 }
 function DSS_loadDealsFromBitrix() {
   const ss = SpreadsheetApp.getActiveSpreadsheet(); const now = new Date(); const base = DSS_webhook_();
@@ -221,6 +253,22 @@ function DSS_stageDirectoryFromDeals_(deals) { const out = new Map(); deals.forE
 function DSS_normalizeTypeNomenclature_(value) {
   return String(value || '').toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
 }
+
+function DSS_serviceCodeByCabinet_(cabinet) {
+  const text = DSS_text_(cabinet);
+  if (text.indexOf('фтл') !== -1) return 'L';
+  if (text.indexOf('магнит') !== -1) return 'S';
+  return '';
+}
+function DSS_requestTypeByCabinetOrDirectory_(cabinet, nomenclature, directory) {
+  const cabinetTypeCode = DSS_serviceCodeByCabinet_(cabinet);
+  return cabinetTypeCode || directory.map.get(DSS_normalizeTypeNomenclature_(nomenclature)) || '';
+}
+function DSS_shouldProcessRequestByCabinetAndName_(code, date, state, cabinetTypeCode, name) {
+  if (!code || !date || !state) return false;
+  if (!cabinetTypeCode && !name) return false;
+  return true;
+}
 function DSS_normalizeSharedTypeCode_(value) { return String(value || '').replace(/\s+/g, '').toUpperCase(); }
 function DSS_readSharedTypeCodesMap_() {
   let spreadsheet;
@@ -304,6 +352,28 @@ function DSS_testRequestMatchingStartDate_() {
   const start = DSS_getRequestMatchingStartDate_(d(2026, 7, 17), null);
   if (!(d(2026, 7, 17) < start && d(2026, 7, 18) >= start)) throw new Error('Заявки в дату назначения исключаются, со следующего дня учитываются для всех типов.');
   return 'DSS_testRequestMatchingStartDate_: OK';
+}
+
+function DSS_testCabinetPriorityTypeDetection_() {
+  const assertEqual = (actual, expected, message) => { if (actual !== expected) throw new Error(message + ' Ожидалось: ' + expected + ', получено: ' + actual + '.'); };
+  const directory = { map: new Map([
+    [DSS_normalizeTypeNomenclature_('ignored'), '-'],
+    [DSS_normalizeTypeNomenclature_('massage'), 'M'],
+    [DSS_normalizeTypeNomenclature_('laser'), 'L']
+  ]) };
+
+  assertEqual(DSS_serviceCodeByCabinet_('4 ФТЛ-К'), 'L', 'Кабинет ФТЛ должен давать тип L.');
+  assertEqual(DSS_serviceCodeByCabinet_('Кабинет магнитотерапии'), 'S', 'Кабинет магнитотерапии должен давать тип S.');
+  assertEqual(DSS_serviceCodeByCabinet_('фтл'), 'L', 'Определение ФТЛ должно быть устойчиво к регистру.');
+  assertEqual(DSS_serviceCodeByCabinet_('Массажный кабинет'), '', 'Нейтральный кабинет не должен определять тип.');
+  assertEqual(DSS_requestTypeByCabinetOrDirectory_('4 ФТЛ-К', 'ignored', directory), 'L', 'ФТЛ должен иметь приоритет над типом номенклатуры "-".');
+  assertEqual(DSS_requestTypeByCabinetOrDirectory_('ФТЛ', 'massage', directory), 'L', 'ФТЛ должен иметь приоритет над ошибочным типом M.');
+  assertEqual(DSS_requestTypeByCabinetOrDirectory_('Магнит-К', 'laser', directory), 'S', 'Магнит должен иметь приоритет над ошибочным типом L.');
+  assertEqual(DSS_requestTypeByCabinetOrDirectory_('Процедурный кабинет', 'massage', directory), 'M', 'Без специального кабинета тип берётся из справочника.');
+  if (!DSS_shouldProcessRequestByCabinetAndName_('001', new Date(2026, 6, 21), 'PLAN', DSS_serviceCodeByCabinet_('ФТЛ'), '')) throw new Error('Пустая номенклатура допустима для ФТЛ.');
+  if (DSS_shouldProcessRequestByCabinetAndName_('001', new Date(2026, 6, 21), 'PLAN', DSS_serviceCodeByCabinet_('Кабинет №1'), '')) throw new Error('Пустая номенклатура без специального кабинета должна исключать заявку.');
+  // Филиал не участвует в сопоставлении заявок со сделками.
+  return 'DSS_testCabinetPriorityTypeDetection_: OK';
 }
 function DSS_scriptTimeZone_() { return Session.getScriptTimeZone(); }
 function DSS_today_() { return DSS_date_(Utilities.formatDate(new Date(), DSS_scriptTimeZone_(), 'yyyy-MM-dd')); }
