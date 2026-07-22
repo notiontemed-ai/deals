@@ -1,0 +1,1177 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "deal-patient-context-v3-batch",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Webhook - Deal patient context batch v3",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -7904,
+        256
+      ],
+      "id": "01669ac3-4dcd-445e-bab7-578f230d2b06",
+      "webhookId": "deal-patient-context-v3-batch"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json.body || $json;\n\nfunction s(v) {\n  return String(v ?? '').trim();\n}\n\nfunction fail(errorCode, message, httpStatus = 400, details = []) {\n  return [{\n    json: {\n      ok: false,\n      status: 'validation_error',\n      error_code: errorCode,\n      message,\n      http_status: httpStatus,\n      details\n    }\n  }];\n}\n\nconst rawItems = Array.isArray(body.items)\n  ? body.items\n  : (Array.isArray(body.deals) ? body.deals : [body]);\n\nif (!rawItems.length) {\n  return fail('EMPTY_BATCH', 'Пакет не содержит сделок.');\n}\n\nif (rawItems.length > 10) {\n  return fail('BATCH_TOO_LARGE', 'В одном запросе допускается не более 10 сделок.');\n}\n\nconst topSpreadsheetId = s(body.spreadsheet_id);\nconst topSheetName = s(body.sheet_name || 'Сделки в Битрикс');\nconst batchId = `deal_context_batch_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;\nconst now = new Date();\nconst normalized = [];\nconst errors = [];\n\nfor (let index = 0; index < rawItems.length; index++) {\n  const item = rawItems[index] || {};\n\n  let patientCodeRaw = s(item.patient_code || item['Пациент.Код']);\n  let patientCode = patientCodeRaw;\n\n  if (/^\\d{1,8}$/.test(patientCode)) {\n    patientCode = patientCode.padStart(8, '0');\n  }\n\n  const patientCodeFor1c = String(patientCodeRaw || patientCode)\n    .replace(/\\D/g, '')\n    .replace(/^0+/, '');\n\n  const spreadsheetId = s(item.spreadsheet_id || topSpreadsheetId);\n  const sheetName = s(item.sheet_name || topSheetName || 'Сделки в Битрикс');\n  const rowNumber = Number(item.row_number || 0);\n  const branch = s(item.branch || item['Филиал']);\n  const dealKey = s(\n    item.deal_key ||\n    item.DealKey ||\n    (patientCodeFor1c && branch ? `${patientCodeFor1c}|${branch}` : '')\n  );\n\n  const itemErrors = [];\n  if (!spreadsheetId) itemErrors.push('Не передан spreadsheet_id.');\n  if (!sheetName) itemErrors.push('Не передан sheet_name.');\n  if (!Number.isInteger(rowNumber) || rowNumber < 2) itemErrors.push('row_number должен быть целым числом не меньше 2.');\n  if (!/^\\d{8}$/.test(patientCode)) itemErrors.push('Код пациента должен состоять из 8 цифр после нормализации.');\n  if (!patientCodeFor1c) itemErrors.push('Не удалось получить код пациента для GetClientByCode.');\n  if (!dealKey) itemErrors.push('Не передан DealKey.');\n\n  if (itemErrors.length) {\n    errors.push({ index, deal_key: dealKey, row_number: rowNumber, errors: itemErrors });\n    continue;\n  }\n\n  const requestId = `deal_context_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 12)}`;\n\n  normalized.push({\n    ok: true,\n    batch_id: batchId,\n    request_id: requestId,\n    status: 'queued',\n    created_at: now.toISOString(),\n    updated_at: now.toISOString(),\n\n    spreadsheet_id: spreadsheetId,\n    sheet_name: sheetName,\n    row_number: rowNumber,\n    deal_key: dealKey,\n\n    patient_code: patientCode,\n    patient_code_for_1c: patientCodeFor1c,\n\n    patient_name: s(item.patient_name || item['ФИО']),\n    branch,\n    deal_amount: Number(item.deal_amount || item['Сумма сделки'] || 0),\n    first_plan_date: s(item.first_plan_date || item['Первый плановый день']),\n    doctor: s(item.doctor || item['Врач']),\n    uids: s(item.uids || item['УИДы']),\n    appointment_composition: s(item.appointment_composition || item['Состав назначений']),\n    nearest_requests: s(item.nearest_requests || item['Ближайшие заявки пациента']),\n    deal_description: s(item.deal_description || item['Описание назначений']),\n    booking_execution_context: s(\n      item.booking_execution_context ||\n      item['Контекст записи'] ||\n      'По данным текущей выгрузки по связанным назначениям требуется создание сделки.'\n    )\n  });\n}\n\nif (errors.length) {\n  return fail(\n    'INVALID_BATCH_ITEMS',\n    'Одна или несколько сделок в пакете не прошли проверку.',\n    400,\n    errors\n  );\n}\n\nconst spreadsheetIds = [...new Set(normalized.map(x => x.spreadsheet_id))];\nconst sheetNames = [...new Set(normalized.map(x => x.sheet_name))];\n\nif (spreadsheetIds.length !== 1 || sheetNames.length !== 1) {\n  return fail(\n    'MIXED_SHEETS_NOT_SUPPORTED',\n    'Все сделки одного пакета должны относиться к одной таблице и одному листу.'\n  );\n}\n\nconst duplicateRows = normalized\n  .map(x => x.row_number)\n  .filter((row, i, all) => all.indexOf(row) !== i);\n\nif (duplicateRows.length) {\n  return fail(\n    'DUPLICATE_ROW_NUMBERS',\n    'В пакете обнаружены повторяющиеся row_number.',\n    400,\n    [...new Set(duplicateRows)]\n  );\n}\n\nreturn [{\n  json: {\n    ok: true,\n    status: 'validated',\n    batch_id: batchId,\n    batch_size: normalized.length,\n    spreadsheet_id: spreadsheetIds[0],\n    sheet_name: sheetNames[0],\n    items: normalized\n  }\n}];"
+      },
+      "name": "Validate batch request v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -7696,
+        256
+      ],
+      "id": "ceb4a415-dcd9-4635-9f99-402765827481"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "batch_valid",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "IF batch request valid v3",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -7472,
+        256
+      ],
+      "id": "bf6e3232-7caa-40c4-aebe-8297c7fe183d"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: false, status: $json.status, error_code: $json.error_code, message: $json.message, details: $json.details || [] } }}",
+        "options": {
+          "responseCode": "={{ $json.http_status || 400 }}"
+        }
+      },
+      "name": "Respond invalid batch request v3",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        -7248,
+        512
+      ],
+      "id": "1a860af3-8141-4935-a789-2104d172a8a5"
+    },
+    {
+      "parameters": {
+        "jsCode": "function quoteSheet(name) {\n  return `'${String(name).replace(/'/g, \"''\")}'`;\n}\n\nconst headerRange = `${quoteSheet($json.sheet_name)}!1:1`;\nconst encodedRange = encodeURIComponent(headerRange);\n\nreturn [{\n  json: {\n    ...$json,\n    header_range: headerRange,\n    header_url: `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent($json.spreadsheet_id)}/values/${encodedRange}?majorDimension=ROWS`\n  }\n}];"
+      },
+      "name": "Prepare Google Sheets header request v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -7248,
+        224
+      ],
+      "id": "a06e187e-5f9c-443b-bdc6-ff42ef0f9325"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.header_url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "name": "Google Sheets API - Read header v3",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -7024,
+        224
+      ],
+      "id": "d1eef50e-84e9-4697-b00d-198254c129dc",
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "j68oP4jTpcKIyBYP",
+          "name": "Google Sheets [ n8n.temed ]"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $('Prepare Google Sheets header request v3').first().json;\n\nfunction colLetter(n) {\n  let out = '';\n  let x = Number(n);\n  while (x > 0) {\n    x--;\n    out = String.fromCharCode(65 + (x % 26)) + out;\n    x = Math.floor(x / 26);\n  }\n  return out;\n}\n\nfunction quoteSheet(name) {\n  return `'${String(name).replace(/'/g, \"''\")}'`;\n}\n\nfunction technicalError(input) {\n  return Boolean(\n    input?.error ||\n    input?.errorMessage ||\n    Number(input?.statusCode || input?.httpCode || 0) >= 400\n  );\n}\n\nif (technicalError($json)) {\n  return [{\n    json: {\n      ...base,\n      ok: false,\n      status: 'sheet_error',\n      error_code: 'GOOGLE_SHEETS_HEADER_READ_ERROR',\n      message: 'Не удалось прочитать заголовки листа Google Sheets.',\n      http_status: 502\n    }\n  }];\n}\n\nconst headers = Array.isArray($json.values?.[0]) ? $json.values[0] : [];\nif (!headers.length) {\n  return [{\n    json: {\n      ...base,\n      ok: false,\n      status: 'sheet_schema_error',\n      error_code: 'EMPTY_SHEET_HEADER',\n      message: 'В первой строке листа не найдены заголовки столбцов.',\n      http_status: 422\n    }\n  }];\n}\n\nconst headerToColumn = {};\nheaders.forEach((value, index) => {\n  const key = String(value ?? '').trim();\n  if (key && !headerToColumn[key]) headerToColumn[key] = colLetter(index + 1);\n});\n\nconst required = [\n  'AI статус',\n  'AI request_id',\n  'AI updated_at',\n  'Ошибка',\n  'AI справка',\n  'Телефон клиента',\n  'Комментарий администратора'\n];\n\nconst missing = required.filter(name => !headerToColumn[name]);\nif (missing.length) {\n  return [{\n    json: {\n      ...base,\n      ok: false,\n      status: 'sheet_schema_error',\n      error_code: 'MISSING_REQUIRED_COLUMNS',\n      message: `На листе отсутствуют обязательные столбцы: ${missing.join(', ')}.`,\n      http_status: 422,\n      missing_columns: missing\n    }\n  }];\n}\n\nconst sheet = quoteSheet(base.sheet_name);\nconst updatedAt = new Date().toISOString();\nconst data = [];\n\nfunction add(rowNumber, columnName, value) {\n  data.push({\n    range: `${sheet}!${headerToColumn[columnName]}${rowNumber}`,\n    majorDimension: 'ROWS',\n    values: [[value ?? '']]\n  });\n}\n\nfor (const item of base.items) {\n  add(item.row_number, 'AI статус', 'processing');\n  add(item.row_number, 'AI request_id', item.request_id);\n  add(item.row_number, 'AI updated_at', updatedAt);\n  add(item.row_number, 'Ошибка', '');\n}\n\nreturn [{\n  json: {\n    ...base,\n    ok: true,\n    sheet_columns: headerToColumn,\n    batch_update_url: `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(base.spreadsheet_id)}/values:batchUpdate`,\n    processing_batch_body: {\n      valueInputOption: 'RAW',\n      data\n    }\n  }\n}];"
+      },
+      "name": "Prepare processing batch update v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -6816,
+        224
+      ],
+      "id": "3aa47e09-6f03-4475-aa28-36208c97e4c4"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "sheet_setup_valid",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "IF sheet setup valid v3",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -6592,
+        224
+      ],
+      "id": "3f9911f4-64f7-4692-90bb-588765d7e1f9"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: false, status: $json.status, error_code: $json.error_code, message: $json.message, missing_columns: $json.missing_columns || [] } }}",
+        "options": {
+          "responseCode": "={{ $json.http_status || 422 }}"
+        }
+      },
+      "name": "Respond sheet setup error v3",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        -6368,
+        512
+      ],
+      "id": "86c064fc-9254-4ce5-9b37-0e7c62c226b0"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.batch_update_url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.processing_batch_body }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "name": "Google Sheets API - Batch mark processing v3",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -6368,
+        192
+      ],
+      "id": "6843ee07-eeb0-452a-b50a-9a9a79d8c843",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 15000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "j68oP4jTpcKIyBYP",
+          "name": "Google Sheets [ n8n.temed ]"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $('Prepare processing batch update v3').first().json;\nconst failed = Boolean(\n  $json?.error ||\n  $json?.errorMessage ||\n  Number($json?.statusCode || $json?.httpCode || 0) >= 400\n);\n\nif (failed) {\n  return [{\n    json: {\n      ...base,\n      ok: false,\n      status: 'sheet_error',\n      error_code: 'GOOGLE_SHEETS_PROCESSING_BATCH_ERROR',\n      message: 'Не удалось пакетно установить статус processing в Google Sheets.',\n      http_status: 502,\n      google_error: $json\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    ...base,\n    ok: true,\n    processing_write_result: $json\n  }\n}];"
+      },
+      "name": "Check processing batch write v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -6144,
+        192
+      ],
+      "id": "d7d94085-67f3-4095-bc6c-ec0a98016a16"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "processing_written",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "IF processing batch written v3",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -5936,
+        192
+      ],
+      "id": "ff98288c-a1d5-4ab0-b049-cd728d4d4980"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: false, status: $json.status, error_code: $json.error_code, message: $json.message } }}",
+        "options": {
+          "responseCode": "={{ $json.http_status || 502 }}"
+        }
+      },
+      "name": "Respond processing batch error v3",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        -5712,
+        512
+      ],
+      "id": "15c1b641-d462-4715-9bad-de9c4055df29"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true, status: 'processing', batch_id: $json.batch_id, accepted: $json.batch_size, request_ids: $json.items.map(x => x.request_id), message: 'Пакет справок принят. Результаты будут записаны в Google Sheet одной пакетной операцией.' } }}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "name": "Respond batch started v3",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        -5712,
+        -32
+      ],
+      "id": "81bef0c1-7e8b-467f-9e88-7bf2b5a5066f"
+    },
+    {
+      "parameters": {
+        "jsCode": "return $json.items.map(item => ({\n  json: {\n    ...item,\n    batch_id: $json.batch_id,\n    batch_size: $json.batch_size,\n    sheet_columns: $json.sheet_columns,\n    batch_update_url: $json.batch_update_url\n  }\n}));"
+      },
+      "name": "Split batch into deal items v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5712,
+        224
+      ],
+      "id": "b74ab053-19d9-44a1-a58a-c9694225a772"
+    },
+    {
+      "parameters": {
+        "options": {
+          "reset": false
+        }
+      },
+      "name": "Loop Over Deal Items v3",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -5488,
+        224
+      ],
+      "id": "b9fc9834-04ac-4481-9a83-fccd7c1ab3b3"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://1c.temed.ru:35656/umc/ws/temed.1cws",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/soap+xml;charset=UTF-8;action=\"ru.umc#Integration:GetClientByCode\"",
+        "body": "=<soap:Envelope xmlns:soap=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:ru=\"ru.umc\">\n   <soap:Header/>\n   <soap:Body>\n      <ru:GetClientByCode>\n         <ru:Code>{{$json.patient_code_for_1c}}</ru:Code>\n         <ru:Key>680668-iDIUkGaWmVLsPi</ru:Key>\n      </ru:GetClientByCode>\n   </soap:Body>\n</soap:Envelope>",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "name": "Get client by code for deal context v3",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -5248,
+        304
+      ],
+      "id": "1a0f5a89-6926-4ec4-a496-0ee995507be1",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "777BAEqycFGJ7Taf",
+          "name": "1C:UMC Auth"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "function getRawResponse(input) {\n  if (typeof input === 'string') return input;\n  if (!input || typeof input !== 'object') return '';\n\n  return String(\n    input.data ??\n    input.body ??\n    input.response ??\n    input.text ??\n    input.result ??\n    input.error?.message ??\n    input.message ??\n    ''\n  );\n}\n\nfunction decodeXmlEntities(str) {\n  return String(str || '')\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&quot;/g, '\"')\n    .replace(/&#34;/g, '\"')\n    .replace(/&#39;/g, \"'\")\n    .replace(/&apos;/g, \"'\")\n    .replace(/&amp;/g, '&');\n}\n\nfunction stripCdata(str) {\n  return String(str || '')\n    .replace(/^<!\\[CDATA\\[/, '')\n    .replace(/\\]\\]>$/, '');\n}\n\nfunction stripNs(name) {\n  return String(name || '').replace(/^.*:/, '');\n}\n\nfunction normName(name) {\n  return stripNs(name).toLowerCase().replace(/ё/g, 'е').replace(/[\\s_-]+/g, '');\n}\n\nfunction cleanValue(value) {\n  return decodeXmlEntities(stripCdata(value))\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction listTags(xml) {\n  const out = [];\n  const re = /<([A-Za-zА-Яа-яЁё0-9_:-]+)(?:\\s[^>]*)?>/g;\n  let m;\n\n  while ((m = re.exec(String(xml || ''))) !== null) {\n    const name = stripNs(m[1]);\n    if (!name || name.startsWith('?') || name.startsWith('!')) continue;\n    if (!out.includes(name)) out.push(name);\n    if (out.length >= 80) break;\n  }\n\n  return out;\n}\n\nfunction extractTagExact(xml, tagName) {\n  const text = String(xml || '');\n  const escaped = String(tagName).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');\n\n  const direct = new RegExp(`<${escaped}(?:\\\\s[^>]*)?>([\\\\s\\\\S]*?)<\\\\/${escaped}>`, 'i');\n  const prefixed = new RegExp(`<[^:>]+:${escaped}(?:\\\\s[^>]*)?>([\\\\s\\\\S]*?)<\\\\/[^:>]+:${escaped}>`, 'i');\n\n  const match = text.match(direct) || text.match(prefixed);\n  if (!match) return '';\n\n  return cleanValue(match[1]);\n}\n\nfunction extractTagByNamePredicate(xml, predicate) {\n  const text = String(xml || '');\n  const re = /<([A-Za-zА-Яа-яЁё0-9_:-]+)(?:\\s[^>]*)?>([\\s\\S]*?)<\\/\\1>/g;\n  let m;\n\n  while ((m = re.exec(text)) !== null) {\n    const rawName = m[1];\n    const name = stripNs(rawName);\n\n    if (!predicate(name, normName(name))) continue;\n\n    const value = cleanValue(m[2]);\n    if (value) return value;\n  }\n\n  return '';\n}\n\nfunction extractAttributeByNamePredicate(xml, predicate) {\n  const text = String(xml || '');\n  const re = /([A-Za-zА-Яа-яЁё0-9_:-]+)\\s*=\\s*\"([^\"]*)\"/g;\n  let m;\n\n  while ((m = re.exec(text)) !== null) {\n    const name = stripNs(m[1]);\n\n    if (!predicate(name, normName(name))) continue;\n\n    const value = cleanValue(m[2]);\n    if (value) return value;\n  }\n\n  return '';\n}\n\nfunction extractReturnFromSoap(xml) {\n  const text = String(xml || '');\n\n  const match =\n    text.match(/<m:return[^>]*>([\\s\\S]*?)<\\/m:return>/i) ||\n    text.match(/<return[^>]*>([\\s\\S]*?)<\\/return>/i) ||\n    text.match(/<[^:>]+:return[^>]*>([\\s\\S]*?)<\\/[^:>]+:return>/i);\n\n  if (!match) return '';\n\n  return decodeXmlEntities(stripCdata(match[1])).trim();\n}\n\nfunction extractFault(xml) {\n  const faultString = extractTagExact(xml, 'faultstring');\n  const faultCode = extractTagExact(xml, 'faultcode');\n  if (!faultString && !faultCode) return '';\n  return [faultCode, faultString].filter(Boolean).join(': ');\n}\n\nfunction looksLikePhone(value) {\n  const digits = String(value || '').replace(/\\D/g, '');\n  return digits.length >= 6;\n}\n\nfunction collectPhones(innerXml) {\n  const values = [];\n\n  [\n    'Телефон',\n    'ОсновнойТелефон',\n    'МобильныйТелефон',\n    'НомерТелефона',\n    'Phone'\n  ].forEach(tag => {\n    const value = extractTagExact(innerXml, tag);\n    if (looksLikePhone(value)) values.push(value);\n  });\n\n  const byName = extractTagByNamePredicate(innerXml, (name, n) => {\n    return n.includes('телефон') || n === 'phone';\n  });\n\n  if (looksLikePhone(byName)) values.push(byName);\n\n  const byAttr = extractAttributeByNamePredicate(innerXml, (name, n) => {\n    return n.includes('телефон') || n === 'phone';\n  });\n\n  if (looksLikePhone(byAttr)) values.push(byAttr);\n\n  const phoneBlockRegexes = [\n    /<[^>]*ПрочийТелефон[^>]*>([\\s\\S]*?)<\\/[^>]*ПрочийТелефон>/gi,\n    /<[^>]*ТелефонКлиента[^>]*>([\\s\\S]*?)<\\/[^>]*ТелефонКлиента>/gi,\n    /<[^>]*КонтактныйТелефон[^>]*>([\\s\\S]*?)<\\/[^>]*КонтактныйТелефон>/gi\n  ];\n\n  for (const re of phoneBlockRegexes) {\n    let m;\n    while ((m = re.exec(innerXml)) !== null) {\n      const block = m[1];\n\n      const phone =\n        extractTagExact(block, 'Телефон') ||\n        extractTagExact(block, 'Номер') ||\n        extractTagExact(block, 'НомерТелефона') ||\n        extractTagExact(block, 'Значение') ||\n        extractTagByNamePredicate(block, (name, n) => n.includes('телефон') || n.includes('номер'));\n\n      const type = extractTagExact(block, 'Тип');\n\n      if (!looksLikePhone(phone)) continue;\n      values.push(type ? `${phone} (${type})` : phone);\n    }\n  }\n\n  return [...new Set(values.map(x => String(x).trim()).filter(Boolean))].join('; ');\n}\n\nfunction extractAdminComment(innerXml) {\n  const exact =\n    extractTagExact(innerXml, 'КомментарийДляАдминистратора') ||\n    extractTagExact(innerXml, 'КомментарийАдминистратора') ||\n    extractTagExact(innerXml, 'КомментарийДляАдминстратора') ||\n    extractTagExact(innerXml, 'AdminComment');\n\n  if (exact) return exact;\n\n  const byName = extractTagByNamePredicate(innerXml, (name, n) => {\n    return n.includes('комментар') && (n.includes('администратор') || n.includes('админ'));\n  });\n\n  if (byName) return byName;\n\n  return extractAttributeByNamePredicate(innerXml, (name, n) => {\n    return n.includes('комментар') && (n.includes('администратор') || n.includes('админ'));\n  });\n}\n\nconst base = $('Loop Over Deal Items v3').item.json;\nconst rawSoap = getRawResponse($json);\nconst fault = extractFault(rawSoap);\nconst returned = extractReturnFromSoap(rawSoap);\nconst innerXml = returned ? decodeXmlEntities(returned).trim() : '';\n\nif (!innerXml) {\n  return [{\n    json: {\n      ...base,\n      client_context: {\n        phone: '',\n        admin_comment: ''\n      },\n      client_context_error: fault\n        ? `GetClientByCode SOAP Fault: ${fault}. Код, отправленный в GetClientByCode: ${base.patient_code_for_1c || ''}`\n        : 'Не удалось извлечь return из ответа GetClientByCode. Начало ответа: ' + rawSoap.slice(0, 700)\n    }\n  }];\n}\n\nconst phone = collectPhones(innerXml);\nconst adminComment = extractAdminComment(innerXml);\nconst tags = listTags(innerXml);\n\nlet clientContextError = '';\nif (!phone && !adminComment) {\n  clientContextError =\n    'GetClientByCode выполнен, но телефон и комментарий администратора не найдены. ' +\n    'Код: ' + (base.patient_code_for_1c || '') + '. ' +\n    'Первые теги ответа: ' + tags.slice(0, 40).join(', ') + '. ' +\n    'Начало innerXml: ' + innerXml.slice(0, 700);\n}\n\nreturn [{\n  json: {\n    ...base,\n    client_context: {\n      phone,\n      admin_comment: adminComment\n    },\n    client_context_error: clientContextError\n  }\n}];"
+      },
+      "name": "Extract client phone and admin comment v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5024,
+        304
+      ],
+      "id": "fb0c5ebe-71e6-4185-9316-9870436f21f3"
+    },
+    {
+      "parameters": {
+        "jsCode": "const start = $json;\nconst patientCode = String(start.patient_code);\nconst requestId = String(start.request_id);\n\nconst now = new Date();\nconst from = new Date(now);\nfrom.setFullYear(from.getFullYear() - 5);\nfrom.setHours(0, 0, 0, 0);\n\nfunction isoLocal(d) {\n  return d.toISOString().slice(0, 19);\n}\n\nfunction esc(s) {\n  return String(s).replace(/[<>&'\"]/g, c => ({\n    '<': '&lt;',\n    '>': '&gt;',\n    '&': '&amp;',\n    \"'\": '&apos;',\n    '\"': '&quot;'\n  }[c]));\n}\n\nconst soapBody =\n  `<soap:Envelope xmlns:soap=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:ru=\"ru.umc\">` +\n  `<soap:Header/>` +\n  `<soap:Body>` +\n  `<ru:GetProtocols>` +\n  `<ru:FromDate>${isoLocal(from)}</ru:FromDate>` +\n  `<ru:ToDate>${isoLocal(now)}</ru:ToDate>` +\n  `<ru:Types></ru:Types>` +\n  `<ru:Clinics></ru:Clinics>` +\n  `<ru:Employees></ru:Employees>` +\n  `<ru:Codes>${esc(patientCode)}</ru:Codes>` +\n  `<ru:Params></ru:Params>` +\n  `</ru:GetProtocols>` +\n  `</soap:Body>` +\n  `</soap:Envelope>`;\n\nreturn [{\n  json: {\n    ...start,\n    request_id: requestId,\n    patient_code: patientCode,\n    period_from: isoLocal(from).slice(0, 10),\n    period_to: isoLocal(now).slice(0, 10),\n    from_date: isoLocal(from),\n    to_date: isoLocal(now),\n    soapBody\n  }\n}];"
+      },
+      "name": "Prepare deal context protocol request v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4816,
+        304
+      ],
+      "id": "2c1ff0c2-f4ed-49a5-8838-3ed41d130c5e"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://1c.temed.ru:35656/umc/ws/temed.1cws",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/soap+xml; charset=utf-8"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/soap+xml; charset=utf-8",
+        "body": "={{ $json.soapBody }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "name": "Get patient protocols for deal context v3",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -4592,
+        304
+      ],
+      "id": "be70eb82-63f8-414c-94b1-84cad19cd05b",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "777BAEqycFGJ7Taf",
+          "name": "1C:UMC Auth"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "name": "Parse deal context protocols XML v3",
+      "type": "n8n-nodes-base.xml",
+      "typeVersion": 1,
+      "position": [
+        -4368,
+        304
+      ],
+      "id": "c3a34b82-6b27-4e17-b8e2-e18d0af1e652",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "function findKey(obj, key) {\n  if (!obj || typeof obj !== 'object') return undefined;\n  if (Object.prototype.hasOwnProperty.call(obj, key)) return obj[key];\n\n  for (const value of Object.values(obj)) {\n    const found = findKey(value, key);\n    if (found !== undefined) return found;\n  }\n}\n\nconst request = $('Prepare deal context protocol request v3').item.json;\nconst root = $json || {};\n\nconst technicalError =\n  root.error ||\n  root.errorMessage ||\n  root.statusCode >= 400 ||\n  root.httpCode >= 400;\n\nconst fault = findKey(root, 'Fault');\n\nif (technicalError || fault) {\n  return [{\n    json: {\n      ...request,\n      ok: false,\n      status: 'source_error',\n      error_code: 'ONE_C_PROTOCOLS_ERROR',\n      message: 'Не удалось получить историю пациента из 1С.'\n    }\n  }];\n}\n\nlet protocols =\n  findKey(root, 'Protocols') ??\n  findKey(root, 'Protocol') ??\n  [];\n\nif (protocols && protocols.Protocols) protocols = protocols.Protocols;\nif (protocols && protocols.Protocol) protocols = protocols.Protocol;\nif (protocols == null) protocols = [];\nif (!Array.isArray(protocols)) protocols = [protocols];\n\nprotocols = protocols.filter(protocol => protocol && typeof protocol === 'object');\n\nreturn [{\n  json: {\n    ...request,\n    ok: true,\n    protocols,\n    count_from_1c: protocols.length\n  }\n}];"
+      },
+      "name": "Normalize deal context protocols v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4144,
+        304
+      ],
+      "id": "3de89ae9-2989-4484-80b4-4c4eeb245336"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "one_c_ok",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "IF deal context 1C response ok v3",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -3936,
+        304
+      ],
+      "id": "9fe5f2a2-dafd-4c0b-8a14-1815cda6a9c6"
+    },
+    {
+      "parameters": {
+        "jsCode": "function arr(v) {\n  if (!v) return [];\n  return Array.isArray(v) ? v : [v];\n}\n\nfunction text(v) {\n  if (v == null) return '';\n  if (typeof v === 'object') return String(v._ ?? v.Value ?? v.value ?? '');\n  return String(v);\n}\n\nfunction norm(s) {\n  return text(s)\n    .replace(/\\u00a0/g, ' ')\n    .trim()\n    .toLowerCase()\n    .replace(/ё/g, 'е');\n}\n\nfunction paramsOf(p) {\n  const ps = p.Params?.Param ?? p.Params ?? [];\n  return arr(ps);\n}\n\nfunction hasMedical(p) {\n  return paramsOf(p).some(x => text(x.Value ?? x.value ?? x.Text ?? x).trim());\n}\n\nfunction parseDate(d) {\n  const s = text(d);\n  const m = s.match(/^(\\d{4})-(\\d{2})-(\\d{2})|^(\\d{2})\\.(\\d{2})\\.(\\d{4})/);\n  if (!m) return new Date(0);\n  return m[1]\n    ? new Date(`${m[1]}-${m[2]}-${m[3]}T00:00:00`)\n    : new Date(`${m[6]}-${m[5]}-${m[4]}T00:00:00`);\n}\n\nconst allowed = new Set([\n  'первичный',\n  'повторный',\n  'повторный прием'\n]);\n\nconst filtered = ($json.protocols || [])\n  .filter(p => allowed.has(norm(p.Type)) && hasMedical(p));\n\nfiltered.sort((a, b) => parseDate(a.Date) - parseDate(b.Date));\n\nconst history_truncated = filtered.length > 50;\nconst used = history_truncated ? filtered.slice(-50) : filtered;\n\nif (!used.length) {\n  return [{\n    json: {\n      ...$json,\n      ok: false,\n      status: 'not_found',\n      error_code: 'PATIENT_OR_PROTOCOLS_NOT_FOUND',\n      message: 'Пациент или доступные протоколы не найдены.',\n      http_status: 200\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    ...$json,\n    protocols_found: filtered.length,\n    protocols_used: used.length,\n    history_truncated,\n    selected_protocols: used\n  }\n}];"
+      },
+      "name": "Filter deal context medical visits v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3712,
+        256
+      ],
+      "id": "55647d6f-d0db-4af5-8e12-0c02270bc8ea"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "protocols_found",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "IF deal context protocols found v3",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -3488,
+        256
+      ],
+      "id": "70bf15cf-9856-4670-ba19-65fe5abb1438"
+    },
+    {
+      "parameters": {
+        "jsCode": "function arr(v) {\n  return !v ? [] : (Array.isArray(v) ? v : [v]);\n}\n\nfunction val(v) {\n  if (v == null) return '';\n  if (typeof v === 'object') return String(v._ ?? v.Value ?? v.value ?? '');\n  return String(v);\n}\n\nfunction params(p) {\n  return arr(p.Params?.Param ?? p.Params);\n}\n\nfunction norm(s) {\n  return val(s).replace(/\\u00a0/g, ' ').trim().toLowerCase();\n}\n\nfunction getDob(p) {\n  for (const x of params(p)) {\n    if (norm(x.Name ?? x.name) === 'дата рождения') {\n      return val(x.Value ?? x.value ?? x.Text);\n    }\n  }\n  return '';\n}\n\nfunction ageFrom(d) {\n  const m = String(d).match(/^(\\d{2})\\.(\\d{2})\\.(\\d{4})$/);\n  if (!m) return null;\n\n  const now = new Date();\n  let a = now.getFullYear() - Number(m[3]);\n\n  if (\n    now.getMonth() + 1 < Number(m[2]) ||\n    (now.getMonth() + 1 === Number(m[2]) && now.getDate() < Number(m[1]))\n  ) {\n    a--;\n  }\n\n  return a;\n}\n\nfunction displayName(full) {\n  const parts = String(full || '').trim().split(/\\s+/).filter(Boolean);\n  if (parts.length >= 3) return `${parts[1]} ${parts.slice(2).join(' ')} ${parts[0][0]}.`;\n  if (parts.length === 2) return `${parts[1]} ${parts[0][0]}.`;\n  return 'Пациент';\n}\n\nfunction yearsWord(a) {\n  const n = Math.abs(a) % 100;\n  const n1 = n % 10;\n  if (n > 10 && n < 20) return 'лет';\n  if (n1 === 1) return 'год';\n  if (n1 >= 2 && n1 <= 4) return 'года';\n  return 'лет';\n}\n\nconst latest = [...$json.selected_protocols]\n  .sort((a, b) => String(b.Date).localeCompare(String(a.Date)))[0] || {};\n\nconst full = val(latest.Patient?.FullName);\nconst dob = getDob(latest);\nconst age = ageFrom(dob);\nconst dn = displayName(full);\nconst label = age == null ? dn : `${dn}, ${age} ${yearsWord(age)}`;\n\nreturn [{\n  json: {\n    ...$json,\n    patient_full_name: full,\n    patient_birth_date: dob,\n    patient: {\n      display_name: dn,\n      age,\n      display_label: label\n    }\n  }\n}];"
+      },
+      "name": "Prepare deal context patient identity v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3264,
+        192
+      ],
+      "id": "a8f097c9-ca39-45dd-a1c5-9f2aa05b69b0"
+    },
+    {
+      "parameters": {
+        "jsCode": "function val(v) {\n  if (v == null) return '';\n  if (typeof v === 'object') return String(v._ ?? v.Value ?? v.value ?? '');\n  return String(v);\n}\n\nfunction iso(d) {\n  const s = val(d);\n\n  let m = s.match(/^(\\d{4})-(\\d{2})-(\\d{2})/);\n  if (m) return `${m[1]}-${m[2]}-${m[3]}`;\n\n  m = s.match(/^(\\d{2})\\.(\\d{2})\\.(\\d{4})/);\n  if (m) return `${m[3]}-${m[2]}-${m[1]}`;\n\n  return '';\n}\n\nfunction disp(i) {\n  return i ? `${i.slice(8, 10)}.${i.slice(5, 7)}.${i.slice(0, 4)}` : '';\n}\n\nconst visits = $json.selected_protocols\n  .map(p => ({\n    date: iso(p.Date),\n    date_display: disp(iso(p.Date)),\n    type: val(p.Type) || 'Не указан',\n    doctor: val(p.Employee?.FullName) || 'Не указан',\n    clinic: val(p.Clinic?.Name) || 'Не указан'\n  }))\n  .sort((a, b) => String(b.date).localeCompare(String(a.date)));\n\nreturn [{\n  json: {\n    ...$json,\n    visits\n  }\n}];"
+      },
+      "name": "Build deal context visits history v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3056,
+        192
+      ],
+      "id": "804658da-28b2-4b9d-bd6e-7610f6f16273"
+    },
+    {
+      "parameters": {
+        "jsCode": "function arr(v) {\n  return !v ? [] : (Array.isArray(v) ? v : [v]);\n}\n\nfunction val(v) {\n  if (v == null) return '';\n  if (typeof v === 'object') return String(v._ ?? v.Value ?? v.value ?? v.Text ?? '');\n  return String(v);\n}\n\nfunction stripHtml(s) {\n  return val(s)\n    .replace(/<[^>]*>/g, ' ')\n    .replace(/\\r/g, '\\n')\n    .replace(/[ \\t]+/g, ' ')\n    .replace(/\\n{3,}/g, '\\n\\n')\n    .trim();\n}\n\nfunction norm(s) {\n  return stripHtml(s)\n    .replace(/\\u00a0/g, ' ')\n    .toLowerCase()\n    .replace(/ё/g, 'е');\n}\n\nconst excludedParamNames = [\n  'пациент', 'пациент сокр', 'дата рождения', 'номер карты', '№ карты',\n  'код пациента', 'телефон', 'адрес', 'почта', 'email', 'e-mail',\n  'паспорт', 'снилс', 'инн', 'полис', 'представитель', 'контактное лицо', 'родственник'\n];\n\nconst full = $json.patient_full_name || '';\n\nfunction clean(s) {\n  let x = stripHtml(s);\n  if (full) {\n    x = x.replace(new RegExp(full.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&'), 'gi'), '[ПАЦИЕНТ]');\n  }\n  return x\n    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi, '[EMAIL УДАЛЁН]')\n    .replace(/(?:\\+7|8)[\\s\\-()]*\\d{3}[\\s\\-()]*\\d{3}[\\s\\-]*\\d{2}[\\s\\-]*\\d{2}/g, '[ТЕЛЕФОН УДАЛЁН]')\n    .replace(/\\d{3}-\\d{3}-\\d{3}\\s?\\d{2}/g, '[СНИЛС УДАЛЁН]')\n    .replace(/\\b\\d{4}\\s?\\d{6}\\b/g, '[ПАСПОРТ УДАЛЁН]')\n    .trim();\n}\n\nfunction params(p) {\n  return arr(p.Params?.Param ?? p.Params);\n}\n\nfunction iso(d) {\n  const s = val(d);\n  const m = s.match(/^(\\d{4}-\\d{2}-\\d{2})|^(\\d{2})\\.(\\d{2})\\.(\\d{4})/);\n  return m ? (m[1] || `${m[4]}-${m[3]}-${m[2]}`) : '';\n}\n\nconst sanitized_protocols = $json.selected_protocols\n  .map(p => ({\n    date: iso(p.Date),\n    type: val(p.Type),\n    doctor: clean(p.Employee?.FullName),\n    clinic: clean(p.Clinic?.Name),\n    params: params(p)\n      .map(prm => ({\n        name: clean(prm.Name ?? prm.name),\n        value: clean(prm.Value ?? prm.value ?? prm.Text)\n      }))\n      .filter(x =>\n        x.name &&\n        x.value &&\n        !excludedParamNames.some(b => norm(x.name).includes(b))\n      )\n  }))\n  .filter(p => p.params.length);\n\nconst deal_context = {\n  deal_key: $json.deal_key,\n  row_number: $json.row_number,\n  patient_code: $json.patient_code,\n  patient_name: $json.patient_name,\n  branch: $json.branch,\n  deal_amount: $json.deal_amount,\n  first_plan_date: $json.first_plan_date,\n  doctor: $json.doctor,\n  uids: $json.uids,\n  appointment_composition: $json.appointment_composition,\n  nearest_requests: $json.nearest_requests,\n  deal_description: $json.deal_description,\n  booking_execution_context: $json.booking_execution_context\n};\n\nreturn [{\n  json: {\n    spreadsheet_id: $json.spreadsheet_id,\n    sheet_name: $json.sheet_name,\n    row_number: $json.row_number,\n    deal_key: $json.deal_key,\n    request_id: $json.request_id,\n    batch_id: $json.batch_id,\n    batch_size: $json.batch_size,\n    sheet_columns: $json.sheet_columns,\n    batch_update_url: $json.batch_update_url,\n    client_context: $json.client_context || {},\n    client_context_error: $json.client_context_error || '',\n    patient_age: $json.patient.age,\n    patient: $json.patient,\n    meta: {\n      period_from: $json.period_from,\n      period_to: $json.period_to,\n      protocols_found: $json.protocols_found,\n      protocols_used: $json.protocols_used,\n      history_truncated: $json.history_truncated\n    },\n    visits: $json.visits,\n    deal_context,\n    sanitized_protocols\n  }\n}];"
+      },
+      "name": "Anonymize deal context protocols v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2832,
+        192
+      ],
+      "id": "1e8bdeea-f2dc-4ebc-933f-4240253807f4"
+    },
+    {
+      "parameters": {
+        "jsCode": "const systemPrompt = `\nТы ассистент, который формирует краткую контекстную справку для сделки Bitrix в сети клиник TEMED.\n\nСправка предназначена для сотрудника отдела продаж. Она должна помогать менеджеру понять контекст пациента перед звонком, но не должна содержать целей, задач, рекомендаций или инструкций для продавца.\n\nИспользуй только факты из переданных протоколов, контекста сделки и карточки клиента 1С.\n\nГлавный фильтр: включай только то, что может practically помочь менеджеру в коммуникации, записи, понимании барьеров, ожиданий, оплаты, логистики или причины назначения.\n\nНе ставь диагнозы от себя.\nНе давай медицинских рекомендаций.\nНе давай продажных рекомендаций.\nНе пиши, что оператор должен сделать.\nНе используй формулировки: \"цель\", \"следующий шаг\", \"рекомендуется\", \"нужно\", \"следует\", \"предложить\", \"записать пациента\", \"помочь начать лечение\".\n\nНе перечисляй назначенные услуги списком, если они переданы в deal_context.appointment_composition.\nНе пиши фразы: \"см. поле Состав назначений\", \"подробный состав назначений см. отдельно\", \"назначения перечислены в отдельном поле\".\nВ справке не должно быть отдельного блока \"Назначения последнего приема\".\n\nМожно использовать комментарий администратора из карточки 1С, но только как фактический контекст.\nНе превращай комментарий администратора в инструкцию продавцу.\nНе добавляй от себя выводы, которых нет в комментарии.\n\nТелефон клиента передан в client_context.phone только для записи в отдельный столбец Google Sheet.\nНе включай телефон клиента в AI-справку.\n\nНе включай в справку факты, которые не помогают менеджеру по продажам:\n- эпидемиологический анамнез;\n- COVID-статус и вакцинацию;\n- рост, вес, ИМТ;\n- отсутствие аллергий;\n- отсутствие постоянного приема препаратов;\n- паспортные, страховые и формальные сведения;\n- лабораторные детали без связи с текущей сделкой;\n- случайные медицинские подробности, не влияющие на коммуникацию или запись.\n\nИсключение: такие факты можно включить только если в протоколе прямо указано, что они влияют на возможность записи, оплату, подготовку к визиту, ограничения процедуры или риск отмены.\n\nОсновной фокус:\n1. краткая история взаимодействия пациента с TEMED;\n2. что было на последнем релевантном приеме — только в части, которая объясняет текущие назначения;\n3. что известно по записи/исполнению из контекста сделки;\n4. комментарий администратора, если он есть;\n5. факты, важные для коммуникации: тревожность, сомнения, прошлый опыт, что помогало/не помогало, далеко ехать, финансовые/организационные барьеры, предоплаты, переносы, предпочтения по врачу/времени, подготовка к занятию или процедуре.\n\nПоследний релевантный прием считать основным для текущей сделки.\n\nПиши кратко, ясно, профессионально, без медицинского жаргона.\nНе включай имя пациента, дату рождения, код, номер карты, телефон, адрес, email или другие идентификаторы.\nНе упоминай, что данные обезличены.\n\nВерни строго валидный JSON без markdown.\n`.trim();\n\nconst userPrompt = `\nВозраст пациента на текущую дату: ${$json.patient_age ?? ''}.\n\nКонтекст сделки из скрипта формирования сделок:\n${JSON.stringify($json.deal_context, null, 2)}\n\nКонтекст клиента из карточки 1С GetClientByCode:\n${JSON.stringify($json.client_context || {}, null, 2)}\n\nОшибка получения карточки клиента, если была:\n${$json.client_context_error || ''}\n\nИстория визитов:\n${JSON.stringify($json.visits, null, 2)}\n\nНиже переданы обезличенные первичные и повторные протоколы за последние пять лет:\n${JSON.stringify($json.sanitized_protocols, null, 2)}\n\nВерни строго JSON следующей структуры:\n{\n  \"interaction_history\": \"\",\n  \"last_visit_context\": \"\",\n  \"booking_execution_context\": \"\",\n  \"admin_context\": \"\",\n  \"communication_context\": \"\"\n}\n\nТребования к полям:\n\ninteraction_history:\nКратко опиши историю взаимодействия пациента с TEMED: количество релевантных приемов, первый и последний прием, клиники, врачи, был ли ранее курс или возврат после перерыва, если это прямо видно. Не добавляй формальные медицинские детали.\n\nlast_visit_context:\nОпиши контекст последнего релевантного приема: дата, тип приема, врач, клиника, основные жалобы и обстоятельства, которые объясняют текущие назначения. Не перечисляй назначенные услуги отдельным списком. Не включай COVID-статус, вакцинацию, рост, вес, ИМТ, аллергии и постоянные препараты, если они прямо не влияют на текущую сделку.\n\nbooking_execution_context:\nОпиши фактический контекст по записи/исполнению из deal_context. Не формулируй цель и не пиши, что оператор должен делать.\n\nadmin_context:\nКратко передай факты из комментария администратора, если он есть.\nНе включай телефон клиента.\nЕсли комментария администратора нет, напиши: \"Комментарий администратора в карточке клиента не указан.\"\n\ncommunication_context:\nУкажи только факты, которые реально помогают менеджеру в разговоре: тревожность, сомнения, прошлый положительный/отрицательный опыт, логистика, дальняя дорога, финансовые обстоятельства, предоплата, переносы, предпочтения по врачу/времени, подготовка к занятию или процедуре.\nНе включай эпидемиологический анамнез, COVID-статус, вакцинацию, рост, вес, ИМТ, аллергии и постоянные препараты, если они прямо не связаны с коммуникацией, записью или ограничениями процедуры.\nЕсли полезных фактов нет, напиши: \"Дополнительные особенности коммуникации в переданных данных не выделены.\"\n`.trim();\n\nreturn [{\n  json: {\n    ...$json,\n    systemPrompt,\n    userPrompt\n  }\n}];"
+      },
+      "name": "Prepare deal context prompt v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2608,
+        192
+      ],
+      "id": "b41bb5b0-a0db-4bd8-8e95-e9b7a961de41"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-5-mini",
+          "mode": "id"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "={{ $json.systemPrompt }}",
+              "role": "system"
+            },
+            {
+              "content": "={{ $json.userPrompt }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "OpenAI - Deal patient context v3",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [
+        -2384,
+        192
+      ],
+      "id": "d1cfc4d4-cabd-419f-841d-9819e4b9360e",
+      "credentials": {
+        "openAiApi": {
+          "id": "AYsswqQnu0370Vfk",
+          "name": "OpenAi [ temed | cid ]"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const fields = [\n  'interaction_history',\n  'last_visit_context',\n  'booking_execution_context',\n  'admin_context',\n  'communication_context'\n];\n\ntry {\n  let raw =\n    $json.message?.content ??\n    $json.text ??\n    $json.content ??\n    $json.output ??\n    $json.response ??\n    '';\n\n  if (typeof raw !== 'string') {\n    raw = JSON.stringify(raw);\n  }\n\n  raw = raw\n    .trim()\n    .replace(/^```json\\s*/i, '')\n    .replace(/^```\\s*/, '')\n    .replace(/```$/, '')\n    .trim();\n\n  const obj = JSON.parse(raw);\n\n  if (!obj || Array.isArray(obj) || typeof obj !== 'object') {\n    throw new Error('OpenAI returned non-object JSON');\n  }\n\n  const summary = {};\n\n  for (const f of fields) {\n    summary[f] = typeof obj[f] === 'string' ? obj[f].trim() : '';\n  }\n\n  return [{\n    json: {\n      ...$('Prepare deal context prompt v3').item.json,\n      summary\n    }\n  }];\n} catch (error) {\n  return [{\n    json: {\n      ...$('Prepare deal context prompt v3').item.json,\n      ok: false,\n      status: 'analysis_error',\n      error_code: 'MODEL_JSON_PARSE_ERROR',\n      message: 'Не удалось сформировать справку для сделки.',\n      http_status: 502\n    }\n  }];\n}"
+      },
+      "name": "Parse deal context JSON v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2176,
+        192
+      ],
+      "id": "f9860478-7f97-4ff3-b025-4d59ae023d6b"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "ai_ok",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "IF deal context analysis ok v3",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -1952,
+        192
+      ],
+      "id": "51a1a792-0f5c-4a59-b856-42b9836e39a2"
+    },
+    {
+      "parameters": {
+        "jsCode": "if ($json.ok === false) {\n  return [{ json: $json }];\n}\n\nconst summary = $json.summary || {};\nconst parts = [];\n\nparts.push('КРАТКАЯ СПРАВКА ДЛЯ СДЕЛКИ');\n\nif ((summary.interaction_history || '').trim()) {\n  parts.push('История взаимодействия:\\n' + summary.interaction_history.trim());\n}\n\nif ((summary.last_visit_context || '').trim()) {\n  parts.push('Последний прием:\\n' + summary.last_visit_context.trim());\n}\n\nif ((summary.booking_execution_context || '').trim()) {\n  parts.push('Запись/исполнение:\\n' + summary.booking_execution_context.trim());\n}\n\nif ((summary.admin_context || '').trim()) {\n  parts.push('Комментарий администратора:\\n' + summary.admin_context.trim());\n}\n\nif ((summary.communication_context || '').trim()) {\n  parts.push('Особенности коммуникации:\\n' + summary.communication_context.trim());\n}\n\nconst summaryText = parts.join('\\n\\n');\n\nreturn [{\n  json: {\n    spreadsheet_id: $json.spreadsheet_id,\n    sheet_name: $json.sheet_name,\n    row_number: $json.row_number,\n    deal_key: $json.deal_key,\n    request_id: $json.request_id,\n    batch_id: $json.batch_id,\n    batch_size: $json.batch_size,\n    sheet_columns: $json.sheet_columns,\n    batch_update_url: $json.batch_update_url,\n    client_context: $json.client_context || {},\n    client_context_error: $json.client_context_error || '',\n    ok: true,\n    status: 'done',\n    source: 'deal_patient_context_v2',\n    summary,\n    summary_text: summaryText\n  }\n}];"
+      },
+      "name": "Build deal context response v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1728,
+        128
+      ],
+      "id": "ee056b00-4cf2-463c-9635-388062e0b59c"
+    },
+    {
+      "parameters": {
+        "jsCode": "const clientContext = $json.client_context || {};\nconst clientContextError = String($json.client_context_error || '').trim();\n\nreturn [{\n  json: {\n    spreadsheet_id: $json.spreadsheet_id,\n    sheet_name: $json.sheet_name,\n    row_number: $json.row_number,\n    deal_key: $json.deal_key,\n    request_id: $json.request_id,\n    batch_id: $json.batch_id,\n    batch_size: $json.batch_size,\n    sheet_columns: $json.sheet_columns,\n    batch_update_url: $json.batch_update_url,\n    ok: true,\n    final_update: {\n      'AI статус': 'done',\n      'AI справка': $json.summary_text,\n      'Телефон клиента': clientContext.phone || '',\n      'Комментарий администратора': clientContext.admin_comment || '',\n      'AI request_id': $json.request_id,\n      'AI updated_at': new Date().toISOString(),\n      'Ошибка': clientContextError\n    }\n  }\n}];"
+      },
+      "name": "Prepare final success item v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1504,
+        128
+      ],
+      "id": "5ea664ed-d1f7-4b1b-84fc-04836addb988"
+    },
+    {
+      "parameters": {
+        "jsCode": "const incomingCode = String($json.error_code || '');\nlet errorCode = incomingCode || 'DEAL_CONTEXT_ANALYSIS_ERROR';\nlet errorMessage = 'Не удалось сформировать справку для сделки.';\n\nif (errorCode === 'ONE_C_PROTOCOLS_ERROR') {\n  errorMessage = 'Не удалось получить историю пациента из 1С.';\n} else if (errorCode === 'PATIENT_OR_PROTOCOLS_NOT_FOUND') {\n  errorMessage = 'Пациент или доступные протоколы не найдены.';\n} else if (errorCode === 'MODEL_JSON_PARSE_ERROR') {\n  errorMessage = 'Не удалось сформировать справку для сделки.';\n} else if ($json.message) {\n  errorMessage = String($json.message);\n}\n\nreturn [{\n  json: {\n    spreadsheet_id: $json.spreadsheet_id,\n    sheet_name: $json.sheet_name,\n    row_number: $json.row_number,\n    deal_key: $json.deal_key,\n    request_id: $json.request_id,\n    batch_id: $json.batch_id,\n    batch_size: $json.batch_size,\n    sheet_columns: $json.sheet_columns,\n    batch_update_url: $json.batch_update_url,\n    ok: false,\n    final_update: {\n      'AI статус': 'error',\n      'AI request_id': $json.request_id,\n      'AI updated_at': new Date().toISOString(),\n      'Ошибка': `${errorCode}: ${errorMessage}`\n    }\n  }\n}];"
+      },
+      "name": "Prepare final error item v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1728,
+        448
+      ],
+      "id": "ca0869dc-a0f8-4627-af9e-84c428877aec"
+    },
+    {
+      "parameters": {
+        "jsCode": "const results = $input.all().map(item => item.json);\n\nif (!results.length) {\n  throw new Error('Loop completed without result items.');\n}\n\nconst first = results[0];\nconst sheetColumns = first.sheet_columns || {};\nconst requiredBase = ['AI статус', 'AI request_id', 'AI updated_at', 'Ошибка'];\nconst missing = requiredBase.filter(name => !sheetColumns[name]);\nif (missing.length) {\n  throw new Error(`Missing columns for final batch update: ${missing.join(', ')}`);\n}\n\nfunction quoteSheet(name) {\n  return `'${String(name).replace(/'/g, \"''\")}'`;\n}\n\nconst sheet = quoteSheet(first.sheet_name);\nconst data = [];\n\nfor (const result of results) {\n  if (result.spreadsheet_id !== first.spreadsheet_id || result.sheet_name !== first.sheet_name) {\n    throw new Error('Final result items belong to different spreadsheets or sheets.');\n  }\n\n  const row = Number(result.row_number);\n  if (!Number.isInteger(row) || row < 2) {\n    throw new Error(`Invalid row_number in final item: ${result.row_number}`);\n  }\n\n  for (const [columnName, value] of Object.entries(result.final_update || {})) {\n    const column = sheetColumns[columnName];\n    if (!column) {\n      throw new Error(`Column not found in header map: ${columnName}`);\n    }\n\n    data.push({\n      range: `${sheet}!${column}${row}`,\n      majorDimension: 'ROWS',\n      values: [[value ?? '']]\n    });\n  }\n}\n\nreturn [{\n  json: {\n    ok: true,\n    batch_id: first.batch_id,\n    batch_size: results.length,\n    spreadsheet_id: first.spreadsheet_id,\n    sheet_name: first.sheet_name,\n    batch_update_url: first.batch_update_url,\n    done_count: results.filter(x => x.ok === true).length,\n    error_count: results.filter(x => x.ok !== true).length,\n    final_batch_body: {\n      valueInputOption: 'RAW',\n      data\n    }\n  }\n}];"
+      },
+      "name": "Build final Google Sheets batch update v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5248,
+        -32
+      ],
+      "id": "3fa15af4-bd31-4b36-9221-52cedfcfccac"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.batch_update_url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.final_batch_body }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "name": "Google Sheets API - Batch save final results v3",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -5008,
+        -32
+      ],
+      "id": "b5bf823e-766b-43ba-baa1-dc37ead641c3",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 15000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "j68oP4jTpcKIyBYP",
+          "name": "Google Sheets [ n8n.temed ]"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $('Build final Google Sheets batch update v3').first().json;\nconst failed = Boolean(\n  $json?.error ||\n  $json?.errorMessage ||\n  Number($json?.statusCode || $json?.httpCode || 0) >= 400\n);\n\nif (failed) {\n  const details = String(\n    $json?.error?.message ||\n    $json?.errorMessage ||\n    $json?.message ||\n    JSON.stringify($json)\n  ).slice(0, 1200);\n\n  throw new Error(\n    `GOOGLE_SHEETS_FINAL_BATCH_ERROR: справки сформированы, но итоговая пакетная запись не выполнена. ${details}`\n  );\n}\n\nreturn [{\n  json: {\n    ...base,\n    ok: true,\n    status: 'done',\n    message: 'Пакет обработан и записан в Google Sheets.',\n    google_result: $json\n  }\n}];"
+      },
+      "name": "Final batch execution result v3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4768,
+        -32
+      ],
+      "id": "af79dd07-3937-44dc-a031-4f13c3e60729"
+    }
+  ],
+  "connections": {
+    "Webhook - Deal patient context batch v3": {
+      "main": [
+        [
+          {
+            "node": "Validate batch request v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate batch request v3": {
+      "main": [
+        [
+          {
+            "node": "IF batch request valid v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF batch request valid v3": {
+      "main": [
+        [
+          {
+            "node": "Prepare Google Sheets header request v3",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond invalid batch request v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Google Sheets header request v3": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets API - Read header v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets API - Read header v3": {
+      "main": [
+        [
+          {
+            "node": "Prepare processing batch update v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare processing batch update v3": {
+      "main": [
+        [
+          {
+            "node": "IF sheet setup valid v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF sheet setup valid v3": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets API - Batch mark processing v3",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond sheet setup error v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets API - Batch mark processing v3": {
+      "main": [
+        [
+          {
+            "node": "Check processing batch write v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check processing batch write v3": {
+      "main": [
+        [
+          {
+            "node": "IF processing batch written v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF processing batch written v3": {
+      "main": [
+        [
+          {
+            "node": "Respond batch started v3",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Split batch into deal items v3",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond processing batch error v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split batch into deal items v3": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Deal Items v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Deal Items v3": {
+      "main": [
+        [
+          {
+            "node": "Build final Google Sheets batch update v3",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get client by code for deal context v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get client by code for deal context v3": {
+      "main": [
+        [
+          {
+            "node": "Extract client phone and admin comment v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract client phone and admin comment v3": {
+      "main": [
+        [
+          {
+            "node": "Prepare deal context protocol request v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare deal context protocol request v3": {
+      "main": [
+        [
+          {
+            "node": "Get patient protocols for deal context v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get patient protocols for deal context v3": {
+      "main": [
+        [
+          {
+            "node": "Parse deal context protocols XML v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse deal context protocols XML v3": {
+      "main": [
+        [
+          {
+            "node": "Normalize deal context protocols v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize deal context protocols v3": {
+      "main": [
+        [
+          {
+            "node": "IF deal context 1C response ok v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF deal context 1C response ok v3": {
+      "main": [
+        [
+          {
+            "node": "Filter deal context medical visits v3",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare final error item v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter deal context medical visits v3": {
+      "main": [
+        [
+          {
+            "node": "IF deal context protocols found v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF deal context protocols found v3": {
+      "main": [
+        [
+          {
+            "node": "Prepare deal context patient identity v3",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare final error item v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare deal context patient identity v3": {
+      "main": [
+        [
+          {
+            "node": "Build deal context visits history v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build deal context visits history v3": {
+      "main": [
+        [
+          {
+            "node": "Anonymize deal context protocols v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anonymize deal context protocols v3": {
+      "main": [
+        [
+          {
+            "node": "Prepare deal context prompt v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare deal context prompt v3": {
+      "main": [
+        [
+          {
+            "node": "OpenAI - Deal patient context v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI - Deal patient context v3": {
+      "main": [
+        [
+          {
+            "node": "Parse deal context JSON v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse deal context JSON v3": {
+      "main": [
+        [
+          {
+            "node": "IF deal context analysis ok v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF deal context analysis ok v3": {
+      "main": [
+        [
+          {
+            "node": "Build deal context response v3",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare final error item v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build deal context response v3": {
+      "main": [
+        [
+          {
+            "node": "Prepare final success item v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare final success item v3": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Deal Items v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare final error item v3": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Deal Items v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build final Google Sheets batch update v3": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets API - Batch save final results v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Sheets API - Batch save final results v3": {
+      "main": [
+        [
+          {
+            "node": "Final batch execution result v3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "0ac9a1d8e7b09fb0f504f7d90e7ec36636be03ea59af94bfa8326a51562dd3c5"
+  }
+}
