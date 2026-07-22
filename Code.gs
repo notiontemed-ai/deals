@@ -393,6 +393,7 @@ const BITRIX_DEALS_HEADERS = [
   'Ближайшие заявки пациента',
   'Телефон клиента',
   'Комментарий администратора',
+  'Комментарий для продаж',
   'Описание назначений',
   'Plan Items JSON',
   'AI справка',
@@ -526,6 +527,7 @@ function buildBitrixDealsSheet() {
         group.nearestRequests.join('\n'),
         '', // Телефон клиента — заполнит n8n
         '', // Комментарий администратора — заполнит n8n
+        '', // Комментарий для продаж — заполнит n8n
         buildBitrixDealAppointmentsDescription_(group),
         buildPlanItemsJson_(group, dealHash),
         '',
@@ -778,8 +780,11 @@ function buildFinalBitrixDescriptions() {
 
     const aiSummary = String(row['AI справка'] || '').trim();
     const appointmentsDescription = String(row['Описание назначений'] || '').trim();
-    const finalDescription = aiSummary
-      ? aiSummary + '\n\n---\n\nНАЗНАЧЕНИЯ:\n\n' + appointmentsDescription
+    // Основной сценарий: «AI справка» уже начинается с блока «КОММЕНТАРИЙ ДЛЯ ПРОДАЖ:».
+    // Fallback: справка пустая, но колонка «Комментарий для продаж» заполнена.
+    const leadText = aiSummary || buildSalesCommentBlock_(row['Комментарий для продаж']);
+    const finalDescription = leadText
+      ? leadText + '\n\n---\n\nНАЗНАЧЕНИЯ:\n\n' + appointmentsDescription
       : appointmentsDescription;
     const rowNumber = i + 2;
 
@@ -801,6 +806,20 @@ function normalizeMultilineTextForBitrix_(value) {
     .trim();
 }
 
+const SALES_COMMENT_HEADING = 'КОММЕНТАРИЙ ДЛЯ ПРОДАЖ:';
+
+function buildSalesCommentBlock_(salesComment) {
+  const sales = String(salesComment || '').trim();
+
+  if (!sales) {
+    return '';
+  }
+
+  return sales.indexOf(SALES_COMMENT_HEADING) === 0
+    ? sales
+    : SALES_COMMENT_HEADING + '\n' + sales;
+}
+
 function formatAiSummaryForBitrix_(value) {
   let text = normalizeMultilineTextForBitrix_(value);
 
@@ -809,6 +828,7 @@ function formatAiSummaryForBitrix_(value) {
   }
 
   text = text
+    .replace(/\s*КОММЕНТАРИЙ ДЛЯ ПРОДАЖ:\s*/g, '\n\nКОММЕНТАРИЙ ДЛЯ ПРОДАЖ:\n')
     .replace(/\s*История взаимодействия:\s*/g, '\n\nИстория взаимодействия:\n')
     .replace(/\s*Последний прием:\s*/g, '\n\nПоследний прием:\n')
     .replace(/\s*Запись\/исполнение:\s*/g, '\n\nЗапись/исполнение:\n')
@@ -1140,7 +1160,7 @@ function writeBitrixDealsOutput_(ss, outputRows) {
   sheet.getRange(2, aiUpdatedAtColumn, totalRows, 1).setNumberFormat('dd.MM.yyyy HH:mm:ss');
 
   if (outputRows.length > 0) {
-    sheet.getRange(2, 12, outputRows.length, 11).setWrap(true);
+    sheet.getRange(2, 12, outputRows.length, 12).setWrap(true);
   }
 
   sheet.autoResizeColumns(1, BITRIX_DEALS_HEADERS.length);
@@ -1154,6 +1174,7 @@ function writeBitrixDealsOutput_(ss, outputRows) {
   sheet.setColumnWidth(19, 800);
   sheet.setColumnWidth(21, 800);
   sheet.setColumnWidth(22, 800);
+  sheet.setColumnWidth(23, 800);
 
   if (sheet.getFilter()) {
     sheet.getFilter().remove();
@@ -2694,8 +2715,50 @@ function addBitrixDealComment_(dealId, text) {
   });
 }
 
+function boldTimelineHeadings_(text) {
+  const headings = [
+    'КРАТКАЯ СПРАВКА ДЛЯ СДЕЛКИ',
+    'КОММЕНТАРИЙ ДЛЯ ПРОДАЖ',
+    'История взаимодействия',
+    'Последний прием',
+    'Последний приём',
+    'Запись/исполнение',
+    'Комментарий администратора',
+    'Особенности коммуникации',
+    'НАЗНАЧЕНИЯ'
+  ].map(heading => heading.toLowerCase());
+
+  return String(text || '')
+    .split('\n')
+    .map(line => {
+      if (line.indexOf('[B]') !== -1) {
+        return line;
+      }
+
+      const trimmed = line.trim();
+      if (!trimmed) {
+        return line;
+      }
+
+      const bare = trimmed.replace(/:$/, '').trim().toLowerCase();
+      if (headings.indexOf(bare) === -1) {
+        return line;
+      }
+
+      return line.replace(trimmed, '[B]' + trimmed + '[/B]');
+    })
+    .join('\n');
+}
+
 function buildBitrixDealTimelineComment_(row) {
-  const aiSummary = formatAiSummaryForBitrix_(row['AI справка'] || '');
+  let aiSummary = formatAiSummaryForBitrix_(row['AI справка'] || '');
+
+  // Fallback: справка пустая, но комментарий для продаж заполнен.
+  if (!aiSummary) {
+    aiSummary = buildSalesCommentBlock_(
+      normalizeMultilineTextForBitrix_(row['Комментарий для продаж'] || '')
+    );
+  }
 
   const appointmentsTextRaw = row['Описание назначений'] || row['Назначения'] || '';
   let appointmentsText = normalizeMultilineTextForBitrix_(appointmentsTextRaw);
@@ -2714,10 +2777,12 @@ function buildBitrixDealTimelineComment_(row) {
     parts.push('НАЗНАЧЕНИЯ\n\n' + appointmentsText);
   }
 
-  return parts
+  const commentText = parts
     .filter(Boolean)
     .join('\n\n---\n\n')
     .trim();
+
+  return boldTimelineHeadings_(commentText);
 }
 
 function bitrixCall_(method, payload) {
