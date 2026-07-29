@@ -10,11 +10,10 @@
  *
  * Одна строка на листе "Сделки" = один УИД назначения.
  *
- * УИД НЕ требует сделки, если в пределах окна исполненности
- * [Дата лечения; min(Дата лечения + 180 дней; дата следующего
- * назначения того же типа)) есть:
- * - заявка "Начато" / "Выполнена" по этой услуге;
- * - или плановая заявка на эту услугу.
+ * УИД НЕ требует сделки, если:
+ * - есть заявка "Начато" / "Выполнена" в день назначения;
+ * - или есть плановая заявка на эту услугу на любую будущую дату
+ *   начиная с даты назначения.
  *
  * Сопоставление:
  * - Пациент.Код = КлиентКод
@@ -30,8 +29,7 @@
  * - анализы объединяются в одну строку "Анализы".
  ****************************************************/
 
-const MIN_BITRIX_DEAL_AMOUNT = 40000;
-const FULFILLMENT_WINDOW_DAYS = 180;
+const MIN_BITRIX_DEAL_AMOUNT = 20000;
 const AI_PROCESSING_TIMEOUT_SECONDS = 180;
 const APPOINTMENT_TYPE_CODE_ORDER = ['L', 'M', 'S', 'F', 'C', 'D', 'U', 'P', 'B'];
 const APPOINTMENT_TYPE_CODE_SET = new Set(APPOINTMENT_TYPE_CODE_ORDER.concat('-'));
@@ -340,24 +338,10 @@ function buildDealsSheet() {
 
   const requestIndexes = buildRequestIndexes_(requests);
   const nearestRequestsByClient = buildNearestRequestsByClientIndex_(requests);
-  const appointmentTypeDateIndex = buildAppointmentTypeDateIndex_(appointments);
   const uidGroups = groupAppointmentsByUid_(appointments);
 
-  const dealRows = Object.values(uidGroups)
-    .map(uidGroup => buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient, appointmentTypeDateIndex));
-
-  // Отсечка по сумме сделки уже на листе «Сделки»: группы «создать сделку»
-  // (пациент|филиал|дата назначения) дешевле порога не выводятся вовсе,
-  // поэтому не попадают ни в AI-обогащение, ни в «Сделки в Битрикс».
-  const partitioned = partitionDealRowsByAmountThreshold_(dealRows);
-
-  Logger.log(
-    'Отсечка по минимальной сумме сделки на листе «Сделки» (< ' + MIN_BITRIX_DEAL_AMOUNT + '): ' +
-    'отсеяно групп «создать сделку» ' + partitioned.skippedGroupsCount + ', ' +
-    'их суммарная стоимость ' + partitioned.skippedGroupsAmount + '.'
-  );
-
-  const outputRows = partitioned.kept
+  const outputRows = Object.values(uidGroups)
+    .map(uidGroup => buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient))
     .sort((a, b) => {
       const statusOrder = {
         [DEALS_CONFIG.resultStatuses.createDeal]: 1,
@@ -379,50 +363,6 @@ function buildDealsSheet() {
     .map(item => item.row);
 
   writeDealsOutput_(ss, outputRows);
-}
-
-
-/**
- * Группирует строки «создать сделку» по будущему ключу сделки
- * (пациент|филиал|дата назначения) и отбрасывает группы с суммарной
- * стоимостью ниже MIN_BITRIX_DEAL_AMOUNT. Информационные строки
- * («Начато/Выполнено», «Запланировано») не фильтруются.
- */
-function partitionDealRowsByAmountThreshold_(dealRows) {
-  const createDealSumByKey = new Map();
-
-  (dealRows || []).forEach(item => {
-    if (item.status !== DEALS_CONFIG.resultStatuses.createDeal) {
-      return;
-    }
-    const key = buildDealAmountGroupKey_(item);
-    createDealSumByKey.set(key, (createDealSumByKey.get(key) || 0) + (item.amountToSell || 0));
-  });
-
-  let skippedGroupsCount = 0;
-  let skippedGroupsAmount = 0;
-  createDealSumByKey.forEach(sum => {
-    if (sum < MIN_BITRIX_DEAL_AMOUNT) {
-      skippedGroupsCount += 1;
-      skippedGroupsAmount += sum;
-    }
-  });
-
-  const kept = (dealRows || []).filter(item => {
-    if (item.status !== DEALS_CONFIG.resultStatuses.createDeal) {
-      return true;
-    }
-    const key = buildDealAmountGroupKey_(item);
-    return (createDealSumByKey.get(key) || 0) >= MIN_BITRIX_DEAL_AMOUNT;
-  });
-
-  return { kept, skippedGroupsCount, skippedGroupsAmount };
-}
-
-
-function buildDealAmountGroupKey_(item) {
-  const appointmentDateKey = item.appointmentDate ? formatDateKey_(item.appointmentDate) : '';
-  return buildBitrixDealKey_(item.patientCode, item.branch, appointmentDateKey);
 }
 
 
@@ -492,10 +432,7 @@ function buildBitrixDealsSheet() {
       return;
     }
 
-    // Одна дата назначения = одна сделка; строки без даты группируются отдельно.
-    const appointmentDate = parseDateOnly_(row['Дата назначения']);
-    const appointmentDateKey = appointmentDate ? formatDateKey_(appointmentDate) : '';
-    const dealKey = buildBitrixDealKey_(patientCode, branch, appointmentDateKey);
+    const dealKey = buildBitrixDealKey_(patientCode, branch);
 
     if (!groups.has(dealKey)) {
       groups.set(dealKey, {
@@ -517,6 +454,7 @@ function buildBitrixDealsSheet() {
 
     const group = groups.get(dealKey);
     const planDate = parseBitrixDealPlanDate_(row);
+    const appointmentDate = parseDateOnly_(row['Дата назначения']);
 
     group.amount += parseNumber_(row['Сумма к продаже']);
 
@@ -553,26 +491,16 @@ function buildBitrixDealsSheet() {
     });
   });
 
-  // Отсечка по сумме сделки: группы дешевле порога в лист не попадают.
-  let skippedGroupsCount = 0;
-  let skippedGroupsAmount = 0;
-  const eligibleGroups = Array.from(groups.values()).filter(group => {
-    if (group.amount < MIN_BITRIX_DEAL_AMOUNT) {
-      skippedGroupsCount += 1;
-      skippedGroupsAmount += group.amount;
-      return false;
-    }
-    return true;
-  });
+  const outputRows = Array.from(groups.values())
+    .sort((a, b) => {
+      const dateDiff = (a.firstPlanDate ? a.firstPlanDate.getTime() : 0) - (b.firstPlanDate ? b.firstPlanDate.getTime() : 0);
+      if (dateDiff !== 0) return dateDiff;
 
-  Logger.log(
-    'Отсечка по минимальной сумме сделки (< ' + MIN_BITRIX_DEAL_AMOUNT + '): ' +
-    'отсеяно групп ' + skippedGroupsCount + ', ' +
-    'их суммарная стоимость ' + skippedGroupsAmount + '.'
-  );
+      const patientDiff = a.patientName.localeCompare(b.patientName, 'ru');
+      if (patientDiff !== 0) return patientDiff;
 
-  const outputRows = eligibleGroups
-    .sort(compareBitrixDealGroupsForUpload_)
+      return a.branch.localeCompare(b.branch, 'ru');
+    })
     .map(group => {
       const uidsText = group.uids.join(', ');
       const dealHash = buildDealHashFromUids_(group.uids);
@@ -613,33 +541,6 @@ function buildBitrixDealsSheet() {
     });
 
   writeBitrixDealsOutput_(ss, outputRows);
-}
-
-
-/**
- * Порядок загрузки в CRM: сделки с самым ранним первым днём лечения
- * идут верхними строками листа «Сделки в Битрикс» и загружаются первыми,
- * чтобы в Bitrix оказаться внизу списка (свежие — сверху). При отсутствии
- * планового дня используется дата назначения группы; группы вовсе без дат
- * уходят в конец листа. Вторичные ключи — ФИО и филиал.
- */
-function compareBitrixDealGroupsForUpload_(a, b) {
-  const aDate = a.firstPlanDate || a.appointmentDate || null;
-  const bDate = b.firstPlanDate || b.appointmentDate || null;
-
-  if (aDate && bDate) {
-    const dateDiff = aDate.getTime() - bDate.getTime();
-    if (dateDiff !== 0) return dateDiff;
-  } else if (aDate && !bDate) {
-    return -1;
-  } else if (!aDate && bDate) {
-    return 1;
-  }
-
-  const patientDiff = String(a.patientName || '').localeCompare(String(b.patientName || ''), 'ru');
-  if (patientDiff !== 0) return patientDiff;
-
-  return String(a.branch || '').localeCompare(String(b.branch || ''), 'ru');
 }
 
 
@@ -940,12 +841,8 @@ function formatAiSummaryForBitrix_(value) {
   return text;
 }
 
-function buildBitrixDealKey_(patientCode, branch, appointmentDateKey) {
-  return [
-    String(patientCode || '').trim(),
-    String(branch || '').trim(),
-    String(appointmentDateKey || '').trim()
-  ].join('|');
+function buildBitrixDealKey_(patientCode, branch) {
+  return String(patientCode || '').trim() + '|' + String(branch || '').trim();
 }
 
 
@@ -1533,7 +1430,7 @@ function extractErrorText_(parsed, body, code) {
  * Построение строки по одному УИД
  ****************************************************/
 
-function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient, appointmentTypeDateIndex) {
+function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient) {
   const matchedRequests = [];
   const matchedRequestNumbers = new Set();
   const matchExplanations = [];
@@ -1546,8 +1443,7 @@ function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient, app
     const candidateRequests = findCandidateRequestsForAppointmentItem_(
       uidGroup,
       item,
-      requestIndexes,
-      appointmentTypeDateIndex
+      requestIndexes
     );
 
     candidateRequests.forEach(match => {
@@ -1614,10 +1510,6 @@ function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient, app
   return {
     uid: uidGroup.uid,
     patient: uidGroup.patient,
-    patientCode: uidGroup.patientCode,
-    branch: uidGroup.branch,
-    appointmentDate: uidGroup.appointmentDate || null,
-    amountToSell: amountToSell,
     status: resultStatus,
     sortDate: uidGroup.firstTreatmentDate ? uidGroup.firstTreatmentDate.getTime() : 0,
     row: [
@@ -1699,7 +1591,6 @@ function testBuildUidDealRowStatusPriority_() {
     const row = buildUidDealRow_(
       uidGroup,
       buildRequestIndexes_(check.requests),
-      new Map(),
       new Map()
     );
 
@@ -1751,7 +1642,6 @@ function testCrossBranchRequestMatching_() {
         typeCode: '-'
       })
     ]),
-    new Map(),
     new Map()
   );
 
@@ -1795,7 +1685,6 @@ function testCrossBranchTypeRequestMatching_() {
         typeCode: 'M'
       })
     ]),
-    new Map(),
     new Map()
   );
 
@@ -1829,264 +1718,6 @@ function buildCrossBranchMatchingTestRequest_(options) {
 }
 
 
-/****************************************************
- * Тесты реанимации базы: окно исполненности, группировка,
- * отсечка по сумме
- ****************************************************/
-
-function buildReanimationTestAppointmentRow_(uid, patientCode, typeCode, treatmentDate) {
-  const c = DEALS_CONFIG.appointmentColumns;
-  const row = {};
-
-  row[c.branch] = 'Тестовый филиал';
-  row[c.patient] = 'Тестовый пациент';
-  row[c.patientCode] = patientCode;
-  row[c.doctor] = 'Тестовый врач';
-  row[c.standard] = 'Тестовый стандарт';
-  row[c.uid] = uid;
-  row[c.appointmentDate] = treatmentDate;
-  row[c.treatmentDate] = treatmentDate;
-  row[c.nomenclature] = 'Услуга ' + typeCode;
-  row[c.price] = 1000;
-  row.typeCode = typeCode;
-
-  return row;
-}
-
-
-function buildReanimationTestUidGroup_(uid, patientCode, typeCode, treatmentDate) {
-  return {
-    uid: uid,
-    branch: 'Тестовый филиал',
-    patient: 'Тестовый пациент',
-    patientCode: patientCode,
-    doctor: 'Тестовый врач',
-    standard: 'Тестовый стандарт',
-    firstTreatmentDate: treatmentDate,
-    appointmentDate: treatmentDate,
-    items: [
-      { treatmentDate: treatmentDate, nomenclature: 'Услуга ' + typeCode, price: 1000, typeCode: typeCode }
-    ]
-  };
-}
-
-
-function testFulfillmentWindowMatching_() {
-  const patientCode = 'P-001';
-  const typeCode = 'M';
-  const janDate = new Date(2026, 0, 12);
-  const marDate = new Date(2026, 2, 10);
-
-  const assertStatus = (name, uidGroup, requests, appointments, expected) => {
-    const row = buildUidDealRow_(
-      uidGroup,
-      buildRequestIndexes_(requests),
-      new Map(),
-      buildAppointmentTypeDateIndex_(appointments)
-    );
-    if (row.status !== expected) {
-      throw new Error(
-        'Окно исполненности — проверка «' + name + '» не пройдена. Ожидалось "' +
-        expected + '", получено "' + row.status + '".'
-      );
-    }
-  };
-
-  // 1. Назначение 12.01, выполненная заявка того же типа 25.01 → УИД исполнен.
-  assertStatus(
-    'выполненная заявка в пределах окна (25.01)',
-    buildReanimationTestUidGroup_('UID-JAN', patientCode, typeCode, janDate),
-    [buildCrossBranchMatchingTestRequest_({
-      number: 'REQ-1', branch: 'Тестовый филиал', clientCode: patientCode,
-      state: 'Выполнено', startDate: new Date(2026, 0, 25),
-      nomenclature: 'Массаж', cabinet: '', typeCode: typeCode
-    })],
-    [buildReanimationTestAppointmentRow_('UID-JAN', patientCode, typeCode, janDate)],
-    DEALS_CONFIG.resultStatuses.started
-  );
-
-  // 2. Назначение 12.01, выполненная заявка 15.08 (>180 дней) → сделка создаётся.
-  assertStatus(
-    'выполненная заявка за пределами окна 180 дней (15.08)',
-    buildReanimationTestUidGroup_('UID-JAN', patientCode, typeCode, janDate),
-    [buildCrossBranchMatchingTestRequest_({
-      number: 'REQ-2', branch: 'Тестовый филиал', clientCode: patientCode,
-      state: 'Выполнено', startDate: new Date(2026, 7, 15),
-      nomenclature: 'Массаж', cabinet: '', typeCode: typeCode
-    })],
-    [buildReanimationTestAppointmentRow_('UID-JAN', patientCode, typeCode, janDate)],
-    DEALS_CONFIG.resultStatuses.createDeal
-  );
-
-  // 3. Назначения 12.01 и 10.03 одного типа, выполненная заявка 20.03 →
-  //    январский УИД не исполнен (заявка за границей D_next), мартовский исполнен.
-  const twoAppointments = [
-    buildReanimationTestAppointmentRow_('UID-JAN', patientCode, typeCode, janDate),
-    buildReanimationTestAppointmentRow_('UID-MAR', patientCode, typeCode, marDate)
-  ];
-  const marRequest = [buildCrossBranchMatchingTestRequest_({
-    number: 'REQ-3', branch: 'Тестовый филиал', clientCode: patientCode,
-    state: 'Выполнено', startDate: new Date(2026, 2, 20),
-    nomenclature: 'Массаж', cabinet: '', typeCode: typeCode
-  })];
-  assertStatus(
-    'январский УИД за границей следующего назначения (D_next = 10.03)',
-    buildReanimationTestUidGroup_('UID-JAN', patientCode, typeCode, janDate),
-    marRequest, twoAppointments,
-    DEALS_CONFIG.resultStatuses.createDeal
-  );
-  assertStatus(
-    'мартовский УИД исполнен в пределах своего окна',
-    buildReanimationTestUidGroup_('UID-MAR', patientCode, typeCode, marDate),
-    marRequest, twoAppointments,
-    DEALS_CONFIG.resultStatuses.started
-  );
-
-  // Граница D_next исключающая: заявка ровно в день следующего назначения
-  // относится к нему, январский УИД остаётся неисполненным.
-  assertStatus(
-    'заявка ровно в день следующего назначения не засчитывается январю',
-    buildReanimationTestUidGroup_('UID-JAN', patientCode, typeCode, janDate),
-    [buildCrossBranchMatchingTestRequest_({
-      number: 'REQ-3B', branch: 'Тестовый филиал', clientCode: patientCode,
-      state: 'Выполнено', startDate: new Date(2026, 2, 10),
-      nomenclature: 'Массаж', cabinet: '', typeCode: typeCode
-    })],
-    twoAppointments,
-    DEALS_CONFIG.resultStatuses.createDeal
-  );
-
-  // 6. Плановая заявка за пределами окна 180 дней → не совпадение.
-  assertStatus(
-    'плановая заявка за пределами окна 180 дней (15.08)',
-    buildReanimationTestUidGroup_('UID-JAN', patientCode, typeCode, janDate),
-    [buildCrossBranchMatchingTestRequest_({
-      number: 'REQ-6', branch: 'Тестовый филиал', clientCode: patientCode,
-      state: 'Запланирована', startDate: new Date(2026, 7, 15),
-      nomenclature: 'Массаж', cabinet: '', typeCode: typeCode
-    })],
-    [buildReanimationTestAppointmentRow_('UID-JAN', patientCode, typeCode, janDate)],
-    DEALS_CONFIG.resultStatuses.createDeal
-  );
-  // Плановая заявка в пределах окна остаётся совпадением.
-  assertStatus(
-    'плановая заявка в пределах окна 180 дней (01.06)',
-    buildReanimationTestUidGroup_('UID-JAN', patientCode, typeCode, janDate),
-    [buildCrossBranchMatchingTestRequest_({
-      number: 'REQ-6B', branch: 'Тестовый филиал', clientCode: patientCode,
-      state: 'Запланирована', startDate: new Date(2026, 5, 1),
-      nomenclature: 'Массаж', cabinet: '', typeCode: typeCode
-    })],
-    [buildReanimationTestAppointmentRow_('UID-JAN', patientCode, typeCode, janDate)],
-    DEALS_CONFIG.resultStatuses.planned
-  );
-
-  return 'testFulfillmentWindowMatching_: OK';
-}
-
-
-function testBitrixDealKeyByAppointmentDate_() {
-  // 4. Разные даты назначения одного пациента/филиала → разные ключи сделок.
-  const janKey = buildBitrixDealKey_('P-001', 'Тестовый филиал', '2026-01-12');
-  const mayKey = buildBitrixDealKey_('P-001', 'Тестовый филиал', '2026-05-20');
-  const emptyKey = buildBitrixDealKey_('P-001', 'Тестовый филиал', '');
-
-  if (janKey === mayKey) {
-    throw new Error('Разные даты назначения должны давать разные ключи сделок.');
-  }
-  if (janKey === emptyKey || mayKey === emptyKey) {
-    throw new Error('Строки без даты назначения должны группироваться отдельно от датированных.');
-  }
-  if (janKey !== 'P-001|Тестовый филиал|2026-01-12') {
-    throw new Error('Неверный формат ключа сделки: ' + janKey);
-  }
-  if (janKey !== buildBitrixDealKey_('P-001', 'Тестовый филиал', '2026-01-12')) {
-    throw new Error('Одна дата назначения должна давать один и тот же ключ сделки.');
-  }
-
-  return 'testBitrixDealKeyByAppointmentDate_: OK';
-}
-
-
-function testBitrixDealAmountThreshold_() {
-  // 5. Группа «создать сделку» дешевле порога отсекается уже на листе «Сделки»
-  //    (и потому не попадёт в «Сделки в Битрикс»); на уровне порога — проходит.
-  if (MIN_BITRIX_DEAL_AMOUNT !== 40000) {
-    throw new Error('MIN_BITRIX_DEAL_AMOUNT должен быть 40000, получено ' + MIN_BITRIX_DEAL_AMOUNT + '.');
-  }
-
-  const status = DEALS_CONFIG.resultStatuses;
-  const apptDate = new Date(2026, 0, 12);
-  const dealRows = [
-    { status: status.createDeal, patientCode: 'P-LOW', branch: 'Ф1', appointmentDate: apptDate, amountToSell: 35000, uid: 'U-LOW' },
-    { status: status.createDeal, patientCode: 'P-HIGH', branch: 'Ф1', appointmentDate: apptDate, amountToSell: 45000, uid: 'U-HIGH' },
-    // Одна группа из двух УИД: 25000 + 25000 = 50000 → выше порога, остаётся.
-    { status: status.createDeal, patientCode: 'P-SPLIT', branch: 'Ф1', appointmentDate: apptDate, amountToSell: 25000, uid: 'U-SPLIT-1' },
-    { status: status.createDeal, patientCode: 'P-SPLIT', branch: 'Ф1', appointmentDate: apptDate, amountToSell: 25000, uid: 'U-SPLIT-2' },
-    // Информационная строка с малой суммой не фильтруется.
-    { status: status.started, patientCode: 'P-INFO', branch: 'Ф1', appointmentDate: apptDate, amountToSell: 0, uid: 'U-INFO' }
-  ];
-
-  const result = partitionDealRowsByAmountThreshold_(dealRows);
-  const keptUids = new Set(result.kept.map(item => item.uid));
-
-  if (keptUids.has('U-LOW')) {
-    throw new Error('Группа «создать сделку» на 35000 должна отсекаться на листе «Сделки».');
-  }
-  if (!keptUids.has('U-HIGH')) {
-    throw new Error('Группа «создать сделку» на 45000 должна оставаться на листе «Сделки».');
-  }
-  if (!keptUids.has('U-SPLIT-1') || !keptUids.has('U-SPLIT-2')) {
-    throw new Error('Группа из двух УИД с суммой 50000 должна оставаться целиком.');
-  }
-  if (!keptUids.has('U-INFO')) {
-    throw new Error('Информационные строки не должны фильтроваться по сумме.');
-  }
-  if (result.skippedGroupsCount !== 1) {
-    throw new Error('Ожидалась 1 отсеянная группа, получено ' + result.skippedGroupsCount + '.');
-  }
-  if (result.skippedGroupsAmount !== 35000) {
-    throw new Error('Суммарная стоимость отсеянных групп должна быть 35000, получено ' + result.skippedGroupsAmount + '.');
-  }
-
-  return 'testBitrixDealAmountThreshold_: OK';
-}
-
-
-function testBitrixDealUploadOrder_() {
-  // 7. Самый ранний первый день лечения — верхняя строка листа (грузится первым).
-  const group = (patientName, firstPlanDate, appointmentDate) => ({
-    patientName: patientName,
-    branch: 'Ф1',
-    firstPlanDate: firstPlanDate,
-    appointmentDate: appointmentDate
-  });
-
-  const byPlanDay = [
-    group('В', new Date(2026, 4, 20), null),
-    group('А', new Date(2026, 0, 10), null),
-    group('Б', new Date(2026, 2, 5), null)
-  ].sort(compareBitrixDealGroupsForUpload_).map(g => g.patientName).join(',');
-
-  if (byPlanDay !== 'А,Б,В') {
-    throw new Error('Ожидался порядок 10.01, 05.03, 20.05 (А,Б,В), получено ' + byPlanDay + '.');
-  }
-
-  // При отсутствии планового дня — дата назначения; без всяких дат — в конец.
-  const withFallback = [
-    group('БезДат', null, null),
-    group('ПоНазначению', null, new Date(2026, 0, 1)),
-    group('ПоПлану', new Date(2026, 1, 1), null)
-  ].sort(compareBitrixDealGroupsForUpload_).map(g => g.patientName).join(',');
-
-  if (withFallback !== 'ПоНазначению,ПоПлану,БезДат') {
-    throw new Error('Ожидался порядок ПоНазначению, ПоПлану, БезДат, получено ' + withFallback + '.');
-  }
-
-  return 'testBitrixDealUploadOrder_: OK';
-}
-
-
 function buildUidStatusPriorityTestRequest_(nomenclature, state, startDate, clientCode) {
   const c = DEALS_CONFIG.requestColumns;
   const row = {};
@@ -2112,7 +1743,7 @@ function buildUidStatusPriorityTestRequest_(nomenclature, state, startDate, clie
 }
 
 
-function findCandidateRequestsForAppointmentItem_(uidGroup, item, requestIndexes, appointmentTypeDateIndex) {
+function findCandidateRequestsForAppointmentItem_(uidGroup, item, requestIndexes) {
   const out = [];
   const usedRequestNumbers = new Set();
   const typeCode = String(item.typeCode || '').trim().toUpperCase();
@@ -2121,7 +1752,6 @@ function findCandidateRequestsForAppointmentItem_(uidGroup, item, requestIndexes
     return out;
   }
 
-  const fulfillmentWindow = buildFulfillmentWindow_(appointmentTypeDateIndex, uidGroup, item);
   const cabinetCategory = getCabinetCategoryForAppointmentType_(typeCode);
 
   if (cabinetCategory) {
@@ -2132,7 +1762,7 @@ function findCandidateRequestsForAppointmentItem_(uidGroup, item, requestIndexes
     const categoryRequests = requestIndexes.cabinetCategory.get(categoryKey) || [];
 
     categoryRequests.forEach(req => {
-      if (isRequestSuitableByDateAndStatus_(req, item.treatmentDate, fulfillmentWindow)) {
+      if (isRequestSuitableByDateAndStatus_(req, item.treatmentDate)) {
         addCandidateRequestMatch_(out, usedRequestNumbers, req, 'совпадение по кабинету ' + req.cabinet);
       }
     });
@@ -2151,7 +1781,7 @@ function findCandidateRequestsForAppointmentItem_(uidGroup, item, requestIndexes
   const typeRequests = requestIndexes.type.get(typeKey) || [];
 
   typeRequests.forEach(req => {
-    if (isRequestSuitableByDateAndStatus_(req, item.treatmentDate, fulfillmentWindow)) {
+    if (isRequestSuitableByDateAndStatus_(req, item.treatmentDate)) {
       addCandidateRequestMatch_(out, usedRequestNumbers, req, 'совпадение по типу ' + typeCode);
     }
   });
@@ -2188,161 +1818,33 @@ function getCabinetCategoryForAppointmentType_(typeCode) {
 }
 
 
-function isRequestSuitableByDateAndStatus_(req, treatmentDate, fulfillmentWindow) {
+function isRequestSuitableByDateAndStatus_(req, treatmentDate) {
   if (!req || !req.startDate || !treatmentDate) {
     return false;
   }
 
-  // Заявка учитывается только в статусах «начато/выполнено» или «запланировано».
+  const requestDayKey = formatDateKey_(req.startDate);
+  const treatmentDayKey = formatDateKey_(treatmentDate);
+
+  // Если заявка начата или выполнена именно в день назначения —
+  // считаем, что назначение уже исполняется.
   if (
-    !isStartedOrCompletedRequestState_(req.state) &&
-    !isPlannedRequestState_(req.state)
+    isStartedOrCompletedRequestState_(req.state) &&
+    requestDayKey === treatmentDayKey
   ) {
-    return false;
+    return true;
   }
 
-  // И начатые/выполненные, и плановые заявки считаются исполнением назначения,
-  // если их дата начала попадает в окно исполненности назначения.
-  return isRequestDateWithinFulfillmentWindow_(req.startDate, treatmentDate, fulfillmentWindow);
-}
-
-
-/****************************************************
- * Окно исполненности назначения
- *
- * Для позиции назначения с датой лечения D и типом T окно исполненности —
- * это [D; min(D + FULFILLMENT_WINDOW_DAYS; D_next)), где D_next — дата
- * лечения ближайшего следующего назначения (другого УИД) того же пациента
- * с тем же типом T. Нижняя граница включительная, граница по следующему
- * назначению — исключающая, граница по 180-дневному окну — включительная.
- ****************************************************/
-
-function buildAppointmentTypeDateIndex_(appointments) {
-  const c = DEALS_CONFIG.appointmentColumns;
-  const index = new Map();
-
-  (appointments || []).forEach(row => {
-    const patientCode = normalizeCode_(row[c.patientCode]);
-    const uid = String(row[c.uid] || '').trim();
-    const typeCode = String(row.typeCode || '').trim().toUpperCase();
-    const treatmentDate = parseDateOnly_(row[c.treatmentDate]);
-
-    if (!patientCode || !uid || !typeCode || typeCode === '-' || !treatmentDate) {
-      return;
-    }
-
-    const key = patientCode + '|' + typeCode;
-
-    if (!index.has(key)) {
-      index.set(key, []);
-    }
-
-    index.get(key).push({ ts: treatmentDate.getTime(), uid });
-  });
-
-  index.forEach(list => list.sort((a, b) => a.ts - b.ts));
-
-  return index;
-}
-
-
-function findNextAppointmentTreatmentTs_(appointmentTypeDateIndex, patientCode, typeCode, currentUid, treatmentTs) {
-  if (!appointmentTypeDateIndex) {
-    return null;
+  // Если есть плановая заявка на любую будущую дату,
+  // начиная с даты назначения, считаем, что пациент записан.
+  if (
+    isPlannedRequestState_(req.state) &&
+    requestDayKey >= treatmentDayKey
+  ) {
+    return true;
   }
 
-  const key = normalizeCode_(patientCode) + '|' + String(typeCode || '').trim().toUpperCase();
-  const list = appointmentTypeDateIndex.get(key);
-
-  if (!list || !list.length) {
-    return null;
-  }
-
-  // Бинарный поиск первой записи со строго большей датой лечения (O(log n)).
-  let lo = 0;
-  let hi = list.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (list[mid].ts > treatmentTs) {
-      hi = mid;
-    } else {
-      lo = mid + 1;
-    }
-  }
-
-  // Берём ближайшее следующее назначение другого УИД: заявка в день такого
-  // назначения относится уже к нему, поэтому оно задаёт границу окна.
-  for (let i = lo; i < list.length; i++) {
-    if (list[i].uid !== currentUid) {
-      return list[i].ts;
-    }
-  }
-
-  return null;
-}
-
-
-function buildFulfillmentWindow_(appointmentTypeDateIndex, uidGroup, item) {
-  if (!item || !item.treatmentDate) {
-    return null;
-  }
-
-  const nextTs = findNextAppointmentTreatmentTs_(
-    appointmentTypeDateIndex,
-    uidGroup.patientCode,
-    item.typeCode,
-    uidGroup.uid,
-    new Date(
-      item.treatmentDate.getFullYear(),
-      item.treatmentDate.getMonth(),
-      item.treatmentDate.getDate()
-    ).getTime()
-  );
-
-  return buildFulfillmentWindowKeys_(item.treatmentDate, nextTs);
-}
-
-
-function buildFulfillmentWindowKeys_(treatmentDate, nextTs) {
-  const startDay = new Date(
-    treatmentDate.getFullYear(),
-    treatmentDate.getMonth(),
-    treatmentDate.getDate()
-  );
-  const capDay = new Date(
-    startDay.getFullYear(),
-    startDay.getMonth(),
-    startDay.getDate() + FULFILLMENT_WINDOW_DAYS
-  );
-
-  return {
-    startKey: formatDateKey_(startDay),
-    capKey: formatDateKey_(capDay),
-    nextKey: (nextTs !== null && nextTs !== undefined) ? formatDateKey_(new Date(nextTs)) : null
-  };
-}
-
-
-function isRequestDateWithinFulfillmentWindow_(requestDate, treatmentDate, fulfillmentWindow) {
-  const window = fulfillmentWindow || buildFulfillmentWindowKeys_(treatmentDate, null);
-  const requestDayKey = formatDateKey_(requestDate);
-
-  // Нижняя граница включительная: заявка не раньше даты лечения.
-  if (requestDayKey < window.startKey) {
-    return false;
-  }
-
-  // Граница по следующему назначению того же типа — исключающая.
-  if (window.nextKey && requestDayKey >= window.nextKey) {
-    return false;
-  }
-
-  // Граница по 180-дневному окну — включительная.
-  if (requestDayKey > window.capKey) {
-    return false;
-  }
-
-  return true;
+  return false;
 }
 
 
@@ -2392,8 +1894,8 @@ function buildUidDescription_(uidGroup, data) {
   } else {
     lines.push('');
     lines.push('По этому УИД не найдено ни одной подходящей заявки:');
-    lines.push('- нет плановой заявки в окне исполненности (' + FULFILLMENT_WINDOW_DAYS + ' дней от даты лечения) по номенклатуре или кабинету;');
-    lines.push('- нет начатой/выполненной заявки в этом же окне исполненности.');
+    lines.push('- нет плановой заявки на будущую дату по номенклатуре или кабинету;');
+    lines.push('- нет начатой/выполненной заявки в день назначения.');
   }
 
   if (data.nearestRequestsText) {
@@ -3123,7 +2625,6 @@ function getOrCreateSheet_(ss, sheetName) {
  ****************************************************/
 
 const BITRIX_DEAL_CATEGORY_ID = 114;
-const BITRIX_DEAL_STAGE_ID = 'C114:UC_712DNY';
 const BITRIX_DEAL_TYPES_FIELD = 'UF_CRM_1784225678';
 const BITRIX_DEAL_PATIENT_CODE_FIELD = 'UF_CRM_1783751141';
 const BITRIX_DEAL_APPOINTMENT_DATE_FIELD = 'UF_CRM_1784267448';
@@ -3598,10 +3099,11 @@ function createBitrixDealFromRow_(row, doctorUserMap) {
   const dealAmount = parseMoney_(row['Сумма сделки']);
   const firstPlanDateValue = row['Первый плановый день'];
   const appointmentDate = parseDateOnly_(row['Дата назначения']);
+  const initialStageId = getInitialBitrixDealStageId_(firstPlanDateValue);
   const patientCode = normalizePatientCodeForBitrix_(row['Пациент.Код']);
   const fields = {
     CATEGORY_ID: BITRIX_DEAL_CATEGORY_ID,
-    STAGE_ID: BITRIX_DEAL_STAGE_ID,
+    STAGE_ID: initialStageId,
     ASSIGNED_BY_ID: getBitrixDealAssignedById_(dealAmount),
     TITLE: buildBitrixDealTitle_(row),
     OPPORTUNITY: dealAmount,
