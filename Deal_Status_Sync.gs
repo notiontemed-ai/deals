@@ -12,6 +12,11 @@
  * справочнику номенклатуры.
  *
  * Филиал заявки при сопоставлении со сделкой не проверяется.
+ *
+ * Для актуализации из Bitrix загружаются сделки только
+ * из отбираемых стадий воронки 114 (DSS_ACTUALIZATION_STAGE_IDS).
+ * Стадия «Не вышел на связь» учитывается только в течение
+ * 30 дней с даты создания сделки.
  ****************************************************/
 
 const DSS_CONFIG = Object.freeze({
@@ -45,6 +50,20 @@ const DSS_DEAL_APPOINTMENT_DATE_FIELD =
 const DSS_ALLOWED_TYPE_CODES = [
   'L', 'M', 'S', 'F', 'C', 'D', 'U', 'P', 'B', '-'
 ];
+// Для актуализации из Bitrix загружаются сделки только этих стадий воронки 114.
+// Стадия «Не вышел на связь» (UC_1GZCBR) учитывается лишь в течение 30 дней
+// с даты создания сделки — см. DSS_RECENT_ONLY_STAGE_ID и DSS_RECENT_ONLY_DAYS.
+const DSS_ACTUALIZATION_STAGE_IDS = [
+  'C114:UC_2ITBVA',        // Ожидание
+  'C114:NEW',              // Связаться
+  'C114:PREPARATION',      // В работе
+  'C114:PREPAYMENT_INVOI', // Cвязаться позже
+  'C114:UC_XR0QG1',        // Повторные касание Не дозвоны
+  'C114:EXECUTING',        // Записался
+  'C114:UC_1GZCBR'         // Не вышел на связь (только свежие сделки)
+];
+const DSS_RECENT_ONLY_STAGE_ID = 'C114:UC_1GZCBR';
+const DSS_RECENT_ONLY_DAYS = 30;
 const DSS_REQUEST_HEADERS = ['КлиентКод', 'Пациент', 'Дата', 'Запланированы', 'Выполнены', 'Дата обработки'];
 const DSS_DEAL_HEADERS = ['ID сделки', 'Название', 'ФИО пациента', 'CATEGORY_ID', 'Текущая стадия ID', 'Текущая стадия', 'Код пациента', 'Сумма сделки', 'Дата создания сделки', 'Дата назначения', 'Первый день лечения', 'Состав назначения', 'Типы назначений', 'Дата загрузки', 'Ошибка данных'];
 const DSS_ACTUALIZATION_HEADERS = ['Отправить', 'ID сделки', 'Название сделки', 'Код пациента', 'Дата назначения', 'Первый день лечения', 'Типы назначений', 'Найденные запланированные типы', 'Найденные выполненные типы', 'Текущая стадия ID', 'Текущая стадия', 'Предлагаемая стадия ID', 'Предлагаемая стадия', 'Результат проверки', 'Причина', 'Дата загрузки сделок', 'Дата обработки заявок', 'Дата актуализации', 'Статус отправки', 'Ошибка отправки'];
@@ -145,13 +164,28 @@ function DSS_loadDealsFromBitrix() {
   // Patient code is deliberately read only from this explicit Bitrix field.
   const raw = DSS_list_(base, 'crm.deal.list', {
     order: { ID: 'ASC' },
-    filter: { CATEGORY_ID: DSS_CONFIG.categoryId },
+    filter: { CATEGORY_ID: DSS_CONFIG.categoryId, STAGE_ID: DSS_ACTUALIZATION_STAGE_IDS },
     select: ['ID', 'TITLE', 'CATEGORY_ID', 'STAGE_ID', 'OPPORTUNITY', 'DATE_CREATE', 'UF_CRM_1737550182812', 'UF_CRM_1783751141', DSS_DEAL_APPOINTMENT_DATE_FIELD, 'UF_CRM_1783751996', 'UF_CRM_1783752197', DSS_DEAL_TYPE_CODES_FIELD]
   });
   const categoryId = Number(DSS_CONFIG.categoryId);
-  const deals = raw.filter(item => Number(item.CATEGORY_ID || 0) === categoryId);
-  const unexpectedDeals = raw.length - deals.length;
+  const inCategory = raw.filter(item => Number(item.CATEGORY_ID || 0) === categoryId);
+  const unexpectedDeals = raw.length - inCategory.length;
   if (unexpectedDeals) Logger.log('Bitrix вернул сделки вне CATEGORY_ID ' + categoryId + ': ' + unexpectedDeals + '.');
+  // Bitrix уже фильтрует по STAGE_ID, но перепроверяем стадии на стороне скрипта и
+  // отбрасываем «Не вышел на связь» старше 30 дней с даты создания сделки.
+  const allowedStages = new Set(DSS_ACTUALIZATION_STAGE_IDS);
+  const recentCutoff = DSS_addDays_(DSS_today_(), -DSS_RECENT_ONLY_DAYS);
+  let unexpectedStages = 0, staleRecentOnly = 0;
+  const deals = inCategory.filter(item => {
+    const stageId = String(item.STAGE_ID || '');
+    if (!allowedStages.has(stageId)) { unexpectedStages += 1; return false; }
+    if (stageId === DSS_RECENT_ONLY_STAGE_ID) {
+      const createdAt = DSS_date_(item.DATE_CREATE);
+      if (!createdAt || createdAt < recentCutoff) { staleRecentOnly += 1; return false; }
+    }
+    return true;
+  });
+  if (unexpectedStages) Logger.log('Bitrix вернул сделки вне отбираемых стадий: ' + unexpectedStages + '.');
   const stages = DSS_stageDirectory_(base, deals); let noPatient = 0; let incomplete = 0;
   const rows = deals.map(item => {
     const id = String(item.ID || ''); const firstTreatment = DSS_date_(item.UF_CRM_1783751996); const appointmentDate = DSS_date_(item[DSS_DEAL_APPOINTMENT_DATE_FIELD]); const createdAt = DSS_date_(item.DATE_CREATE);
@@ -170,7 +204,7 @@ function DSS_loadDealsFromBitrix() {
     return [id, title, patientName || title, category, stageId, stage, patient, opportunity, createdAt || '', appointmentDate || '', firstTreatment || '', String(item.UF_CRM_1783752197 || ''), codes, now, errors.join('\n')];
   }).filter(row => row[0]);
   DSS_saveStageDirectory_(stages); DSS_writeSheet_(ss, DSS_CONFIG.sheets.deals, DSS_DEAL_HEADERS, rows, { numbers: [8], dateTimes: [9, 14], dates: [10, 11], wraps: [12, 15], widths: { 1: 110, 2: 220, 3: 220, 7: 120, 8: 120, 9: 165, 10: 120, 11: 120, 12: 300, 13: 130, 14: 165, 15: 360 } }); DSS_log_(ss, 'Загрузка сделок Bitrix', now);
-  DSS_alert_('Загрузка сделок из Bitrix завершена.', 'Направление: ' + categoryId + '.\nПолучено сделок направления: ' + deals.length + '.\nЗаписано на лист: ' + rows.length + '.\nБез кода пациента: ' + noPatient + '.\nБез заполненных типов назначений: ' + incomplete + '.');
+  DSS_alert_('Загрузка сделок из Bitrix завершена.', 'Направление: ' + categoryId + '.\nОтбираемых стадий: ' + DSS_ACTUALIZATION_STAGE_IDS.length + '.\nПолучено сделок отбираемых стадий: ' + deals.length + '.\nЗаписано на лист: ' + rows.length + '.\n«Не вышел на связь» старше ' + DSS_RECENT_ONLY_DAYS + ' дней исключено: ' + staleRecentOnly + '.\nБез кода пациента: ' + noPatient + '.\nБез заполненных типов назначений: ' + incomplete + '.');
 }
 function DSS_loadStagesFromBitrix() {
   const ss = SpreadsheetApp.getActiveSpreadsheet(); const base = DSS_webhook_(); const categoryId = DSS_CONFIG.categoryId;
