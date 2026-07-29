@@ -343,8 +343,21 @@ function buildDealsSheet() {
   const appointmentTypeDateIndex = buildAppointmentTypeDateIndex_(appointments);
   const uidGroups = groupAppointmentsByUid_(appointments);
 
-  const outputRows = Object.values(uidGroups)
-    .map(uidGroup => buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient, appointmentTypeDateIndex))
+  const dealRows = Object.values(uidGroups)
+    .map(uidGroup => buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient, appointmentTypeDateIndex));
+
+  // Отсечка по сумме сделки уже на листе «Сделки»: группы «создать сделку»
+  // (пациент|филиал|дата назначения) дешевле порога не выводятся вовсе,
+  // поэтому не попадают ни в AI-обогащение, ни в «Сделки в Битрикс».
+  const partitioned = partitionDealRowsByAmountThreshold_(dealRows);
+
+  Logger.log(
+    'Отсечка по минимальной сумме сделки на листе «Сделки» (< ' + MIN_BITRIX_DEAL_AMOUNT + '): ' +
+    'отсеяно групп «создать сделку» ' + partitioned.skippedGroupsCount + ', ' +
+    'их суммарная стоимость ' + partitioned.skippedGroupsAmount + '.'
+  );
+
+  const outputRows = partitioned.kept
     .sort((a, b) => {
       const statusOrder = {
         [DEALS_CONFIG.resultStatuses.createDeal]: 1,
@@ -366,6 +379,50 @@ function buildDealsSheet() {
     .map(item => item.row);
 
   writeDealsOutput_(ss, outputRows);
+}
+
+
+/**
+ * Группирует строки «создать сделку» по будущему ключу сделки
+ * (пациент|филиал|дата назначения) и отбрасывает группы с суммарной
+ * стоимостью ниже MIN_BITRIX_DEAL_AMOUNT. Информационные строки
+ * («Начато/Выполнено», «Запланировано») не фильтруются.
+ */
+function partitionDealRowsByAmountThreshold_(dealRows) {
+  const createDealSumByKey = new Map();
+
+  (dealRows || []).forEach(item => {
+    if (item.status !== DEALS_CONFIG.resultStatuses.createDeal) {
+      return;
+    }
+    const key = buildDealAmountGroupKey_(item);
+    createDealSumByKey.set(key, (createDealSumByKey.get(key) || 0) + (item.amountToSell || 0));
+  });
+
+  let skippedGroupsCount = 0;
+  let skippedGroupsAmount = 0;
+  createDealSumByKey.forEach(sum => {
+    if (sum < MIN_BITRIX_DEAL_AMOUNT) {
+      skippedGroupsCount += 1;
+      skippedGroupsAmount += sum;
+    }
+  });
+
+  const kept = (dealRows || []).filter(item => {
+    if (item.status !== DEALS_CONFIG.resultStatuses.createDeal) {
+      return true;
+    }
+    const key = buildDealAmountGroupKey_(item);
+    return (createDealSumByKey.get(key) || 0) >= MIN_BITRIX_DEAL_AMOUNT;
+  });
+
+  return { kept, skippedGroupsCount, skippedGroupsAmount };
+}
+
+
+function buildDealAmountGroupKey_(item) {
+  const appointmentDateKey = item.appointmentDate ? formatDateKey_(item.appointmentDate) : '';
+  return buildBitrixDealKey_(item.patientCode, item.branch, appointmentDateKey);
 }
 
 
@@ -515,15 +572,7 @@ function buildBitrixDealsSheet() {
   );
 
   const outputRows = eligibleGroups
-    .sort((a, b) => {
-      const dateDiff = (a.firstPlanDate ? a.firstPlanDate.getTime() : 0) - (b.firstPlanDate ? b.firstPlanDate.getTime() : 0);
-      if (dateDiff !== 0) return dateDiff;
-
-      const patientDiff = a.patientName.localeCompare(b.patientName, 'ru');
-      if (patientDiff !== 0) return patientDiff;
-
-      return a.branch.localeCompare(b.branch, 'ru');
-    })
+    .sort(compareBitrixDealGroupsForUpload_)
     .map(group => {
       const uidsText = group.uids.join(', ');
       const dealHash = buildDealHashFromUids_(group.uids);
@@ -564,6 +613,33 @@ function buildBitrixDealsSheet() {
     });
 
   writeBitrixDealsOutput_(ss, outputRows);
+}
+
+
+/**
+ * Порядок загрузки в CRM: сделки с самым ранним первым днём лечения
+ * идут верхними строками листа «Сделки в Битрикс» и загружаются первыми,
+ * чтобы в Bitrix оказаться внизу списка (свежие — сверху). При отсутствии
+ * планового дня используется дата назначения группы; группы вовсе без дат
+ * уходят в конец листа. Вторичные ключи — ФИО и филиал.
+ */
+function compareBitrixDealGroupsForUpload_(a, b) {
+  const aDate = a.firstPlanDate || a.appointmentDate || null;
+  const bDate = b.firstPlanDate || b.appointmentDate || null;
+
+  if (aDate && bDate) {
+    const dateDiff = aDate.getTime() - bDate.getTime();
+    if (dateDiff !== 0) return dateDiff;
+  } else if (aDate && !bDate) {
+    return -1;
+  } else if (!aDate && bDate) {
+    return 1;
+  }
+
+  const patientDiff = String(a.patientName || '').localeCompare(String(b.patientName || ''), 'ru');
+  if (patientDiff !== 0) return patientDiff;
+
+  return String(a.branch || '').localeCompare(String(b.branch || ''), 'ru');
 }
 
 
@@ -1538,6 +1614,10 @@ function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient, app
   return {
     uid: uidGroup.uid,
     patient: uidGroup.patient,
+    patientCode: uidGroup.patientCode,
+    branch: uidGroup.branch,
+    appointmentDate: uidGroup.appointmentDate || null,
+    amountToSell: amountToSell,
     status: resultStatus,
     sortDate: uidGroup.firstTreatmentDate ? uidGroup.firstTreatmentDate.getTime() : 0,
     row: [
@@ -1929,18 +2009,81 @@ function testBitrixDealKeyByAppointmentDate_() {
 
 
 function testBitrixDealAmountThreshold_() {
-  // 5. Группа ниже порога отсекается, на уровне порога — проходит.
+  // 5. Группа «создать сделку» дешевле порога отсекается уже на листе «Сделки»
+  //    (и потому не попадёт в «Сделки в Битрикс»); на уровне порога — проходит.
   if (MIN_BITRIX_DEAL_AMOUNT !== 40000) {
     throw new Error('MIN_BITRIX_DEAL_AMOUNT должен быть 40000, получено ' + MIN_BITRIX_DEAL_AMOUNT + '.');
   }
-  if (!(35000 < MIN_BITRIX_DEAL_AMOUNT)) {
-    throw new Error('Группа с суммой 35000 должна отсекаться.');
+
+  const status = DEALS_CONFIG.resultStatuses;
+  const apptDate = new Date(2026, 0, 12);
+  const dealRows = [
+    { status: status.createDeal, patientCode: 'P-LOW', branch: 'Ф1', appointmentDate: apptDate, amountToSell: 35000, uid: 'U-LOW' },
+    { status: status.createDeal, patientCode: 'P-HIGH', branch: 'Ф1', appointmentDate: apptDate, amountToSell: 45000, uid: 'U-HIGH' },
+    // Одна группа из двух УИД: 25000 + 25000 = 50000 → выше порога, остаётся.
+    { status: status.createDeal, patientCode: 'P-SPLIT', branch: 'Ф1', appointmentDate: apptDate, amountToSell: 25000, uid: 'U-SPLIT-1' },
+    { status: status.createDeal, patientCode: 'P-SPLIT', branch: 'Ф1', appointmentDate: apptDate, amountToSell: 25000, uid: 'U-SPLIT-2' },
+    // Информационная строка с малой суммой не фильтруется.
+    { status: status.started, patientCode: 'P-INFO', branch: 'Ф1', appointmentDate: apptDate, amountToSell: 0, uid: 'U-INFO' }
+  ];
+
+  const result = partitionDealRowsByAmountThreshold_(dealRows);
+  const keptUids = new Set(result.kept.map(item => item.uid));
+
+  if (keptUids.has('U-LOW')) {
+    throw new Error('Группа «создать сделку» на 35000 должна отсекаться на листе «Сделки».');
   }
-  if (!(45000 >= MIN_BITRIX_DEAL_AMOUNT)) {
-    throw new Error('Группа с суммой 45000 должна попадать в лист.');
+  if (!keptUids.has('U-HIGH')) {
+    throw new Error('Группа «создать сделку» на 45000 должна оставаться на листе «Сделки».');
+  }
+  if (!keptUids.has('U-SPLIT-1') || !keptUids.has('U-SPLIT-2')) {
+    throw new Error('Группа из двух УИД с суммой 50000 должна оставаться целиком.');
+  }
+  if (!keptUids.has('U-INFO')) {
+    throw new Error('Информационные строки не должны фильтроваться по сумме.');
+  }
+  if (result.skippedGroupsCount !== 1) {
+    throw new Error('Ожидалась 1 отсеянная группа, получено ' + result.skippedGroupsCount + '.');
+  }
+  if (result.skippedGroupsAmount !== 35000) {
+    throw new Error('Суммарная стоимость отсеянных групп должна быть 35000, получено ' + result.skippedGroupsAmount + '.');
   }
 
   return 'testBitrixDealAmountThreshold_: OK';
+}
+
+
+function testBitrixDealUploadOrder_() {
+  // 7. Самый ранний первый день лечения — верхняя строка листа (грузится первым).
+  const group = (patientName, firstPlanDate, appointmentDate) => ({
+    patientName: patientName,
+    branch: 'Ф1',
+    firstPlanDate: firstPlanDate,
+    appointmentDate: appointmentDate
+  });
+
+  const byPlanDay = [
+    group('В', new Date(2026, 4, 20), null),
+    group('А', new Date(2026, 0, 10), null),
+    group('Б', new Date(2026, 2, 5), null)
+  ].sort(compareBitrixDealGroupsForUpload_).map(g => g.patientName).join(',');
+
+  if (byPlanDay !== 'А,Б,В') {
+    throw new Error('Ожидался порядок 10.01, 05.03, 20.05 (А,Б,В), получено ' + byPlanDay + '.');
+  }
+
+  // При отсутствии планового дня — дата назначения; без всяких дат — в конец.
+  const withFallback = [
+    group('БезДат', null, null),
+    group('ПоНазначению', null, new Date(2026, 0, 1)),
+    group('ПоПлану', new Date(2026, 1, 1), null)
+  ].sort(compareBitrixDealGroupsForUpload_).map(g => g.patientName).join(',');
+
+  if (withFallback !== 'ПоНазначению,ПоПлану,БезДат') {
+    throw new Error('Ожидался порядок ПоНазначению, ПоПлану, БезДат, получено ' + withFallback + '.');
+  }
+
+  return 'testBitrixDealUploadOrder_: OK';
 }
 
 
