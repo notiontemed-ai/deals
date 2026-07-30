@@ -30,7 +30,7 @@
  * - анализы объединяются в одну строку "Анализы".
  ****************************************************/
 
-const MIN_BITRIX_DEAL_AMOUNT = 40000;
+const MIN_BITRIX_DEAL_AMOUNT = 30000;
 const FULFILLMENT_WINDOW_DAYS = 180;
 const AI_PROCESSING_TIMEOUT_SECONDS = 180;
 const APPOINTMENT_TYPE_CODE_ORDER = ['L', 'M', 'S', 'F', 'C', 'D', 'U', 'P', 'B'];
@@ -126,7 +126,9 @@ const DEALS_CONFIG = {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('TEMED сделки')
-    .addItem('Сформировать лист "Сделки"', 'buildDealsSheet')
+    .addItem('Сформировать лист "Сделки" (одномоментно)', 'buildDealsSheet')
+    .addItem('Начать обработку заново (по пациентам)', 'startDealsProcessing')
+    .addItem('Продолжить обработку', 'continueDealsProcessing')
     .addSeparator()
     .addItem('Сделки в Битрикс', 'buildBitrixDealsSheet')
     .addItem('Запросить AI справки для Bitrix', 'requestAiSummariesForBitrixDeals')
@@ -321,30 +323,29 @@ function mergeAppointmentTypeCodes_(values) {
 function buildDealsSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  const appointmentsSheet = getRequiredSheet_(ss, DEALS_CONFIG.appointmentsSheetName);
-  const requestsSheet = getRequiredSheet_(ss, DEALS_CONFIG.requestsSheetName);
-
-  const appointments = readSheetAsObjects_(appointmentsSheet);
-  const requests = readSheetAsObjects_(requestsSheet);
-
-  // Проверяем справочник до любых расчётов и до очистки листа "Сделки".
-  const typeCodesSheet = getRequiredSheet_(ss, DEALS_CONFIG.typeCodesSheetName);
-  const typeValidation = validateAppointmentTypeCodes_(typeCodesSheet, appointments, requests);
-  if (!typeValidation.isValid) {
-    typeCodesSheet.activate();
-    SpreadsheetApp.getUi().alert(typeValidation.message);
+  // Одномоментная сборка листа «Сделки». Полезна на малом объёме и как
+  // эталон для сравнения с попациентной обработкой. На большой базе
+  // используйте «Начать обработку заново» / «Продолжить обработку».
+  const context = buildDealsProcessingContext_(ss);
+  if (!context.isValid) {
+    if (context.typeCodesSheet) {
+      context.typeCodesSheet.activate();
+    }
+    SpreadsheetApp.getUi().alert(context.message);
     return;
   }
 
-  assignAppointmentTypeCodes_(appointments, requests, typeValidation.typeCodeMap);
-
-  const requestIndexes = buildRequestIndexes_(requests);
-  const nearestRequestsByClient = buildNearestRequestsByClientIndex_(requests);
-  const appointmentTypeDateIndex = buildAppointmentTypeDateIndex_(appointments);
-  const uidGroups = groupAppointmentsByUid_(appointments);
-
-  const dealRows = Object.values(uidGroups)
-    .map(uidGroup => buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient, appointmentTypeDateIndex));
+  const dealRows = [];
+  context.uidGroupsByPatient.forEach(groups => {
+    groups.forEach(uidGroup => {
+      dealRows.push(buildUidDealRow_(
+        uidGroup,
+        context.requestIndexes,
+        context.nearestRequestsByClient,
+        context.appointmentTypeDateIndex
+      ));
+    });
+  });
 
   // Отсечка по сумме сделки уже на листе «Сделки»: группы «создать сделку»
   // (пациент|филиал|дата назначения) дешевле порога не выводятся вовсе,
@@ -358,27 +359,83 @@ function buildDealsSheet() {
   );
 
   const outputRows = partitioned.kept
-    .sort((a, b) => {
-      const statusOrder = {
-        [DEALS_CONFIG.resultStatuses.createDeal]: 1,
-        [DEALS_CONFIG.resultStatuses.started]: 2,
-        [DEALS_CONFIG.resultStatuses.planned]: 3
-      };
-
-      const statusDiff = (statusOrder[a.status] || 99) - (statusOrder[b.status] || 99);
-      if (statusDiff !== 0) return statusDiff;
-
-      const dateDiff = a.sortDate - b.sortDate;
-      if (dateDiff !== 0) return dateDiff;
-
-      const patientDiff = String(a.patient).localeCompare(String(b.patient), 'ru');
-      if (patientDiff !== 0) return patientDiff;
-
-      return String(a.uid).localeCompare(String(b.uid), 'ru');
-    })
+    .sort(compareDealRowsForOutput_)
     .map(item => item.row);
 
   writeDealsOutput_(ss, outputRows);
+}
+
+
+/**
+ * Порядок вывода строк листа «Сделки»: сначала «создать сделку», затем
+ * «Начато», затем «Запланировано»; внутри статуса — по дате лечения,
+ * ФИО и УИД. Общий для одномоментной и попациентной сборки.
+ */
+function compareDealRowsForOutput_(a, b) {
+  const statusOrder = {
+    [DEALS_CONFIG.resultStatuses.createDeal]: 1,
+    [DEALS_CONFIG.resultStatuses.started]: 2,
+    [DEALS_CONFIG.resultStatuses.planned]: 3
+  };
+
+  const statusDiff = (statusOrder[a.status] || 99) - (statusOrder[b.status] || 99);
+  if (statusDiff !== 0) return statusDiff;
+
+  const dateDiff = a.sortDate - b.sortDate;
+  if (dateDiff !== 0) return dateDiff;
+
+  const patientDiff = String(a.patient).localeCompare(String(b.patient), 'ru');
+  if (patientDiff !== 0) return patientDiff;
+
+  return String(a.uid).localeCompare(String(b.uid), 'ru');
+}
+
+
+/**
+ * Читает входные листы, проверяет справочник типов и строит общие индексы
+ * для сборки листа «Сделки». УИД-группы сгруппированы по пациенту, чтобы
+ * пациента можно было обработать атомарно (окно исполненности и граница по
+ * следующему назначению зависят только от назначений самого пациента).
+ * Возвращает { isValid:false, message, typeCodesSheet } при ошибке справочника.
+ */
+function buildDealsProcessingContext_(ss) {
+  const appointmentsSheet = getRequiredSheet_(ss, DEALS_CONFIG.appointmentsSheetName);
+  const requestsSheet = getRequiredSheet_(ss, DEALS_CONFIG.requestsSheetName);
+
+  const appointments = readSheetAsObjects_(appointmentsSheet);
+  const requests = readSheetAsObjects_(requestsSheet);
+
+  const typeCodesSheet = getRequiredSheet_(ss, DEALS_CONFIG.typeCodesSheetName);
+  const typeValidation = validateAppointmentTypeCodes_(typeCodesSheet, appointments, requests);
+  if (!typeValidation.isValid) {
+    return { isValid: false, message: typeValidation.message, typeCodesSheet: typeCodesSheet };
+  }
+
+  assignAppointmentTypeCodes_(appointments, requests, typeValidation.typeCodeMap);
+
+  const requestIndexes = buildRequestIndexes_(requests);
+  const nearestRequestsByClient = buildNearestRequestsByClientIndex_(requests);
+  const appointmentTypeDateIndex = buildAppointmentTypeDateIndex_(appointments);
+  const uidGroups = groupAppointmentsByUid_(appointments);
+
+  const uidGroupsByPatient = new Map();
+  Object.keys(uidGroups).forEach(uid => {
+    const group = uidGroups[uid];
+    const code = String(group.patientCode || '').trim();
+    if (!code) return;
+    if (!uidGroupsByPatient.has(code)) {
+      uidGroupsByPatient.set(code, []);
+    }
+    uidGroupsByPatient.get(code).push(group);
+  });
+
+  return {
+    isValid: true,
+    requestIndexes: requestIndexes,
+    nearestRequestsByClient: nearestRequestsByClient,
+    appointmentTypeDateIndex: appointmentTypeDateIndex,
+    uidGroupsByPatient: uidGroupsByPatient
+  };
 }
 
 
@@ -428,6 +485,493 @@ function buildDealAmountGroupKey_(item) {
 
 
 /****************************************************
+ * Попациентная пачечная обработка листа «Сделки» с чекпоинтами
+ *
+ * Единица обработки — пациент: все его назначения и заявки за период
+ * обрабатываются вместе, атомарно. Размер пачки определяется только
+ * временем (бюджет ~4,5 минуты), порядок обхода детерминирован по
+ * «Пациент.Код». Прогресс хранится на служебном листе «Прогресс обработки»,
+ * счётчики и флаг активной сессии — в Script Properties. Лист «Сделки»
+ * наполняется дозаписью строк обработанных пациентов.
+ ****************************************************/
+
+const DEALS_PROGRESS_SHEET_NAME = 'Прогресс обработки';
+const DEALS_PROGRESS_HEADERS = [
+  'Пациент.Код',
+  'ФИО',
+  'Строк назначений',
+  'Статус',
+  'Обработан в',
+  'Ошибка'
+];
+const DEALS_PROGRESS_STATUS = {
+  waiting: 'ожидает',
+  done: 'обработан',
+  error: 'ошибка'
+};
+
+// Бюджет времени на одну пачку: обрабатываем пациентов, пока с начала
+// выполнения не пройдёт 4,5 минуты (запас до лимита Apps Script ~6 минут),
+// затем завершаем текущего пациента и штатно выходим с чекпоинтом.
+const DEALS_PROCESSING_TIME_BUDGET_MS = 4.5 * 60 * 1000;
+const DEALS_CONTINUE_FUNCTION = 'continueDealsProcessing';
+
+const DEALS_PROCESSING_PROPS = {
+  processedCount: 'DEALS_PROCESSED_COUNT',
+  totalCount: 'DEALS_TOTAL_COUNT',
+  sessionActive: 'DEALS_SESSION_ACTIVE_AT'
+};
+
+// Флаг активной сессии считается устаревшим (например, после падения
+// runtime) по истечении этого срока, чтобы обработка не блокировалась навсегда.
+const DEALS_SESSION_STALE_MS = 10 * 60 * 1000;
+
+
+/**
+ * Обрабатывает одного пациента целиком: строит строки листа «Сделки» по всем
+ * его УИД, применяет отсечку по сумме (группы дешевле порога отбрасываются)
+ * и сортирует оставшиеся строки в порядке вывода. Возвращает готовые строки
+ * листа и статистику отсечки.
+ */
+function processPatientDealRows_(patientCode, context) {
+  const groups = context.uidGroupsByPatient.get(String(patientCode || '').trim()) || [];
+
+  const dealRows = groups.map(uidGroup => buildUidDealRow_(
+    uidGroup,
+    context.requestIndexes,
+    context.nearestRequestsByClient,
+    context.appointmentTypeDateIndex
+  ));
+
+  const partitioned = partitionDealRowsByAmountThreshold_(dealRows);
+  const rows = partitioned.kept
+    .sort(compareDealRowsForOutput_)
+    .map(item => item.row);
+
+  return {
+    rows: rows,
+    skippedGroupsCount: partitioned.skippedGroupsCount,
+    skippedGroupsAmount: partitioned.skippedGroupsAmount
+  };
+}
+
+
+function compareByPatientCode_(a, b) {
+  return String(a || '').localeCompare(String(b || ''), 'ru', { numeric: true, sensitivity: 'base' });
+}
+
+
+/**
+ * Ядро попациентной обработки одной пачки. Не зависит от Google Sheets:
+ * прогресс и запись строк переданы через объекты-хранилища, что позволяет
+ * тестировать логику чекпоинтов на in-memory данных.
+ *
+ * options:
+ *   context   — результат buildDealsProcessingContext_ (uidGroupsByPatient и индексы);
+ *   progress  — { list(): [{code,status}], update(code, patch) };
+ *   sink      — { append(rows) } для дозаписи строк листа «Сделки»;
+ *   budgetMs  — бюджет времени на пачку (по умолчанию DEALS_PROCESSING_TIME_BUDGET_MS);
+ *   now       — функция текущего времени в мс (по умолчанию Date.now), параметр для тестов.
+ *
+ * Гарантии: за пачку обрабатывается минимум один ожидающий пациент; пациент
+ * не разрезается между запусками; ошибка на одном пациенте не прерывает пачку.
+ */
+function runDealsProcessingBatch_(options) {
+  options = options || {};
+  const context = options.context;
+  const progress = options.progress;
+  const sink = options.sink;
+  const budgetMs = (options.budgetMs !== undefined && options.budgetMs !== null)
+    ? options.budgetMs
+    : DEALS_PROCESSING_TIME_BUDGET_MS;
+  const now = options.now || Date.now;
+
+  const startTime = now();
+
+  const waiting = progress.list()
+    .filter(entry => entry.status === DEALS_PROGRESS_STATUS.waiting)
+    .map(entry => String(entry.code || '').trim())
+    .filter(Boolean)
+    .sort(compareByPatientCode_);
+
+  let processedThisRun = 0;
+  let appended = 0;
+  let skippedGroupsCount = 0;
+  let skippedGroupsAmount = 0;
+  const errors = [];
+
+  for (let i = 0; i < waiting.length; i++) {
+    // Бюджет по времени: как минимум одного пациента обрабатываем всегда,
+    // затем перед каждым следующим проверяем, не вышли ли за бюджет.
+    if (processedThisRun > 0 && (now() - startTime) >= budgetMs) {
+      break;
+    }
+
+    const code = waiting[i];
+
+    try {
+      const result = processPatientDealRows_(code, context);
+      if (result.rows.length) {
+        sink.append(result.rows);
+        appended += result.rows.length;
+      }
+      skippedGroupsCount += result.skippedGroupsCount;
+      skippedGroupsAmount += result.skippedGroupsAmount;
+      progress.update(code, {
+        status: DEALS_PROGRESS_STATUS.done,
+        processedAt: new Date(now()),
+        error: ''
+      });
+    } catch (err) {
+      const text = String((err && err.stack) || err);
+      progress.update(code, {
+        status: DEALS_PROGRESS_STATUS.error,
+        processedAt: new Date(now()),
+        error: text
+      });
+      errors.push(code + ': ' + text);
+    }
+
+    processedThisRun++;
+  }
+
+  const remaining = waiting.length - processedThisRun;
+
+  Logger.log(
+    'Пачка попациентной обработки: обработано пациентов ' + processedThisRun +
+    ', дозаписано строк ' + appended +
+    ', осталось ожидающих ' + remaining +
+    '. Отсечка по сумме (< ' + MIN_BITRIX_DEAL_AMOUNT + '): отсеяно групп «создать сделку» ' +
+    skippedGroupsCount + ', их суммарная стоимость ' + skippedGroupsAmount +
+    (errors.length ? ('. Ошибок: ' + errors.length) : '') + '.'
+  );
+
+  return {
+    ok: true,
+    processedThisRun: processedThisRun,
+    appended: appended,
+    remaining: remaining,
+    skippedGroupsCount: skippedGroupsCount,
+    skippedGroupsAmount: skippedGroupsAmount,
+    errors: errors
+  };
+}
+
+
+/**
+ * Список всех пациентов для листа прогресса: код, ФИО и число строк
+ * назначений (сумма позиций по всем УИД пациента). Отсортирован по коду.
+ */
+function buildPatientRoster_(context) {
+  const roster = [];
+
+  context.uidGroupsByPatient.forEach((groups, code) => {
+    let rowsCount = 0;
+    let fio = '';
+    groups.forEach(group => {
+      rowsCount += (group.items ? group.items.length : 0);
+      if (!fio && group.patient) fio = group.patient;
+    });
+    roster.push({ code: code, fio: fio, rows: rowsCount });
+  });
+
+  roster.sort((a, b) => compareByPatientCode_(a.code, b.code));
+  return roster;
+}
+
+
+/****************************************************
+ * Служебный лист «Прогресс обработки»
+ ****************************************************/
+
+function writeProgressSheet_(ss, roster) {
+  const sheet = getOrCreateSheet_(ss, DEALS_PROGRESS_SHEET_NAME);
+
+  if (sheet.getFilter()) {
+    sheet.getFilter().remove();
+  }
+  sheet.clear();
+
+  sheet.getRange(1, 1, 1, DEALS_PROGRESS_HEADERS.length).setValues([DEALS_PROGRESS_HEADERS]);
+  sheet.setFrozenRows(1);
+  sheet.getRange(1, 1, 1, DEALS_PROGRESS_HEADERS.length)
+    .setFontWeight('bold')
+    .setBackground('#fce5cd')
+    .setHorizontalAlignment('center');
+
+  if (roster.length) {
+    const rows = roster.map(patient => [
+      patient.code,
+      patient.fio,
+      patient.rows,
+      DEALS_PROGRESS_STATUS.waiting,
+      '',
+      ''
+    ]);
+    sheet.getRange(2, 1, rows.length, DEALS_PROGRESS_HEADERS.length).setValues(rows);
+    sheet.getRange(2, 5, rows.length, 1).setNumberFormat('dd.MM.yyyy HH:mm:ss');
+  }
+
+  sheet.getRange(1, 1, Math.max(roster.length + 1, 1), DEALS_PROGRESS_HEADERS.length).createFilter();
+  return sheet;
+}
+
+
+/**
+ * Считает пациентов в статусе «ожидает». Если листа прогресса нет — 0
+ * (значит попациентная сессия не запускалась, лист «Сделки» мог быть
+ * собран одномоментно).
+ */
+function getPendingPatientsCount_(ss) {
+  const sheet = ss.getSheetByName(DEALS_PROGRESS_SHEET_NAME);
+  if (!sheet) return 0;
+
+  const data = readSheetWithHeaders_(sheet);
+  const statusHeader = 'Статус';
+  if (!data.headerMap[statusHeader]) return 0;
+
+  return data.rows.reduce((count, row) => {
+    return count + (String(row[statusHeader] || '').trim() === DEALS_PROGRESS_STATUS.waiting ? 1 : 0);
+  }, 0);
+}
+
+
+/**
+ * Хранилище прогресса поверх листа «Прогресс обработки». Читает статусы один
+ * раз при создании, буферизует изменения и пишет их одним setValues в commit().
+ */
+function createSheetProgressStore_(sheet) {
+  const data = readSheetWithHeaders_(sheet);
+  const statusCol = data.headerMap['Статус'];
+  const processedCol = data.headerMap['Обработан в'];
+  const errorCol = data.headerMap['Ошибка'];
+
+  const rowByCode = new Map();
+  data.rows.forEach((row, i) => {
+    const code = String(row['Пациент.Код'] || '').trim();
+    if (code) {
+      rowByCode.set(code, { index: i, status: String(row['Статус'] || '').trim() });
+    }
+  });
+
+  const patches = new Map();
+
+  return {
+    list: function () {
+      return Array.from(rowByCode.entries()).map(entry => ({ code: entry[0], status: entry[1].status }));
+    },
+    update: function (code, patch) {
+      patches.set(String(code || '').trim(), patch);
+    },
+    commit: function () {
+      if (!patches.size || !data.rows.length) return;
+
+      // Колонки «Статус», «Обработан в», «Ошибка» идут подряд — пишем блоком.
+      const block = data.rows.map(row => [row['Статус'], row['Обработан в'], row['Ошибка']]);
+      patches.forEach((patch, code) => {
+        const meta = rowByCode.get(code);
+        if (!meta) return;
+        block[meta.index] = [patch.status, patch.processedAt || '', patch.error || ''];
+      });
+      sheet.getRange(2, statusCol, block.length, 3).setValues(block);
+
+      // statusCol/processedCol/errorCol должны быть смежными; проверяем на всякий случай.
+      if (processedCol !== statusCol + 1 || errorCol !== statusCol + 2) {
+        Logger.log('Внимание: колонки прогресса не смежны, статусы записаны по порядку заголовков.');
+      }
+    }
+  };
+}
+
+
+/**
+ * Приёмник строк листа «Сделки»: буферизует дозаписываемые строки и пишет их
+ * одним диапазоном в commit(). Возвращает число дозаписанных строк.
+ */
+function createSheetDealsSink_(ss) {
+  const sheet = getRequiredSheet_(ss, DEALS_CONFIG.outputSheetName);
+  const buffer = [];
+
+  return {
+    append: function (rows) {
+      for (let i = 0; i < rows.length; i++) {
+        buffer.push(rows[i]);
+      }
+    },
+    commit: function () {
+      if (!buffer.length) return 0;
+      appendDealsOutputRows_(sheet, buffer);
+      return buffer.length;
+    }
+  };
+}
+
+
+/****************************************************
+ * Управление сессией попациентной обработки
+ ****************************************************/
+
+function startDealsProcessing() {
+  runDealsProcessingSession_(true);
+}
+
+
+function continueDealsProcessing() {
+  runDealsProcessingSession_(false);
+}
+
+
+function runDealsProcessingSession_(isRestart) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) {
+    tryAlertUser_('Обработка уже выполняется — дождитесь завершения текущей пачки.');
+    return;
+  }
+
+  const props = PropertiesService.getScriptProperties();
+
+  try {
+    if (!isRestart && isSessionActive_(props)) {
+      tryAlertUser_('Обработка уже выполняется (активная сессия). Повторите позже.');
+      return;
+    }
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const context = buildDealsProcessingContext_(ss);
+    if (!context.isValid) {
+      if (context.typeCodesSheet) context.typeCodesSheet.activate();
+      tryAlertUser_(context.message);
+      return;
+    }
+
+    if (isRestart) {
+      const roster = buildPatientRoster_(context);
+      const outputSheet = getOrCreateSheet_(ss, DEALS_CONFIG.outputSheetName);
+      initDealsOutputSheet_(outputSheet);
+      refreshDealsOutputFilter_(outputSheet);
+      writeProgressSheet_(ss, roster);
+      props.setProperty(DEALS_PROCESSING_PROPS.totalCount, String(roster.length));
+      props.setProperty(DEALS_PROCESSING_PROPS.processedCount, '0');
+      deleteDealsProcessingTriggers_();
+      Logger.log('Старт попациентной обработки: пациентов всего ' + roster.length + '.');
+    }
+
+    const progressSheet = ss.getSheetByName(DEALS_PROGRESS_SHEET_NAME);
+    if (!progressSheet) {
+      tryAlertUser_('Не найден лист «' + DEALS_PROGRESS_SHEET_NAME +
+        '». Запустите «Начать обработку заново».');
+      return;
+    }
+    if (!ss.getSheetByName(DEALS_CONFIG.outputSheetName)) {
+      tryAlertUser_('Не найден лист «' + DEALS_CONFIG.outputSheetName +
+        '». Запустите «Начать обработку заново».');
+      return;
+    }
+
+    markSessionActive_(props, true);
+
+    const progress = createSheetProgressStore_(progressSheet);
+    const sink = createSheetDealsSink_(ss);
+
+    const result = runDealsProcessingBatch_({ context: context, progress: progress, sink: sink });
+
+    // Сначала дозаписываем строки, затем фиксируем статусы прогресса —
+    // так статус «обработан» не появится раньше, чем строки пациента в листе.
+    const appended = sink.commit();
+    progress.commit();
+    refreshDealsOutputFilter_(getRequiredSheet_(ss, DEALS_CONFIG.outputSheetName));
+
+    const totalCount = Number(props.getProperty(DEALS_PROCESSING_PROPS.totalCount)) ||
+      (result.processedThisRun + result.remaining);
+    props.setProperty(DEALS_PROCESSING_PROPS.processedCount, String(totalCount - result.remaining));
+
+    markSessionActive_(props, false);
+
+    finalizeDealsBatch_(result, appended, props);
+  } catch (err) {
+    Logger.log('Ошибка попациентной обработки: ' + ((err && err.stack) || err));
+    tryAlertUser_('Ошибка обработки: ' + err);
+  } finally {
+    markSessionActive_(props, false);
+    lock.releaseLock();
+  }
+}
+
+
+/**
+ * По итогам пачки: если остались необработанные — планирует автопрогон
+ * следующей пачки одноразовым триггером через 60 секунд; иначе — удаляет свои
+ * триггеры и выводит итог.
+ */
+function finalizeDealsBatch_(result, appended, props) {
+  if (result.remaining > 0) {
+    scheduleNextDealsBatch_();
+    Logger.log('Пачка завершена: обработано ' + result.processedThisRun +
+      ', дозаписано строк ' + appended + ', осталось необработанных ' + result.remaining +
+      '. Автопрогон следующей пачки через 60 секунд.');
+    return;
+  }
+
+  deleteDealsProcessingTriggers_();
+  Logger.log('Попациентная обработка завершена. Обработано пациентов: ' +
+    (props.getProperty(DEALS_PROCESSING_PROPS.processedCount) || '?') + ' из ' +
+    (props.getProperty(DEALS_PROCESSING_PROPS.totalCount) || '?') +
+    '. В этой пачке дозаписано строк: ' + appended + '.');
+  tryAlertUser_('Обработка листа «' + DEALS_CONFIG.outputSheetName +
+    '» завершена. Можно формировать «Сделки в Битрикс».');
+}
+
+
+function scheduleNextDealsBatch_() {
+  deleteDealsProcessingTriggers_();
+  ScriptApp.newTrigger(DEALS_CONTINUE_FUNCTION)
+    .timeBased()
+    .after(60 * 1000)
+    .create();
+}
+
+
+function deleteDealsProcessingTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    if (trigger.getHandlerFunction() === DEALS_CONTINUE_FUNCTION) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+}
+
+
+function markSessionActive_(props, active) {
+  if (active) {
+    props.setProperty(DEALS_PROCESSING_PROPS.sessionActive, String(Date.now()));
+  } else {
+    props.deleteProperty(DEALS_PROCESSING_PROPS.sessionActive);
+  }
+}
+
+
+function isSessionActive_(props) {
+  const raw = props.getProperty(DEALS_PROCESSING_PROPS.sessionActive);
+  if (!raw) return false;
+
+  const startedAt = Number(raw);
+  if (!startedAt) return false;
+
+  // Устаревший флаг (после падения runtime) не должен блокировать обработку.
+  return (Date.now() - startedAt) <= DEALS_SESSION_STALE_MS;
+}
+
+
+function tryAlertUser_(message) {
+  try {
+    SpreadsheetApp.getUi().alert(message);
+  } catch (e) {
+    // Нет привязки к UI (например, запуск из триггера) — пишем в лог.
+    Logger.log('Сообщение пользователю (UI недоступен): ' + message);
+  }
+}
+
+
+/****************************************************
  * Сделки в Битрикс: 1 пациент + 1 филиал = 1 сделка
  ****************************************************/
 
@@ -468,6 +1012,16 @@ const BITRIX_DEALS_HEADERS = [
 
 function buildBitrixDealsSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // Лист «Сделки» должен быть полностью собран: пока в прогрессе есть
+  // «ожидает», строки листа неполны и «Сделки в Битрикс» строить нельзя.
+  const pending = getPendingPatientsCount_(ss);
+  if (pending > 0) {
+    tryAlertUser_('Лист «' + DEALS_CONFIG.outputSheetName + '» ещё не готов: не обработано пациентов — ' +
+      pending + '. Дождитесь завершения попациентной обработки или запустите «Продолжить обработку».');
+    return;
+  }
+
   const dealsSheet = getRequiredSheet_(ss, DEALS_CONFIG.outputSheetName);
   const deals = readSheetAsObjects_(dealsSheet);
   const registry = readBitrixSentUidRegistry_(ss);
@@ -1236,6 +1790,57 @@ function parseBitrixDealPlanDate_(row) {
 }
 
 
+/****************************************************
+ * Защита от лимита 50 000 символов в ячейке Google Sheets
+ ****************************************************/
+
+const CELL_VALUE_TRUNCATION_MARKER = '…[обрезано]';
+const CELL_VALUE_LENGTH_LIMIT = 49900;
+
+/**
+ * Обрезает строковое значение до лимита символов и добавляет маркер обрезки,
+ * чтобы запись в ячейку не роняла скрипт (лимит Google Sheets — 50 000).
+ * Нестроковые значения и строки короче лимита возвращаются без изменений.
+ */
+function truncateCellValue_(value, limit) {
+  if (limit === undefined || limit === null) {
+    limit = CELL_VALUE_LENGTH_LIMIT;
+  }
+  if (typeof value !== 'string' || value.length <= limit) {
+    return value;
+  }
+  return value.slice(0, limit) + CELL_VALUE_TRUNCATION_MARKER;
+}
+
+/**
+ * Прогоняет все текстовые значения двумерного массива строк через
+ * truncateCellValue_ перед setValues. Факт обрезки логируется
+ * (лист, строка, колонка, исходная длина). Массив меняется на месте.
+ */
+function truncateCellValuesForOutput_(sheetName, rows, firstDataRow, limit) {
+  if (limit === undefined || limit === null) {
+    limit = CELL_VALUE_LENGTH_LIMIT;
+  }
+  const startRow = firstDataRow || 2;
+
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    for (let c = 0; c < row.length; c++) {
+      const original = row[c];
+      if (typeof original === 'string' && original.length > limit) {
+        Logger.log(
+          'Обрезка длинного значения: лист «' + sheetName + '», строка ' + (startRow + r) +
+          ', колонка ' + (c + 1) + ', исходная длина ' + original.length + ' символов.'
+        );
+        row[c] = truncateCellValue_(original, limit);
+      }
+    }
+  }
+
+  return rows;
+}
+
+
 function writeBitrixDealsOutput_(ss, outputRows) {
   let sheet = ss.getSheetByName(DEALS_CONFIG.bitrixDealsSheetName);
 
@@ -1247,6 +1852,7 @@ function writeBitrixDealsOutput_(ss, outputRows) {
   sheet.getRange(1, 1, 1, BITRIX_DEALS_HEADERS.length).setValues([BITRIX_DEALS_HEADERS]);
 
   if (outputRows.length > 0) {
+    truncateCellValuesForOutput_(DEALS_CONFIG.bitrixDealsSheetName, outputRows, 2);
     sheet.getRange(2, 1, outputRows.length, BITRIX_DEALS_HEADERS.length).setValues(outputRows);
   }
 
@@ -1644,6 +2250,50 @@ function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient, app
 }
 
 
+/**
+ * Прогоняет все автономные (без Google Sheets) тесты скрипта реанимации и
+ * выводит сводку в лог. Запускать вручную из редактора Apps Script.
+ */
+function runReanimationTests_() {
+  const tests = [
+    testTruncateCellValue_,
+    testBitrixDealAmountThreshold_,
+    testDealsProcessingCheckpoint_,
+    testBuildUidDealRowStatusPriority_,
+    testCrossBranchRequestMatching_,
+    testCrossBranchTypeRequestMatching_,
+    testFulfillmentWindowMatching_,
+    testBitrixDealKeyByAppointmentDate_,
+    testBitrixDealUploadOrder_,
+    testInitialBitrixDealStageId_,
+    testBotulinumAppointmentType_,
+    testBitrixDealAppointmentDate_
+  ];
+
+  let passed = 0;
+  const failures = [];
+
+  tests.forEach(test => {
+    try {
+      Logger.log(test());
+      passed++;
+    } catch (err) {
+      failures.push(test.name + ': ' + ((err && err.stack) || err));
+      Logger.log('FAIL ' + test.name + ': ' + ((err && err.message) || err));
+    }
+  });
+
+  const summary = 'Итог тестов: пройдено ' + passed + ' из ' + tests.length +
+    (failures.length ? ('. Провалено: ' + failures.length) : '. Все тесты пройдены.');
+  Logger.log(summary);
+
+  if (failures.length) {
+    throw new Error(summary + '\n' + failures.join('\n'));
+  }
+  return summary;
+}
+
+
 function testBuildUidDealRowStatusPriority_() {
   const baseDate = new Date(2026, 0, 10);
   const uidGroup = {
@@ -2009,35 +2659,41 @@ function testBitrixDealKeyByAppointmentDate_() {
 
 
 function testBitrixDealAmountThreshold_() {
-  // 5. Группа «создать сделку» дешевле порога отсекается уже на листе «Сделки»
-  //    (и потому не попадёт в «Сделки в Битрикс»); на уровне порога — проходит.
-  if (MIN_BITRIX_DEAL_AMOUNT !== 40000) {
-    throw new Error('MIN_BITRIX_DEAL_AMOUNT должен быть 40000, получено ' + MIN_BITRIX_DEAL_AMOUNT + '.');
-  }
+  // Группа «создать сделку» дешевле порога отсекается уже на листе «Сделки»
+  // (и потому не попадёт в «Сделки в Битрикс»); на уровне порога — проходит.
+  // Все суммы считаются относительно константы MIN_BITRIX_DEAL_AMOUNT, а не
+  // зашитого числа: при пороге 30000 «низкая» сумма = 25000, «высокая» = 35000.
+  const below = MIN_BITRIX_DEAL_AMOUNT - 5000; // ниже порога (25000 при 30000)
+  const above = MIN_BITRIX_DEAL_AMOUNT + 5000; // выше порога (35000 при 30000)
 
   const status = DEALS_CONFIG.resultStatuses;
   const apptDate = new Date(2026, 0, 12);
   const dealRows = [
-    { status: status.createDeal, patientCode: 'P-LOW', branch: 'Ф1', appointmentDate: apptDate, amountToSell: 35000, uid: 'U-LOW' },
-    { status: status.createDeal, patientCode: 'P-HIGH', branch: 'Ф1', appointmentDate: apptDate, amountToSell: 45000, uid: 'U-HIGH' },
-    // Одна группа из двух УИД: 25000 + 25000 = 50000 → выше порога, остаётся.
-    { status: status.createDeal, patientCode: 'P-SPLIT', branch: 'Ф1', appointmentDate: apptDate, amountToSell: 25000, uid: 'U-SPLIT-1' },
-    { status: status.createDeal, patientCode: 'P-SPLIT', branch: 'Ф1', appointmentDate: apptDate, amountToSell: 25000, uid: 'U-SPLIT-2' },
+    { status: status.createDeal, patientCode: 'P-LOW', branch: 'Ф1', appointmentDate: apptDate, amountToSell: below, uid: 'U-LOW' },
+    { status: status.createDeal, patientCode: 'P-HIGH', branch: 'Ф1', appointmentDate: apptDate, amountToSell: above, uid: 'U-HIGH' },
+    // Одна группа из двух УИД: below + below >= порога → остаётся целиком,
+    // хотя каждый УИД в отдельности ниже порога.
+    { status: status.createDeal, patientCode: 'P-SPLIT', branch: 'Ф1', appointmentDate: apptDate, amountToSell: below, uid: 'U-SPLIT-1' },
+    { status: status.createDeal, patientCode: 'P-SPLIT', branch: 'Ф1', appointmentDate: apptDate, amountToSell: below, uid: 'U-SPLIT-2' },
     // Информационная строка с малой суммой не фильтруется.
     { status: status.started, patientCode: 'P-INFO', branch: 'Ф1', appointmentDate: apptDate, amountToSell: 0, uid: 'U-INFO' }
   ];
+
+  if (2 * below < MIN_BITRIX_DEAL_AMOUNT) {
+    throw new Error('Тест ожидает, что сумма двух УИД по ' + below + ' достигает порога ' + MIN_BITRIX_DEAL_AMOUNT + '.');
+  }
 
   const result = partitionDealRowsByAmountThreshold_(dealRows);
   const keptUids = new Set(result.kept.map(item => item.uid));
 
   if (keptUids.has('U-LOW')) {
-    throw new Error('Группа «создать сделку» на 35000 должна отсекаться на листе «Сделки».');
+    throw new Error('Группа «создать сделку» на ' + below + ' (< ' + MIN_BITRIX_DEAL_AMOUNT + ') должна отсекаться.');
   }
   if (!keptUids.has('U-HIGH')) {
-    throw new Error('Группа «создать сделку» на 45000 должна оставаться на листе «Сделки».');
+    throw new Error('Группа «создать сделку» на ' + above + ' (>= ' + MIN_BITRIX_DEAL_AMOUNT + ') должна оставаться.');
   }
   if (!keptUids.has('U-SPLIT-1') || !keptUids.has('U-SPLIT-2')) {
-    throw new Error('Группа из двух УИД с суммой 50000 должна оставаться целиком.');
+    throw new Error('Группа из двух УИД с суммой ' + (2 * below) + ' должна оставаться целиком.');
   }
   if (!keptUids.has('U-INFO')) {
     throw new Error('Информационные строки не должны фильтроваться по сумме.');
@@ -2045,11 +2701,217 @@ function testBitrixDealAmountThreshold_() {
   if (result.skippedGroupsCount !== 1) {
     throw new Error('Ожидалась 1 отсеянная группа, получено ' + result.skippedGroupsCount + '.');
   }
-  if (result.skippedGroupsAmount !== 35000) {
-    throw new Error('Суммарная стоимость отсеянных групп должна быть 35000, получено ' + result.skippedGroupsAmount + '.');
+  if (result.skippedGroupsAmount !== below) {
+    throw new Error('Суммарная стоимость отсеянных групп должна быть ' + below + ', получено ' + result.skippedGroupsAmount + '.');
   }
 
   return 'testBitrixDealAmountThreshold_: OK';
+}
+
+
+function testTruncateCellValue_() {
+  // 1. Строка длиннее лимита обрезается до лимита + маркер, без исключения.
+  const marker = '…[обрезано]';
+  const limit = 49900;
+  const long = 'x'.repeat(60000);
+  const out = truncateCellValue_(long);
+
+  if (out.length !== limit + marker.length) {
+    throw new Error('Ожидалась длина ' + (limit + marker.length) + ', получено ' + out.length + '.');
+  }
+  if (out.slice(-marker.length) !== marker) {
+    throw new Error('Обрезанное значение должно заканчиваться маркером «' + marker + '».');
+  }
+  if (out.slice(0, limit) !== long.slice(0, limit)) {
+    throw new Error('Первые ' + limit + ' символов должны совпадать с исходной строкой.');
+  }
+
+  // Строки короче лимита и нестроковые значения не меняются.
+  if (truncateCellValue_('короткая строка') !== 'короткая строка') {
+    throw new Error('Короткая строка не должна изменяться.');
+  }
+  const exact = 'y'.repeat(limit);
+  if (truncateCellValue_(exact) !== exact) {
+    throw new Error('Строка ровно по лимиту не должна обрезаться.');
+  }
+  if (truncateCellValue_(12345) !== 12345) {
+    throw new Error('Числовые значения должны возвращаться без изменений.');
+  }
+
+  // Кастомный лимит.
+  const short = truncateCellValue_('abcdef', 3);
+  if (short !== 'abc' + marker) {
+    throw new Error('Ожидалось «abc' + marker + '», получено «' + short + '».');
+  }
+
+  // Проверка через выходной хелпер: массив строк, факт обрезки логируется,
+  // выполнение не прерывается.
+  const rows = [['ok', long], ['короткая', 'тоже ок']];
+  truncateCellValuesForOutput_('Тестовый лист', rows, 2);
+  if (rows[0][1].length !== limit + marker.length) {
+    throw new Error('truncateCellValuesForOutput_ должен обрезать длинное значение в массиве.');
+  }
+  if (rows[1][0] !== 'короткая' || rows[1][1] !== 'тоже ок') {
+    throw new Error('truncateCellValuesForOutput_ не должен менять короткие значения.');
+  }
+
+  return 'testTruncateCellValue_: OK';
+}
+
+
+/**
+ * Строит in-memory контекст обработки из массива тестовых назначений и заявок,
+ * чтобы прогонять попациентную логику без Google Sheets.
+ */
+function buildDealsProcessingContextFromData_(appointments, requests) {
+  requests = requests || [];
+  const requestIndexes = buildRequestIndexes_(requests);
+  const nearestRequestsByClient = buildNearestRequestsByClientIndex_(requests);
+  const appointmentTypeDateIndex = buildAppointmentTypeDateIndex_(appointments);
+  const uidGroups = groupAppointmentsByUid_(appointments);
+
+  const uidGroupsByPatient = new Map();
+  Object.keys(uidGroups).forEach(uid => {
+    const group = uidGroups[uid];
+    const code = String(group.patientCode || '').trim();
+    if (!code) return;
+    if (!uidGroupsByPatient.has(code)) uidGroupsByPatient.set(code, []);
+    uidGroupsByPatient.get(code).push(group);
+  });
+
+  return {
+    isValid: true,
+    requestIndexes: requestIndexes,
+    nearestRequestsByClient: nearestRequestsByClient,
+    appointmentTypeDateIndex: appointmentTypeDateIndex,
+    uidGroupsByPatient: uidGroupsByPatient
+  };
+}
+
+
+function testDealsProcessingCheckpoint_() {
+  // 2. Чекпоинт: попациентная обработка серией пачек не дублирует строки и не
+  //    пропускает пациентов; статусы «обработан» соответствуют дозаписанным
+  //    строкам листа «Сделки». Бюджет времени — параметр (budgetMs).
+  const c = DEALS_CONFIG.appointmentColumns;
+  const treatmentDate = new Date(2026, 0, 15);
+
+  // Четыре пациента. У P-01/P-02/P-04 сумма выше порога (дадут строки),
+  // у P-03 — ниже порога (обрабатывается, но строк не даёт).
+  const highPrice = MIN_BITRIX_DEAL_AMOUNT + 10000;
+  const lowPrice = MIN_BITRIX_DEAL_AMOUNT - 5000;
+
+  function appointment(patientCode, uid, price) {
+    const row = buildReanimationTestAppointmentRow_(uid, patientCode, 'M', treatmentDate);
+    row[c.price] = price;
+    return row;
+  }
+
+  const appointments = [
+    appointment('P-02', 'U-02', highPrice),
+    appointment('P-01', 'U-01', highPrice),
+    appointment('P-04', 'U-04', highPrice),
+    appointment('P-03', 'U-03', lowPrice)
+  ];
+
+  const context = buildDealsProcessingContextFromData_(appointments, []);
+  const allCodes = ['P-01', 'P-02', 'P-03', 'P-04'];
+
+  // In-memory прогресс и приёмник строк, переиспользуемые между пачками.
+  const statusByCode = new Map(allCodes.map(code => [code, DEALS_PROGRESS_STATUS.waiting]));
+  const processedOrder = [];
+  const progress = {
+    list: function () {
+      return Array.from(statusByCode.entries()).map(entry => ({ code: entry[0], status: entry[1] }));
+    },
+    update: function (code, patch) {
+      statusByCode.set(code, patch.status);
+      if (patch.status === DEALS_PROGRESS_STATUS.done) processedOrder.push(code);
+    }
+  };
+  const appendedRows = [];
+  const sink = {
+    append: function (rows) { rows.forEach(r => appendedRows.push(r)); }
+  };
+
+  // budgetMs = 0 → как минимум один пациент за пачку, затем выход по бюджету:
+  // ровно один пациент на пачку, что моделирует штатный выход по таймеру.
+  let batches = 0;
+  let guard = 0;
+  while (progress.list().some(e => e.status === DEALS_PROGRESS_STATUS.waiting)) {
+    const res = runDealsProcessingBatch_({
+      context: context,
+      progress: progress,
+      sink: sink,
+      budgetMs: 0,
+      now: (function () { let t = 1000; return function () { return (t += 1); }; })()
+    });
+    batches++;
+    if (res.processedThisRun !== 1) {
+      throw new Error('При budgetMs=0 за пачку должен обрабатываться ровно один пациент, получено ' + res.processedThisRun + '.');
+    }
+    if (++guard > 100) throw new Error('Обработка не сходится (защита от бесконечного цикла).');
+  }
+
+  if (batches !== allCodes.length) {
+    throw new Error('Ожидалось ' + allCodes.length + ' пачек по одному пациенту, получено ' + batches + '.');
+  }
+
+  // Порядок обработки детерминирован по «Пациент.Код».
+  if (processedOrder.join(',') !== 'P-01,P-02,P-03,P-04') {
+    throw new Error('Порядок обработки должен быть по коду пациента, получено ' + processedOrder.join(',') + '.');
+  }
+
+  // Все пациенты обработаны, без пропусков и повторов.
+  if (processedOrder.length !== new Set(processedOrder).size) {
+    throw new Error('Пациенты не должны обрабатываться повторно: ' + processedOrder.join(','));
+  }
+  allCodes.forEach(code => {
+    if (statusByCode.get(code) !== DEALS_PROGRESS_STATUS.done) {
+      throw new Error('Пациент ' + code + ' не отмечен «обработан».');
+    }
+  });
+
+  // Дозаписанные строки — только по пациентам выше порога, по одной на УИД,
+  // без дублей. Столбец «Пациент.Код» — индекс 2, «УИД» — индекс 4.
+  const appendedCodes = appendedRows.map(r => String(r[2]));
+  const appendedUids = appendedRows.map(r => String(r[4]));
+  if (appendedUids.length !== new Set(appendedUids).size) {
+    throw new Error('Строки листа «Сделки» не должны дублироваться: ' + appendedUids.join(','));
+  }
+  const expectedCoded = ['P-01', 'P-02', 'P-04'].sort().join(',');
+  if (appendedCodes.slice().sort().join(',') !== expectedCoded) {
+    throw new Error('Дозаписаны должны быть только пациенты выше порога (P-01,P-02,P-04), получено ' + appendedCodes.join(','));
+  }
+
+  // Соответствие «обработан» ↔ дозаписанные строки: каждый дозаписанный код
+  // обработан; каждый обработанный либо дал строки (выше порога), либо нет
+  // (ниже порога) — но не «ожидает».
+  appendedCodes.forEach(code => {
+    if (statusByCode.get(code) !== DEALS_PROGRESS_STATUS.done) {
+      throw new Error('Дозаписан пациент ' + code + ', но он не «обработан».');
+    }
+  });
+
+  // Повторный запуск «Продолжить» после завершения не дублирует и не пропускает.
+  const before = appendedRows.length;
+  const rerun = runDealsProcessingBatch_({ context: context, progress: progress, sink: sink, budgetMs: 0, now: function () { return 1000; } });
+  if (rerun.processedThisRun !== 0 || rerun.remaining !== 0 || appendedRows.length !== before) {
+    throw new Error('Повторный запуск после завершения не должен ничего добавлять.');
+  }
+
+  // Эталон: одномоментная сборка того же контекста даёт тот же набор строк.
+  const oneShot = [];
+  context.uidGroupsByPatient.forEach(groups => {
+    groups.forEach(g => oneShot.push(buildUidDealRow_(g, context.requestIndexes, context.nearestRequestsByClient, context.appointmentTypeDateIndex)));
+  });
+  const oneShotUids = partitionDealRowsByAmountThreshold_(oneShot).kept.map(item => String(item.uid)).sort();
+  if (oneShotUids.join(',') !== appendedUids.slice().sort().join(',')) {
+    throw new Error('Набор строк попациентной обработки должен совпадать с одномоментной сборкой. Одномоментно: ' +
+      oneShotUids.join(',') + '; попациентно: ' + appendedUids.slice().sort().join(','));
+  }
+
+  return 'testDealsProcessingCheckpoint_: OK';
 }
 
 
@@ -2661,92 +3523,120 @@ function groupAppointmentsByUid_(appointments) {
  * Вывод листа "Сделки"
  ****************************************************/
 
-function writeDealsOutput_(ss, outputRows) {
-  let sheet = ss.getSheetByName(DEALS_CONFIG.outputSheetName);
+const DEALS_OUTPUT_HEADERS = [
+  'Статус',
+  'ФИО',
+  'Пациент.Код',
+  'Филиал',
+  'УИД',
+  'Кол-во услуг',
+  'Сумма назначений',
+  'Сумма к продаже',
+  'Дата назначения',
+  'Первый плановый день',
+  'Врач',
+  'Стандарт лечения',
+  'Состав назначений',
+  'Типы назначений',
+  'Номера найденных заявок',
+  'Ближайшие заявки пациента',
+  'Описание сделки',
+  'UID Plan Items JSON'
+];
 
-  if (!sheet) {
-    sheet = ss.insertSheet(DEALS_CONFIG.outputSheetName);
+
+function writeDealsOutput_(ss, outputRows) {
+  const sheet = getOrCreateSheet_(ss, DEALS_CONFIG.outputSheetName);
+
+  initDealsOutputSheet_(sheet);
+
+  if (outputRows.length > 0) {
+    appendDealsOutputRows_(sheet, outputRows);
+  }
+
+  refreshDealsOutputFilter_(sheet);
+}
+
+
+/**
+ * Готовит лист «Сделки» к дозаписи: очищает, ставит заголовки, шапку,
+ * закрепляет строку и задаёт ширины колонок. Данные не пишет.
+ */
+function initDealsOutputSheet_(sheet) {
+  if (sheet.getFilter()) {
+    sheet.getFilter().remove();
   }
 
   sheet.clear();
-
-  const headers = [
-    'Статус',
-    'ФИО',
-    'Пациент.Код',
-    'Филиал',
-    'УИД',
-    'Кол-во услуг',
-    'Сумма назначений',
-    'Сумма к продаже',
-    'Дата назначения',
-    'Первый плановый день',
-    'Врач',
-    'Стандарт лечения',
-    'Состав назначений',
-    'Типы назначений',
-    'Номера найденных заявок',
-    'Ближайшие заявки пациента',
-    'Описание сделки',
-    'UID Plan Items JSON'
-  ];
-
-  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-
-  if (outputRows.length > 0) {
-    sheet.getRange(2, 1, outputRows.length, headers.length).setValues(outputRows);
-  }
-
+  sheet.getRange(1, 1, 1, DEALS_OUTPUT_HEADERS.length).setValues([DEALS_OUTPUT_HEADERS]);
   sheet.setFrozenRows(1);
 
-  sheet.getRange(1, 1, 1, headers.length)
+  sheet.getRange(1, 1, 1, DEALS_OUTPUT_HEADERS.length)
     .setFontWeight('bold')
     .setBackground('#d9ead3')
     .setHorizontalAlignment('center');
-
-  const totalRows = Math.max(outputRows.length, 1);
-
-  sheet.getRange(2, 6, totalRows, 1).setNumberFormat('0');
-  sheet.getRange(2, 7, totalRows, 1).setNumberFormat('#,##0.00');
-  sheet.getRange(2, 8, totalRows, 1).setNumberFormat('#,##0.00');
-  sheet.getRange(2, 9, totalRows, 2).setNumberFormat('dd.MM.yyyy');
-
-  if (outputRows.length > 0) {
-    sheet.getRange(2, 12, outputRows.length, 6).setWrap(true);
-
-    const statusValues = sheet.getRange(2, 1, outputRows.length, 1).getValues();
-
-    statusValues.forEach((row, i) => {
-      const status = String(row[0] || '');
-      const range = sheet.getRange(i + 2, 1, 1, headers.length);
-
-      if (status === DEALS_CONFIG.resultStatuses.createDeal) {
-        range.setBackground('#fff2cc');
-      }
-
-      if (status === DEALS_CONFIG.resultStatuses.planned) {
-        range.setBackground('#d9ead3');
-      }
-
-      if (status === DEALS_CONFIG.resultStatuses.started) {
-        range.setBackground('#cfe2f3');
-      }
-    });
-  }
-
-  sheet.autoResizeColumns(1, headers.length);
 
   sheet.setColumnWidth(12, 450);
   sheet.setColumnWidth(14, 500);
   sheet.setColumnWidth(15, 800);
   sheet.setColumnWidth(16, 800);
   sheet.setColumnWidth(17, 800);
+}
 
+
+/**
+ * Дозаписывает (append) строки в конец листа «Сделки», прогоняя все
+ * текстовые значения через защиту от лимита 50 000 символов и применяя
+ * форматы/подсветку статусов только к добавленному диапазону.
+ * Возвращает номер первой добавленной строки.
+ */
+function appendDealsOutputRows_(sheet, rows) {
+  if (!rows || !rows.length) {
+    return sheet.getLastRow() + 1;
+  }
+
+  const firstRow = sheet.getLastRow() + 1;
+
+  truncateCellValuesForOutput_(DEALS_CONFIG.outputSheetName, rows, firstRow);
+  sheet.getRange(firstRow, 1, rows.length, DEALS_OUTPUT_HEADERS.length).setValues(rows);
+
+  sheet.getRange(firstRow, 6, rows.length, 1).setNumberFormat('0');
+  sheet.getRange(firstRow, 7, rows.length, 2).setNumberFormat('#,##0.00');
+  sheet.getRange(firstRow, 9, rows.length, 2).setNumberFormat('dd.MM.yyyy');
+  sheet.getRange(firstRow, 12, rows.length, 6).setWrap(true);
+
+  const backgrounds = rows.map(row => {
+    const status = String(row[0] || '');
+    let color = null;
+
+    if (status === DEALS_CONFIG.resultStatuses.createDeal) {
+      color = '#fff2cc';
+    } else if (status === DEALS_CONFIG.resultStatuses.planned) {
+      color = '#d9ead3';
+    } else if (status === DEALS_CONFIG.resultStatuses.started) {
+      color = '#cfe2f3';
+    }
+
+    return new Array(DEALS_OUTPUT_HEADERS.length).fill(color);
+  });
+
+  sheet.getRange(firstRow, 1, rows.length, DEALS_OUTPUT_HEADERS.length).setBackgrounds(backgrounds);
+
+  return firstRow;
+}
+
+
+/**
+ * Пересоздаёт фильтр листа «Сделки» так, чтобы он покрывал весь текущий
+ * диапазон данных (в т.ч. дозаписанные строки).
+ */
+function refreshDealsOutputFilter_(sheet) {
   if (sheet.getFilter()) {
     sheet.getFilter().remove();
   }
 
-  sheet.getRange(1, 1, Math.max(outputRows.length + 1, 1), headers.length).createFilter();
+  const lastRow = Math.max(sheet.getLastRow(), 1);
+  sheet.getRange(1, 1, lastRow, DEALS_OUTPUT_HEADERS.length).createFilter();
 }
 
 
