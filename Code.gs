@@ -421,7 +421,7 @@ function buildDealsProcessingContext_(ss) {
   const uidGroupsByPatient = new Map();
   Object.keys(uidGroups).forEach(uid => {
     const group = uidGroups[uid];
-    const code = String(group.patientCode || '').trim();
+    const code = normalizePatientCode_(group.patientCode);
     if (!code) return;
     if (!uidGroupsByPatient.has(code)) {
       uidGroupsByPatient.set(code, []);
@@ -534,7 +534,7 @@ const DEALS_SESSION_STALE_MS = 10 * 60 * 1000;
  * листа и статистику отсечки.
  */
 function processPatientDealRows_(patientCode, context) {
-  const groups = context.uidGroupsByPatient.get(String(patientCode || '').trim()) || [];
+  const groups = context.uidGroupsByPatient.get(normalizePatientCode_(patientCode)) || [];
 
   const dealRows = groups.map(uidGroup => buildUidDealRow_(
     uidGroup,
@@ -558,6 +558,19 @@ function processPatientDealRows_(patientCode, context) {
 
 function compareByPatientCode_(a, b) {
   return String(a || '').localeCompare(String(b || ''), 'ru', { numeric: true, sensitivity: 'base' });
+}
+
+
+/**
+ * Приводит код пациента к канонической строковой форме (String + trim).
+ * Единая точка нормализации: ключи uidGroupsByPatient, чтение листа прогресса
+ * и поиск строк пациента должны использовать её. Иначе искажение кода при
+ * записи/чтении Google Sheets (например, потеря ведущих нулей, когда текстовый
+ * код '00123' приводится к числу 123) рассинхронизирует прогресс и контекст
+ * обработки: пациенты помечаются «обработан», но строк не даёт ни один.
+ */
+function normalizePatientCode_(value) {
+  return String(value === null || value === undefined ? '' : value).trim();
 }
 
 
@@ -646,6 +659,20 @@ function runDealsProcessingBatch_(options) {
     (errors.length ? ('. Ошибок: ' + errors.length) : '') + '.'
   );
 
+  // Диагностика искажения кодов: пациенты «обработаны», но не дали ни строк,
+  // ни отсечённых по сумме групп. Обычно это значит, что коды на листе
+  // прогресса не совпали с ключами uidGroupsByPatient (например, Sheets
+  // потерял ведущие нули), и вся база «обработалась» вхолостую.
+  if (processedThisRun > 0 && appended === 0 && skippedGroupsCount === 0) {
+    Logger.log(
+      'ВНИМАНИЕ: за пачку обработано пациентов ' + processedThisRun +
+      ', но не дозаписано ни строки и не отсеяно ни одной группы по сумме. ' +
+      'Вероятно несоответствие кодов пациентов между листом «' +
+      DEALS_PROGRESS_SHEET_NAME + '» и данными назначений ' +
+      '(проверьте текстовый формат колонки «Пациент.Код» и ведущие нули).'
+    );
+  }
+
   return {
     ok: true,
     processedThisRun: processedThisRun,
@@ -708,6 +735,10 @@ function writeProgressSheet_(ss, roster) {
       '',
       ''
     ]);
+    // Текстовый формат колонки «Пациент.Код» ДО записи значений: иначе Sheets
+    // приводит числовые коды к числам и теряет ведущие нули ('00123' → 123),
+    // после чего чтение прогресса не совпадёт с ключами uidGroupsByPatient.
+    sheet.getRange(2, 1, rows.length, 1).setNumberFormat('@');
     sheet.getRange(2, 1, rows.length, DEALS_PROGRESS_HEADERS.length).setValues(rows);
     sheet.getRange(2, 5, rows.length, 1).setNumberFormat('dd.MM.yyyy HH:mm:ss');
   }
@@ -748,7 +779,7 @@ function createSheetProgressStore_(sheet) {
 
   const rowByCode = new Map();
   data.rows.forEach((row, i) => {
-    const code = String(row['Пациент.Код'] || '').trim();
+    const code = normalizePatientCode_(row['Пациент.Код']);
     if (code) {
       rowByCode.set(code, { index: i, status: String(row['Статус'] || '').trim() });
     }
@@ -761,7 +792,7 @@ function createSheetProgressStore_(sheet) {
       return Array.from(rowByCode.entries()).map(entry => ({ code: entry[0], status: entry[1].status }));
     },
     update: function (code, patch) {
-      patches.set(String(code || '').trim(), patch);
+      patches.set(normalizePatientCode_(code), patch);
     },
     commit: function () {
       if (!patches.size || !data.rows.length) return;
@@ -2259,6 +2290,7 @@ function runReanimationTests_() {
     testTruncateCellValue_,
     testBitrixDealAmountThreshold_,
     testDealsProcessingCheckpoint_,
+    testProgressSheetPreservesLeadingZeros_,
     testBuildUidDealRowStatusPriority_,
     testCrossBranchRequestMatching_,
     testCrossBranchTypeRequestMatching_,
@@ -2773,7 +2805,7 @@ function buildDealsProcessingContextFromData_(appointments, requests) {
   const uidGroupsByPatient = new Map();
   Object.keys(uidGroups).forEach(uid => {
     const group = uidGroups[uid];
-    const code = String(group.patientCode || '').trim();
+    const code = normalizePatientCode_(group.patientCode);
     if (!code) return;
     if (!uidGroupsByPatient.has(code)) uidGroupsByPatient.set(code, []);
     uidGroupsByPatient.get(code).push(group);
@@ -2912,6 +2944,175 @@ function testDealsProcessingCheckpoint_() {
   }
 
   return 'testDealsProcessingCheckpoint_: OK';
+}
+
+
+/**
+ * In-memory лист, моделирующий приведение типов Google Sheets: числоподобная
+ * строка ('00123') при записи в ячейку без текстового формата превращается в
+ * число (123, ведущие нули теряются); в ячейке с форматом '@' сохраняется
+ * как есть. Этого достаточно, чтобы прогнать writeProgressSheet_ и
+ * createSheetProgressStore_ без реального Spreadsheet.
+ */
+function makeFakeProgressSheet_() {
+  const grid = [];
+  const formats = [];
+
+  function ensure(r, c) {
+    while (grid.length < r) { grid.push([]); formats.push([]); }
+    while (grid[r - 1].length < c) { grid[r - 1].push(''); formats[r - 1].push(''); }
+  }
+
+  function coerce(value, format) {
+    if (format === '@') return value;
+    if (typeof value === 'string' && /^\d+$/.test(value.trim()) && value.trim() !== '') {
+      return Number(value.trim());
+    }
+    return value;
+  }
+
+  return {
+    getName: function () { return DEALS_PROGRESS_SHEET_NAME; },
+    getFilter: function () { return null; },
+    setFrozenRows: function () { return this; },
+    clear: function () { grid.length = 0; formats.length = 0; return this; },
+    getRange: function (row, col, numRows, numCols) {
+      numRows = numRows || 1;
+      numCols = numCols || 1;
+      return {
+        setNumberFormat: function (fmt) {
+          for (let i = 0; i < numRows; i++) {
+            for (let j = 0; j < numCols; j++) {
+              ensure(row + i, col + j);
+              formats[row + i - 1][col + j - 1] = fmt;
+            }
+          }
+          return this;
+        },
+        setValues: function (values) {
+          for (let i = 0; i < numRows; i++) {
+            for (let j = 0; j < numCols; j++) {
+              ensure(row + i, col + j);
+              const fmt = formats[row + i - 1][col + j - 1] || '';
+              grid[row + i - 1][col + j - 1] = coerce(values[i][j], fmt);
+            }
+          }
+          return this;
+        },
+        setValue: function (value) {
+          ensure(row, col);
+          const fmt = formats[row - 1][col - 1] || '';
+          grid[row - 1][col - 1] = coerce(value, fmt);
+          return this;
+        },
+        getValues: function () {
+          const out = [];
+          for (let i = 0; i < numRows; i++) {
+            const r = [];
+            for (let j = 0; j < numCols; j++) {
+              ensure(row + i, col + j);
+              r.push(grid[row + i - 1][col + j - 1]);
+            }
+            out.push(r);
+          }
+          return out;
+        },
+        setFontWeight: function () { return this; },
+        setBackground: function () { return this; },
+        setHorizontalAlignment: function () { return this; },
+        createFilter: function () { return {}; }
+      };
+    },
+    getDataRange: function () {
+      let maxCols = 0;
+      grid.forEach(r => { if (r.length > maxCols) maxCols = r.length; });
+      const numRows = grid.length;
+      return {
+        getValues: function () {
+          const out = [];
+          for (let i = 0; i < numRows; i++) {
+            const r = [];
+            for (let j = 0; j < maxCols; j++) {
+              r.push(grid[i][j] !== undefined ? grid[i][j] : '');
+            }
+            out.push(r);
+          }
+          return out;
+        }
+      };
+    }
+  };
+}
+
+
+function testProgressSheetPreservesLeadingZeros_() {
+  // Регресс бага: коды пациентов с ведущими нулями искажались при записи/чтении
+  // листа «Прогресс обработки» (Sheets приводил '00123' к числу 123), из-за чего
+  // код прогресса не совпадал с ключами uidGroupsByPatient — попациентная
+  // обработка «завершала» всю базу мгновенно с 0 дозаписанными строк.
+  const treatmentDate = new Date(2026, 0, 15);
+  const highPrice = MIN_BITRIX_DEAL_AMOUNT + 10000;
+
+  function appointment(patientCode, uid) {
+    const row = buildReanimationTestAppointmentRow_(uid, patientCode, 'M', treatmentDate);
+    row[DEALS_CONFIG.appointmentColumns.price] = highPrice;
+    return row;
+  }
+
+  // Контрольная проверка: фейковый лист действительно моделирует потерю нулей
+  // без текстового формата (иначе тест ничего не доказывает).
+  const control = makeFakeProgressSheet_();
+  control.getRange(1, 1, 1, 1).setValues([['00123']]);
+  if (control.getDataRange().getValues()[0][0] !== 123) {
+    throw new Error('Фейковый лист должен моделировать приведение "00123" к числу 123 без формата "@".');
+  }
+
+  const context = buildDealsProcessingContextFromData_(
+    [appointment('00123', 'U-1'), appointment('00045', 'U-2')],
+    []
+  );
+  const roster = buildPatientRoster_(context);
+
+  // Псевдо-Spreadsheet: writeProgressSheet_ получает лист через getOrCreateSheet_.
+  const sheet = makeFakeProgressSheet_();
+  const ss = {
+    getSheetByName: function () { return sheet; },
+    insertSheet: function () { return sheet; }
+  };
+
+  writeProgressSheet_(ss, roster);
+
+  // После записи с фиксом код должен сохраниться как текст '00123'.
+  const store = createSheetProgressStore_(sheet);
+  const codes = store.list().map(entry => entry.code).sort();
+  if (codes.join(',') !== '00045,00123') {
+    throw new Error('Коды с ведущими нулями должны сохраниться на листе прогресса, получено: ' + codes.join(','));
+  }
+
+  // Прогон пачки должен найти пациентов и дозаписать строки, а не завершиться вхолостую.
+  const appendedRows = [];
+  const sink = { append: function (rows) { rows.forEach(r => appendedRows.push(r)); } };
+  const result = runDealsProcessingBatch_({
+    context: context,
+    progress: store,
+    sink: sink,
+    budgetMs: 60 * 1000,
+    now: function () { return 1000; }
+  });
+
+  if (result.processedThisRun !== 2) {
+    throw new Error('Ожидалось обработать 2 пациентов, обработано ' + result.processedThisRun + '.');
+  }
+  if (result.appended !== 2) {
+    throw new Error('Ожидалось дозаписать 2 строки (по одной на пациента выше порога), дозаписано ' + result.appended + '.');
+  }
+
+  const appendedCodes = appendedRows.map(r => String(r[2])).sort();
+  if (appendedCodes.join(',') !== '00045,00123') {
+    throw new Error('Дозаписанные строки должны относиться к пациентам с исходными кодами, получено ' + appendedCodes.join(','));
+  }
+
+  return 'testProgressSheetPreservesLeadingZeros_: OK';
 }
 
 
