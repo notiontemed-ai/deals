@@ -2996,8 +2996,13 @@ function uploadBitrixDeals() {
         return;
       }
 
-      const created = createBitrixDealFromRow_(row, doctorUserMap);
+      const intersection = checkPatientDealIntersections_(row);
+      const created = createBitrixDealFromRow_(row, doctorUserMap, intersection.overrideStageId);
       const warnings = created.warnings.slice();
+
+      if (intersection.warnings.length) {
+        warnings.push.apply(warnings, intersection.warnings);
+      }
 
       try {
         const timelineComment = buildBitrixDealTimelineComment_(row);
@@ -3011,6 +3016,11 @@ function uploadBitrixDeals() {
           : String(commentErr);
 
         warnings.push('Сделка создана, но комментарий в таймлайн не добавлен: ' + commentErrorText);
+      }
+
+      const intersectionWarnings = applyPatientDealIntersectionOutcomes_(created.dealId, row, intersection);
+      if (intersectionWarnings.length) {
+        warnings.push.apply(warnings, intersectionWarnings);
       }
 
       const warningText = warnings.join('\n');
@@ -3080,7 +3090,7 @@ function findBitrixDealByHash_(dealHash) {
   return null;
 }
 
-function createBitrixDealFromRow_(row, doctorUserMap) {
+function createBitrixDealFromRow_(row, doctorUserMap, overrideStageId) {
   const warnings = [];
   const uids = splitUids_(row['УИДы'] || row['TEMED_UIDS']);
   const dealHash = String(row['Deal Hash'] || row['TEMED_DEAL_HASH'] || '').trim() || buildDealHashFromUids_(uids);
@@ -3099,7 +3109,7 @@ function createBitrixDealFromRow_(row, doctorUserMap) {
   const dealAmount = parseMoney_(row['Сумма сделки']);
   const firstPlanDateValue = row['Первый плановый день'];
   const appointmentDate = parseDateOnly_(row['Дата назначения']);
-  const initialStageId = getInitialBitrixDealStageId_(firstPlanDateValue);
+  const initialStageId = overrideStageId || getInitialBitrixDealStageId_(firstPlanDateValue);
   const patientCode = normalizePatientCodeForBitrix_(row['Пациент.Код']);
   const fields = {
     CATEGORY_ID: BITRIX_DEAL_CATEGORY_ID,
