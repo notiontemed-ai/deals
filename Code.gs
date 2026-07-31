@@ -135,8 +135,6 @@ function onOpen() {
     .addItem('Заполнить типы, коды пациентов и даты назначений в существующих сделках Bitrix', 'backfillBitrixDealAppointmentTypes')
     .addItem('Проверить поля Bitrix', 'debugBitrixDealFields')
     .addItem('Проверить дубли отправки Bitrix', 'checkBitrixDuplicateRegistry')
-    .addSeparator()
-    .addItem('Отправить итог дня в чат', 'sendDailySalesReport')
     .addToUi();
 }
 
@@ -2998,11 +2996,8 @@ function uploadBitrixDeals() {
         return;
       }
 
-      const intersectionCheck = prepareDealIntersectionCheck_(row);
-      const created = createBitrixDealFromRow_(row, doctorUserMap, intersectionCheck.overrideStageId);
+      const created = createBitrixDealFromRow_(row, doctorUserMap);
       const warnings = created.warnings.slice();
-
-      intersectionCheck.warnings.forEach(warning => warnings.push(warning));
 
       try {
         const timelineComment = buildBitrixDealTimelineComment_(row);
@@ -3017,9 +3012,6 @@ function uploadBitrixDeals() {
 
         warnings.push('Сделка создана, но комментарий в таймлайн не добавлен: ' + commentErrorText);
       }
-
-      applyDealIntersectionOutcome_(intersectionCheck, created.dealId, buildBitrixDealTitle_(row))
-        .forEach(warning => warnings.push(warning));
 
       const warningText = warnings.join('\n');
 
@@ -3088,7 +3080,7 @@ function findBitrixDealByHash_(dealHash) {
   return null;
 }
 
-function createBitrixDealFromRow_(row, doctorUserMap, overrideStageId) {
+function createBitrixDealFromRow_(row, doctorUserMap) {
   const warnings = [];
   const uids = splitUids_(row['УИДы'] || row['TEMED_UIDS']);
   const dealHash = String(row['Deal Hash'] || row['TEMED_DEAL_HASH'] || '').trim() || buildDealHashFromUids_(uids);
@@ -3107,7 +3099,7 @@ function createBitrixDealFromRow_(row, doctorUserMap, overrideStageId) {
   const dealAmount = parseMoney_(row['Сумма сделки']);
   const firstPlanDateValue = row['Первый плановый день'];
   const appointmentDate = parseDateOnly_(row['Дата назначения']);
-  const initialStageId = overrideStageId || getInitialBitrixDealStageId_(firstPlanDateValue);
+  const initialStageId = getInitialBitrixDealStageId_(firstPlanDateValue);
   const patientCode = normalizePatientCodeForBitrix_(row['Пациент.Код']);
   const fields = {
     CATEGORY_ID: BITRIX_DEAL_CATEGORY_ID,
