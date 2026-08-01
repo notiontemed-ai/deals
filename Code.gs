@@ -2774,6 +2774,8 @@ const BITRIX_DEAL_CONTACT_WINDOW_DAYS = 5;
 const BITRIX_DEAL_ASSIGNED_BY_ID = 22718;
 const BITRIX_DEAL_SMALL_AMOUNT_ASSIGNED_BY_ID = 6108;
 const BITRIX_DEAL_SMALL_AMOUNT_LIMIT = 20000;
+// Сделки «в клинике» не требуют работы операторов — у них отдельный ответственный.
+const BITRIX_DEAL_CLINIC_ASSIGNED_BY_ID = 22286;
 const BITRIX_EMPLOYEES_SHEET_NAME = 'Справочник сотрудников';
 const BITRIX_DEAL_SUCCESS_STATUSES = ['Отправлено', 'sent_to_bitrix', 'Уже существует в Bitrix'];
 
@@ -2896,7 +2898,14 @@ function testInitialBitrixDealStageId_() {
   return 'Проверка определения начальной стадии Bitrix пройдена.';
 }
 
-function getBitrixDealAssignedById_(amount) {
+// Ответственный сделки. Стадия «в клинике» приоритетнее суммы: такие сделки
+// не требуют работы операторов, поэтому сумма на выбор ответственного не влияет.
+// Без стадии (или с обычной стадией) действует прежнее правило суммы.
+function getBitrixDealAssignedById_(amount, targetStageId) {
+  if (normalizeClinicDealStageId_(targetStageId)) {
+    return BITRIX_DEAL_CLINIC_ASSIGNED_BY_ID;
+  }
+
   const value = Number(amount) || 0;
 
   if (value < BITRIX_DEAL_SMALL_AMOUNT_LIMIT) {
@@ -2904,6 +2913,91 @@ function getBitrixDealAssignedById_(amount) {
   }
 
   return BITRIX_DEAL_ASSIGNED_BY_ID;
+}
+
+// Ответственный: клинические стадии — отдельный сотрудник независимо от суммы,
+// обычные сделки — прежнее правило суммы.
+function testBitrixDealAssignedBy_() {
+  const checks = [
+    {
+      name: 'обычная сделка меньше лимита',
+      amount: 19999,
+      stageId: '',
+      expected: BITRIX_DEAL_SMALL_AMOUNT_ASSIGNED_BY_ID
+    },
+    {
+      name: 'обычная сделка ровно по лимиту',
+      amount: BITRIX_DEAL_SMALL_AMOUNT_LIMIT,
+      stageId: '',
+      expected: BITRIX_DEAL_ASSIGNED_BY_ID
+    },
+    {
+      name: 'обычная сделка больше лимита',
+      amount: 50000,
+      stageId: '',
+      expected: BITRIX_DEAL_ASSIGNED_BY_ID
+    },
+    {
+      name: 'сделка без указания стадии',
+      amount: 50000,
+      stageId: undefined,
+      expected: BITRIX_DEAL_ASSIGNED_BY_ID
+    },
+    {
+      name: 'обычная стадия «Связаться»',
+      amount: 100,
+      stageId: BITRIX_DEAL_STAGE_CONTACT,
+      expected: BITRIX_DEAL_SMALL_AMOUNT_ASSIGNED_BY_ID
+    },
+    {
+      name: 'стадия «Пересечения»',
+      amount: 50000,
+      stageId: BITRIX_DEAL_STAGE_INTERSECTION,
+      expected: BITRIX_DEAL_ASSIGNED_BY_ID
+    },
+    {
+      name: '«Записался в клинике», сумма меньше лимита',
+      amount: 100,
+      stageId: BITRIX_DEAL_STAGE_CLINIC_BOOKED,
+      expected: BITRIX_DEAL_CLINIC_ASSIGNED_BY_ID
+    },
+    {
+      name: '«Записался в клинике», сумма больше лимита',
+      amount: 50000,
+      stageId: BITRIX_DEAL_STAGE_CLINIC_BOOKED,
+      expected: BITRIX_DEAL_CLINIC_ASSIGNED_BY_ID
+    },
+    {
+      name: '«Начал в клинике», сумма меньше лимита',
+      amount: 100,
+      stageId: BITRIX_DEAL_STAGE_CLINIC_STARTED,
+      expected: BITRIX_DEAL_CLINIC_ASSIGNED_BY_ID
+    },
+    {
+      name: '«Начал в клинике», сумма больше лимита',
+      amount: 50000,
+      stageId: BITRIX_DEAL_STAGE_CLINIC_STARTED,
+      expected: BITRIX_DEAL_CLINIC_ASSIGNED_BY_ID
+    }
+  ];
+
+  checks.forEach(check => {
+    const actual = getBitrixDealAssignedById_(check.amount, check.stageId);
+    if (actual !== check.expected) {
+      throw new Error(
+        'Ошибка выбора ответственного для «' + check.name +
+        '»: ожидалось ' + check.expected + ', получено ' + actual + '.'
+      );
+    }
+  });
+
+  // Вызов без стадии сохраняет прежнее поведение по сумме.
+  if (getBitrixDealAssignedById_(19999) !== BITRIX_DEAL_SMALL_AMOUNT_ASSIGNED_BY_ID ||
+    getBitrixDealAssignedById_(20000) !== BITRIX_DEAL_ASSIGNED_BY_ID) {
+    throw new Error('Вызов getBitrixDealAssignedById_ без стадии должен работать по правилу суммы.');
+  }
+
+  return 'testBitrixDealAssignedBy_: OK';
 }
 
 
@@ -3829,7 +3923,7 @@ function createBitrixDealFromRow_(row, doctorUserMap, overrideStageId) {
   const fields = {
     CATEGORY_ID: BITRIX_DEAL_CATEGORY_ID,
     STAGE_ID: initialStageId,
-    ASSIGNED_BY_ID: getBitrixDealAssignedById_(dealAmount),
+    ASSIGNED_BY_ID: getBitrixDealAssignedById_(dealAmount, initialStageId),
     TITLE: buildBitrixDealTitle_(row),
     OPPORTUNITY: dealAmount,
     CURRENCY_ID: 'RUB',
