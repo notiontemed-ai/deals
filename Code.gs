@@ -2637,6 +2637,27 @@ const BITRIX_DEAL_SMALL_AMOUNT_LIMIT = 20000;
 const BITRIX_EMPLOYEES_SHEET_NAME = 'Справочник сотрудников';
 const BITRIX_DEAL_SUCCESS_STATUSES = ['Отправлено', 'sent_to_bitrix', 'Уже существует в Bitrix'];
 
+const BITRIX_DEAL_STAGE_INTERSECTION = 'C114:UC_C7PDQC'; // стадия «Пересечения»
+
+// Стадии, где сделка считается открытой для проверки пересечений:
+const BITRIX_INTERSECTION_CHECK_STAGE_IDS = [
+  'C114:UC_2ITBVA',        // Ожидание
+  'C114:NEW',              // Связаться
+  'C114:UC_712DNY',        // Для реанимации
+  'C114:PREPARATION',      // В работе
+  'C114:PREPAYMENT_INVOI', // Связаться позже
+  'C114:UC_C3O5EH',        // Связаться по горящей акции
+  'C114:UC_XR0QG1',        // Повторные касания. Не дозвоны
+  'C114:EXECUTING',        // Записался
+  'C114:UC_G5EXVL',        // Запись по горящей акции
+  'C114:UC_C7PDQC'         // Пересечения
+];
+// «Не вышел на связь» (C114:UC_1GZCBR) и «Отказ» (C114:UC_8I6LEA) — транзитные:
+// робот сразу переводит их в «Провал», сделки там не живут, в проверку не входят.
+
+// Из этих стадий сделки НЕ переводятся в «Пересечения» (только комментарий):
+const BITRIX_INTERSECTION_KEEP_STAGE_IDS = ['C114:EXECUTING', 'C114:UC_G5EXVL'];
+
 function getTodayDateOnly_() {
   const timeZone = Session.getScriptTimeZone();
   const todayText = Utilities.formatDate(new Date(), timeZone, 'yyyy-MM-dd');
@@ -2996,8 +3017,15 @@ function uploadBitrixDeals() {
         return;
       }
 
-      const created = createBitrixDealFromRow_(row, doctorUserMap);
-      const warnings = created.warnings.slice();
+      // Пересечения проверяются после реестра УИДов и поиска по dealHash:
+      // при пересечении новая сделка создаётся сразу в стадии «Пересечения».
+      const intersectionCheck = checkBitrixDealIntersections_(row);
+      const created = createBitrixDealFromRow_(
+        row,
+        doctorUserMap,
+        intersectionCheck.hasIntersection ? BITRIX_DEAL_STAGE_INTERSECTION : ''
+      );
+      const warnings = created.warnings.slice().concat(intersectionCheck.warnings);
 
       try {
         const timelineComment = buildBitrixDealTimelineComment_(row);
@@ -3012,6 +3040,14 @@ function uploadBitrixDeals() {
 
         warnings.push('Сделка создана, но комментарий в таймлайн не добавлен: ' + commentErrorText);
       }
+
+      // Комментарии о пересечениях и перевод старых сделок — после
+      // основной справки, чтобы она осталась первой в таймлайне.
+      warnings.push.apply(warnings, applyBitrixDealIntersectionResults_(
+        created.dealId,
+        buildBitrixDealTitle_(row),
+        intersectionCheck
+      ));
 
       const warningText = warnings.join('\n');
 
@@ -3080,7 +3116,328 @@ function findBitrixDealByHash_(dealHash) {
   return null;
 }
 
-function createBitrixDealFromRow_(row, doctorUserMap) {
+/****************************************************
+ * Проверка пересечений сделок пациента по типам назначений
+ ****************************************************/
+
+// Нормализация строки типов сделки для сравнения: остаются только
+// допустимые коды без «-»; если типов больше одного, консультация C
+// пересечением не считается (та же логика, что в Deal_Status_Sync.gs).
+function normalizeDealTypeCodesForIntersection_(value) {
+  const codes = new Set();
+
+  String(value || '').toUpperCase().split('').forEach(code => {
+    if (APPOINTMENT_TYPE_CODE_SET.has(code) && code !== '-') {
+      codes.add(code);
+    }
+  });
+
+  if (codes.size > 1) {
+    codes.delete('C');
+  }
+
+  return codes;
+}
+
+function formatAppointmentTypeCodesForOutput_(codes) {
+  const present = codes instanceof Set ? codes : new Set(codes || []);
+  return APPOINTMENT_TYPE_CODE_ORDER.filter(code => present.has(code)).join('');
+}
+
+// Пустое пересечение типов — доназначение, непустое — пересечение.
+function classifyBitrixDealIntersection_(newCodes, existingCodes) {
+  const overlap = new Set();
+
+  existingCodes.forEach(code => {
+    if (newCodes.has(code)) {
+      overlap.add(code);
+    }
+  });
+
+  return {
+    category: overlap.size ? 'intersection' : 'addition',
+    overlap: overlap
+  };
+}
+
+function shouldMoveBitrixDealToIntersectionStage_(stageId) {
+  const stage = String(stageId || '');
+
+  if (!stage || stage === BITRIX_DEAL_STAGE_INTERSECTION) {
+    return false;
+  }
+
+  return BITRIX_INTERSECTION_KEEP_STAGE_IDS.indexOf(stage) === -1;
+}
+
+function getBitrixPortalOrigin_() {
+  const baseUrl = String(
+    PropertiesService.getScriptProperties().getProperty('BITRIX_WEBHOOK_BASE_URL') || ''
+  );
+  const match = baseUrl.match(/^(https?:\/\/[^\/]+)/i);
+
+  return match ? match[1] : '';
+}
+
+function buildBitrixDealReference_(portalOrigin, dealId, title) {
+  const text = '#' + String(dealId || '') + ' «' + String(title || '').trim() + '»';
+
+  if (!portalOrigin || !dealId) {
+    return text;
+  }
+
+  return '[URL=' + portalOrigin + '/crm/deal/details/' + String(dealId) + '/]' + text + '[/URL]';
+}
+
+// Открытые сделки пациента в воронке 114. У bitrixCall_ нет пагинации,
+// поэтому запрос выполняется отдельно с проходом по start/next.
+function fetchOpenBitrixDealsByPatientCode_(patientCode) {
+  const baseUrl = PropertiesService.getScriptProperties().getProperty('BITRIX_WEBHOOK_BASE_URL');
+
+  if (!baseUrl) {
+    throw new Error('Не задано свойство BITRIX_WEBHOOK_BASE_URL');
+  }
+
+  const url = baseUrl.replace(/\/+$/, '') + '/crm.deal.list.json';
+  const filter = { CATEGORY_ID: BITRIX_DEAL_CATEGORY_ID, STAGE_ID: BITRIX_INTERSECTION_CHECK_STAGE_IDS };
+  filter[BITRIX_DEAL_PATIENT_CODE_FIELD] = patientCode;
+
+  const deals = [];
+  let start = 0;
+  let guard = 0;
+
+  while (guard++ < 100) {
+    const response = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({
+        order: { ID: 'ASC' },
+        filter: filter,
+        select: ['ID', 'TITLE', 'STAGE_ID', BITRIX_DEAL_TYPES_FIELD],
+        start: start
+      }),
+      muteHttpExceptions: true
+    });
+
+    const text = response.getContentText();
+    let data;
+
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      throw new Error('Bitrix вернул не JSON: ' + text);
+    }
+
+    if (data.error) {
+      throw new Error(data.error + ': ' + (data.error_description || ''));
+    }
+
+    const rows = Array.isArray(data.result) ? data.result : [];
+    deals.push.apply(deals, rows);
+
+    if (data.next === undefined || data.next === null || data.next === '') {
+      break;
+    }
+
+    const next = Number(data.next);
+
+    if (!isFinite(next) || next <= start) {
+      throw new Error('Bitrix вернул некорректное значение next для crm.deal.list: ' + String(data.next));
+    }
+
+    start = next;
+  }
+
+  return deals;
+}
+
+// Проверка выполняется до создания сделки. Ошибка поиска не блокирует
+// создание: она попадает в предупреждения строки листа.
+function checkBitrixDealIntersections_(row) {
+  const result = {
+    patientCode: '',
+    newCodesText: '',
+    matches: [],
+    hasIntersection: false,
+    warnings: []
+  };
+
+  const patientCode = normalizePatientCodeForBitrix_(row['Пациент.Код']);
+  const mergedTypes = mergeAppointmentTypeCodes_([row['Типы назначений'] || '']);
+
+  if (!patientCode || !mergedTypes) {
+    return result;
+  }
+
+  const newCodes = normalizeDealTypeCodesForIntersection_(mergedTypes);
+
+  if (!newCodes.size) {
+    return result;
+  }
+
+  result.patientCode = patientCode;
+  result.newCodesText = formatAppointmentTypeCodesForOutput_(newCodes);
+
+  let deals;
+
+  try {
+    deals = fetchOpenBitrixDealsByPatientCode_(patientCode);
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    Logger.log('Проверка пересечений для пациента ' + patientCode + ' не выполнена: ' + message);
+    result.warnings.push('Проверка пересечений не выполнена, сделка создана в обычной стадии: ' + message);
+    return result;
+  }
+
+  deals.forEach(deal => {
+    const dealId = String(deal.ID || '');
+
+    if (!dealId) {
+      return;
+    }
+
+    const existingCodes = normalizeDealTypeCodesForIntersection_(deal[BITRIX_DEAL_TYPES_FIELD]);
+    const classified = classifyBitrixDealIntersection_(newCodes, existingCodes);
+
+    result.matches.push({
+      id: dealId,
+      title: String(deal.TITLE || ''),
+      stageId: String(deal.STAGE_ID || ''),
+      typesText: formatAppointmentTypeCodesForOutput_(existingCodes),
+      overlapText: formatAppointmentTypeCodesForOutput_(classified.overlap),
+      category: classified.category
+    });
+
+    if (classified.category === 'intersection') {
+      result.hasIntersection = true;
+    }
+  });
+
+  return result;
+}
+
+// Комментарии и перевод стадий выполняются после успешного crm.deal.add.
+// Ошибки собираются в предупреждения — созданная сделка остаётся успешной.
+function applyBitrixDealIntersectionResults_(newDealId, newDealTitle, check) {
+  const warnings = [];
+
+  if (!newDealId || !check || !check.matches.length) {
+    return warnings;
+  }
+
+  const portalOrigin = getBitrixPortalOrigin_();
+  const newTypesText = check.newCodesText || '—';
+  const newReference = buildBitrixDealReference_(portalOrigin, newDealId, newDealTitle);
+
+  const addComment = (dealId, text, description) => {
+    try {
+      addBitrixDealComment_(dealId, text);
+    } catch (err) {
+      const message = err && err.message ? err.message : String(err);
+      warnings.push('Не добавлен комментарий ' + description + ' (сделка #' + dealId + '): ' + message);
+    }
+  };
+
+  check.matches.forEach(match => {
+    const oldTypesText = match.typesText || '—';
+    const oldReference = buildBitrixDealReference_(portalOrigin, match.id, match.title);
+
+    if (match.category === 'addition') {
+      addComment(
+        match.id,
+        'Создано доназначение: сделка ' + newReference + ', типы: ' + newTypesText +
+        '. Типы текущей сделки (' + oldTypesText + ') не пересекаются — обе сделки актуальны.',
+        'о доназначении'
+      );
+      addComment(
+        newDealId,
+        'У пациента есть активная сделка ' + oldReference + ', типы: ' + oldTypesText +
+        '. Пересечений с текущей сделкой нет — это доназначение.',
+        'о доназначении'
+      );
+      return;
+    }
+
+    const decision = '. Решите: объединить сделки или одну перевести в неактуальные.';
+    addComment(
+      match.id,
+      'ПЕРЕСЕЧЕНИЕ: ' + newReference + ', типы: ' + newTypesText +
+      '. Совпадающие типы: ' + match.overlapText + decision,
+      'о пересечении'
+    );
+    addComment(
+      newDealId,
+      'ПЕРЕСЕЧЕНИЕ: ' + oldReference + ', типы: ' + oldTypesText +
+      '. Совпадающие типы: ' + match.overlapText + decision,
+      'о пересечении'
+    );
+
+    if (!shouldMoveBitrixDealToIntersectionStage_(match.stageId)) {
+      return;
+    }
+
+    try {
+      bitrixCall_('crm.deal.update', {
+        id: match.id,
+        fields: { STAGE_ID: BITRIX_DEAL_STAGE_INTERSECTION }
+      });
+    } catch (err) {
+      const message = err && err.message ? err.message : String(err);
+      warnings.push('Сделка #' + match.id + ' не переведена в «Пересечения»: ' + message);
+    }
+  });
+
+  return warnings;
+}
+
+function testBitrixDealIntersectionClassification_() {
+  const assertEqual = (actual, expected, message) => {
+    if (actual !== expected) {
+      throw new Error(message + ' Ожидалось: ' + expected + ', получено: ' + actual + '.');
+    }
+  };
+  const classify = (newTypes, oldTypes) => {
+    const result = classifyBitrixDealIntersection_(
+      normalizeDealTypeCodesForIntersection_(newTypes),
+      normalizeDealTypeCodesForIntersection_(oldTypes)
+    );
+    return result.category + ':' + formatAppointmentTypeCodesForOutput_(result.overlap);
+  };
+
+  assertEqual(formatAppointmentTypeCodesForOutput_(normalizeDealTypeCodesForIntersection_('ml')), 'LM',
+    'Типы должны приводиться к верхнему регистру и сортироваться по APPOINTMENT_TYPE_CODE_ORDER.');
+  assertEqual(formatAppointmentTypeCodesForOutput_(normalizeDealTypeCodesForIntersection_('L-X')), 'L',
+    'Недопустимые символы и «-» должны отбрасываться.');
+  assertEqual(formatAppointmentTypeCodesForOutput_(normalizeDealTypeCodesForIntersection_('LC')), 'L',
+    'При нескольких типах консультация C должна исключаться.');
+  assertEqual(formatAppointmentTypeCodesForOutput_(normalizeDealTypeCodesForIntersection_('C')), 'C',
+    'Единственная консультация C должна сохраняться.');
+
+  assertEqual(classify('F', 'ML'), 'addition:', 'Сделки ML и F не пересекаются — доназначение.');
+  assertEqual(classify('MF', 'ML'), 'intersection:M', 'Сделки ML и MF пересекаются по типу M.');
+  assertEqual(classify('LC', 'C'), 'addition:', 'Консультация C при наличии других услуг не даёт пересечения.');
+  assertEqual(classify('C', 'C'), 'intersection:C', 'Две сделки только с консультацией пересекаются.');
+  assertEqual(classify('ML', 'ML'), 'intersection:LM', 'Полное совпадение типов даёт пересечение по обоим типам.');
+  assertEqual(classify('ML', ''), 'addition:', 'Сделка без типов считается доназначением.');
+
+  const stageChecks = [
+    { stage: 'C114:NEW', expected: true, name: 'обычная стадия переводится в «Пересечения»' },
+    { stage: 'C114:EXECUTING', expected: false, name: '«Записался» не переводится' },
+    { stage: 'C114:UC_G5EXVL', expected: false, name: '«Запись по горящей акции» не переводится' },
+    { stage: BITRIX_DEAL_STAGE_INTERSECTION, expected: false, name: 'сделка уже в «Пересечениях»' },
+    { stage: '', expected: false, name: 'пустая стадия не переводится' }
+  ];
+
+  stageChecks.forEach(check => {
+    if (shouldMoveBitrixDealToIntersectionStage_(check.stage) !== check.expected) {
+      throw new Error('Проверка перевода стадии не пройдена: ' + check.name + '.');
+    }
+  });
+
+  return 'Проверка классификации пересечений сделок пройдена.';
+}
+
+function createBitrixDealFromRow_(row, doctorUserMap, overrideStageId) {
   const warnings = [];
   const uids = splitUids_(row['УИДы'] || row['TEMED_UIDS']);
   const dealHash = String(row['Deal Hash'] || row['TEMED_DEAL_HASH'] || '').trim() || buildDealHashFromUids_(uids);
@@ -3099,7 +3456,7 @@ function createBitrixDealFromRow_(row, doctorUserMap) {
   const dealAmount = parseMoney_(row['Сумма сделки']);
   const firstPlanDateValue = row['Первый плановый день'];
   const appointmentDate = parseDateOnly_(row['Дата назначения']);
-  const initialStageId = getInitialBitrixDealStageId_(firstPlanDateValue);
+  const initialStageId = overrideStageId || getInitialBitrixDealStageId_(firstPlanDateValue);
   const patientCode = normalizePatientCodeForBitrix_(row['Пациент.Код']);
   const fields = {
     CATEGORY_ID: BITRIX_DEAL_CATEGORY_ID,
