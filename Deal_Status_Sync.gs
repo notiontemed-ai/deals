@@ -17,6 +17,10 @@
  * из отбираемых стадий воронки 114 (DSS_ACTUALIZATION_STAGE_IDS).
  * Стадия «Не вышел на связь» учитывается только в течение
  * 30 дней с даты создания сделки.
+ *
+ * Из стадии «Записался в клинике» рассчитывается только
+ * переход в «Дошёл»: перевод в «Записался» движением
+ * вперёд не является.
  ****************************************************/
 
 const DSS_CONFIG = Object.freeze({
@@ -60,10 +64,16 @@ const DSS_ACTUALIZATION_STAGE_IDS = [
   'C114:PREPAYMENT_INVOI', // Cвязаться позже
   'C114:UC_XR0QG1',        // Повторные касание Не дозвоны
   'C114:EXECUTING',        // Записался
+  'C114:UC_LZO5RC',        // Записался в клинике
   'C114:UC_1GZCBR'         // Не вышел на связь (только свежие сделки)
 ];
 const DSS_RECENT_ONLY_STAGE_ID = 'C114:UC_1GZCBR';
 const DSS_RECENT_ONLY_DAYS = 30;
+// Стадии сделок, созданных по назначениям пациентов, уже находящихся в клинике.
+// «Начал в клинике» — транзитная: робот Bitrix сразу переводит её в «Дошёл»,
+// поэтому в актуализацию она не попадает.
+const DSS_STAGE_CLINIC_BOOKED = 'C114:UC_LZO5RC';   // Записался в клинике
+const DSS_STAGE_CLINIC_STARTED = 'C114:UC_WR9VJQ';  // Начал в клинике
 // Ежедневный отчёт по воронке 114 в групповой чат Bitrix.
 // Отчётные сутки: [reportDate 06:00; reportDate + 1 день 06:00),
 // поэтому запуск до 06:00 относится к предыдущему календарному дню.
@@ -256,6 +266,7 @@ function DSS_actualizeDeals() {
       else { result = 'Подходящие заявки не найдены'; reason = 'После нижней границы совпадений нет.'; }
       if (!si) { result = 'Недостаточно данных'; reason = 'Не найдены стадии воронки.'; errors += 1; targetId = ''; }
       if (targetId === String(d['Текущая стадия ID'] || '') || String(d['Текущая стадия'] || '') === DSS_CONFIG.stageNames.attended) { targetId = ''; targetName = ''; result = 'Без изменений'; reason = 'Обратный переход не рассчитывается или стадия уже целевая.'; }
+      else if (DSS_isClinicBookedToBookedTransition_(d['Текущая стадия ID'], targetId, si)) { targetId = ''; targetName = ''; result = 'Без изменений'; reason = 'Из «Записался в клинике» перевод в «Записался» движением вперёд не является.'; }
       if (targetId) targetName = si.byId.get(targetId) || result;
     }
     if (result === 'Записался' && targetId) booked += 1; else if (result === 'Дошёл' && targetId) attended += 1; else unchanged += 1;
@@ -264,6 +275,13 @@ function DSS_actualizeDeals() {
   DSS_writeActualization_(ss, rows); DSS_log_(ss, 'Актуализация сделок', now);
   DSS_alert_('Актуализация сделок завершена.', 'Сделок проверено: ' + deals.length + '.\nПредлагается «Записался»: ' + booked + '.\nПредлагается «Дошёл»: ' + attended + '.\nБез изменений: ' + unchanged + '.\nСтрок с ошибками данных: ' + errors + '.');
 }
+// Из «Записался в клинике» рассчитывается только переход в «Дошёл»:
+// перевод в «Записался» движением вперёд не является.
+function DSS_isClinicBookedToBookedTransition_(currentStageId, targetId, stageInfo) {
+  return String(currentStageId || '') === DSS_STAGE_CLINIC_BOOKED &&
+    Boolean(targetId) && Boolean(stageInfo) && targetId === stageInfo.bookedId;
+}
+
 function DSS_sendChangesToBitrixWithConfirmation() {
   const ui = SpreadsheetApp.getUi(); if (ui.alert('Отправка изменений в Bitrix', 'Будут обновлены стадии сделок, отмеченных флажком «Отправить» на листе «Актуализация сделок». Продолжить?', ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
   const ss = SpreadsheetApp.getActiveSpreadsheet(); const sheet = ss.getSheetByName(DSS_CONFIG.sheets.actualization); if (!sheet || sheet.getLastRow() < 2) throw new Error('Нет подготовленных изменений для отправки.');
@@ -346,12 +364,16 @@ function DSS_collectDailyReport_(reportWindow) {
     label: reportWindow.label,
     newDeals: {
       total: DSS_reportTotal_(), contact: DSS_reportTotal_(),
-      waiting: DSS_reportTotal_(), intersection: DSS_reportTotal_()
+      waiting: DSS_reportTotal_(), intersection: DSS_reportTotal_(),
+      clinicBooked: DSS_reportTotal_(), clinicStarted: DSS_reportTotal_()
     },
     booked: DSS_reportTotal_(), won: DSS_reportTotal_(), lost: DSS_reportTotal_(),
     lostRefusal: DSS_reportTotal_(), lostNoContact: DSS_reportTotal_(),
     activities: { created: 0, completed: 0 }
   };
+
+  const history = DSS_collectDailyReportStageHistory_(base, reportWindow);
+  const creationStages = DSS_firstStageByDeal_(history);
 
   const created = DSS_list_(base, 'crm.deal.list', {
     order: { ID: 'ASC' },
@@ -360,15 +382,21 @@ function DSS_collectDailyReport_(reportWindow) {
   });
   created.forEach(deal => {
     const amount = DSS_reportAmount_(deal.OPPORTUNITY);
-    const stageId = String(deal.STAGE_ID || '');
+    // Группировка по стадии создания, а не по текущей: «Начал в клинике»
+    // робот мгновенно переводит в «Дошёл». Без истории берётся текущая стадия.
+    const stageId = creationStages.get(String(deal.ID || '')) || String(deal.STAGE_ID || '');
     DSS_reportAdd_(report.newDeals.total, amount);
     // Прочие стадии учитываются только в общем счётчике новых сделок.
     if (stageId === DSS_REPORT_STAGE_CONTACT) DSS_reportAdd_(report.newDeals.contact, amount);
     else if (stageId === DSS_REPORT_STAGE_WAITING) DSS_reportAdd_(report.newDeals.waiting, amount);
     else if (stageId === DSS_REPORT_STAGE_INTERSECTION) DSS_reportAdd_(report.newDeals.intersection, amount);
+    else if (stageId === DSS_STAGE_CLINIC_BOOKED) DSS_reportAdd_(report.newDeals.clinicBooked, amount);
+    else if (stageId === DSS_STAGE_CLINIC_STARTED) DSS_reportAdd_(report.newDeals.clinicStarted, amount);
   });
 
-  const transitions = DSS_collectDailyReportTransitions_(base, reportWindow);
+  // «Дошёл» считается по всем переходам суток: сделки, созданные сегодня
+  // в «Начал в клинике», сознательно попадают и в «Новые сделки», и в «Дошёл».
+  const transitions = DSS_classifyStageTransitions_(history);
   const ids = new Set();
   Object.keys(transitions).forEach(key => transitions[key].forEach(id => ids.add(id)));
   const opportunities = DSS_fetchDealOpportunities_(base, Array.from(ids));
@@ -383,15 +411,27 @@ function DSS_collectDailyReport_(reportWindow) {
   return report;
 }
 
-// Переходы стадий за сутки: учитываются изменения и скриптом, и операторами.
-// Повторные переходы в ту же стадию считаются один раз (уникальные ID сделок).
-function DSS_collectDailyReportTransitions_(base, reportWindow) {
-  return DSS_classifyStageTransitions_(DSS_listStageHistory_(base, {
+// История стадий за сутки: учитываются изменения и скриптом, и операторами.
+// Из неё считаются и стадии создания новых сделок, и переходы за сутки.
+function DSS_collectDailyReportStageHistory_(base, reportWindow) {
+  return DSS_listStageHistory_(base, {
     entityTypeId: 2,
     order: { ID: 'ASC' },
     filter: { CATEGORY_ID: DSS_CONFIG.categoryId, '>=CREATED_TIME': reportWindow.from, '<CREATED_TIME': reportWindow.to },
     select: ['ID', 'OWNER_ID', 'CREATED_TIME', 'CATEGORY_ID', 'STAGE_ID']
-  }));
+  });
+}
+
+// Стадия создания сделки — первая запись crm.stagehistory.list по сделке.
+// История приходит в порядке возрастания ID, поэтому берётся первое вхождение.
+function DSS_firstStageByDeal_(history) {
+  const out = new Map();
+  history.forEach(item => {
+    const dealId = String(item.OWNER_ID || '');
+    if (!dealId || out.has(dealId)) return;
+    out.set(dealId, String(item.STAGE_ID || ''));
+  });
+  return out;
 }
 
 // history — записи истории стадий за сутки в порядке возрастания ID.
@@ -500,6 +540,8 @@ function DSS_formatDailyReportMessage_(report) {
     '• Связаться: ' + DSS_reportValue_(report.newDeals.contact),
     '• Ожидание: ' + DSS_reportValue_(report.newDeals.waiting),
     '• Пересечения: ' + DSS_reportValue_(report.newDeals.intersection),
+    '• Записался в клинике: ' + DSS_reportValue_(report.newDeals.clinicBooked),
+    '• Начал в клинике: ' + DSS_reportValue_(report.newDeals.clinicStarted),
     '',
     'Движение по стадиям:',
     '• Записался: ' + DSS_reportValue_(report.booked),
@@ -551,11 +593,15 @@ function DSS_testDailyReportTransitions_() {
     // Сделка 4: дважды «Записался» за сутки — считается один раз.
     entry('4', DSS_REPORT_STAGE_BOOKED), entry('4', DSS_REPORT_STAGE_WAITING), entry('4', DSS_REPORT_STAGE_BOOKED),
     // Сделка 5: «Записался → Дошёл».
-    entry('5', DSS_REPORT_STAGE_BOOKED), entry('5', DSS_REPORT_STAGE_WON)
+    entry('5', DSS_REPORT_STAGE_BOOKED), entry('5', DSS_REPORT_STAGE_WON),
+    // Сделка 6: создана в «Начал в клинике», робот сразу перевёл её в «Дошёл».
+    entry('6', DSS_STAGE_CLINIC_STARTED), entry('6', DSS_REPORT_STAGE_WON),
+    // Сделка 7: создана в «Записался в клинике» и за сутки не двигалась.
+    entry('7', DSS_STAGE_CLINIC_BOOKED)
   ]);
 
   const checks = [
-    ['booked', '4,5'], ['won', '5'], ['lost', '1,2,3'], ['lostRefusal', '1'], ['lostNoContact', '2']
+    ['booked', '4,5'], ['won', '5,6'], ['lost', '1,2,3'], ['lostRefusal', '1'], ['lostNoContact', '2']
   ];
   checks.forEach(check => {
     if (list(result[check[0]]) !== check[1]) {
@@ -563,25 +609,82 @@ function DSS_testDailyReportTransitions_() {
     }
   });
   if (result.booked.has('1')) throw new Error('Сделка «Отказ → Провал» не должна попадать в движение по стадиям.');
+  if (result.booked.has('6') || result.booked.has('7')) throw new Error('Стадии «в клинике» не попадают в «Записался» блока «Движение».');
 
   return 'DSS_testDailyReportTransitions_: OK';
+}
+
+// Группировка новых сделок ведётся по стадии создания: «Начал в клинике»
+// робот мгновенно переводит в «Дошёл», по текущей стадии её не посчитать.
+function DSS_testDailyReportCreationStages_() {
+  const entry = (dealId, stageId) => ({ OWNER_ID: dealId, STAGE_ID: stageId });
+  const stages = DSS_firstStageByDeal_([
+    entry('6', DSS_STAGE_CLINIC_STARTED), entry('6', DSS_REPORT_STAGE_WON),
+    entry('7', DSS_STAGE_CLINIC_BOOKED),
+    entry('8', DSS_REPORT_STAGE_CONTACT), entry('8', DSS_REPORT_STAGE_BOOKED)
+  ]);
+
+  const checks = [
+    ['6', DSS_STAGE_CLINIC_STARTED, 'Сделка «Начал в клинике → Дошёл» считается по стадии создания.'],
+    ['7', DSS_STAGE_CLINIC_BOOKED, 'Сделка без переходов считается по своей стадии создания.'],
+    ['8', DSS_REPORT_STAGE_CONTACT, 'Стадия создания не подменяется более поздним переходом.']
+  ];
+  checks.forEach(check => {
+    if (stages.get(check[0]) !== check[1]) {
+      throw new Error(check[2] + ' Ожидалось: ' + check[1] + ', получено: ' + stages.get(check[0]) + '.');
+    }
+  });
+  if (stages.has('9')) throw new Error('Для сделки без записей истории стадия создания не определяется — берётся текущая.');
+
+  return 'DSS_testDailyReportCreationStages_: OK';
+}
+
+// «Записался в клинике» → «Дошёл» рассчитывается, → «Записался» — нет.
+function DSS_testClinicBookedTransitions_() {
+  const stageInfo = { bookedId: DSS_REPORT_STAGE_BOOKED, attendedId: DSS_REPORT_STAGE_WON };
+
+  if (!DSS_isClinicBookedToBookedTransition_(DSS_STAGE_CLINIC_BOOKED, DSS_REPORT_STAGE_BOOKED, stageInfo)) {
+    throw new Error('Переход «Записался в клинике» → «Записался» выполняться не должен.');
+  }
+  if (DSS_isClinicBookedToBookedTransition_(DSS_STAGE_CLINIC_BOOKED, DSS_REPORT_STAGE_WON, stageInfo)) {
+    throw new Error('Переход «Записался в клинике» → «Дошёл» должен рассчитываться.');
+  }
+  if (DSS_isClinicBookedToBookedTransition_(DSS_REPORT_STAGE_CONTACT, DSS_REPORT_STAGE_BOOKED, stageInfo)) {
+    throw new Error('Из обычных стадий перевод в «Записался» должен рассчитываться.');
+  }
+  if (DSS_isClinicBookedToBookedTransition_(DSS_STAGE_CLINIC_BOOKED, '', stageInfo)) {
+    throw new Error('Без целевой стадии проверка не применяется.');
+  }
+  if (DSS_ACTUALIZATION_STAGE_IDS.indexOf(DSS_STAGE_CLINIC_BOOKED) === -1) {
+    throw new Error('«Записался в клинике» должна попадать в актуализацию.');
+  }
+  if (DSS_ACTUALIZATION_STAGE_IDS.indexOf(DSS_STAGE_CLINIC_STARTED) !== -1) {
+    throw new Error('«Начал в клинике» — транзитная стадия, в актуализацию не попадает.');
+  }
+
+  return 'DSS_testClinicBookedTransitions_: OK';
 }
 
 function DSS_testDailyReportMessage_() {
   const total = (count, amount) => ({ count, amount });
   const message = DSS_formatDailyReportMessage_({
     label: '31.07',
-    newDeals: { total: total(14, 486000), contact: total(8, 290000), waiting: total(4, 122000), intersection: total(2, 74000) },
+    newDeals: {
+      total: total(20, 640000), contact: total(8, 290000), waiting: total(4, 122000), intersection: total(2, 74000),
+      clinicBooked: total(3, 82000), clinicStarted: total(3, 72000)
+    },
     booked: total(9, 312000), won: total(6, 214000), lost: total(9, 254000),
     lostRefusal: total(4, 96000), lostNoContact: total(5, 158000),
     activities: { created: 37, completed: 29 }
   });
   const expected = [
     '📊 Итоги дня 31.07', '',
-    'Новые сделки: 14 на 486 000 ₽',
+    'Новые сделки: 20 на 640 000 ₽',
     '• Связаться: 8 на 290 000 ₽',
     '• Ожидание: 4 на 122 000 ₽',
-    '• Пересечения: 2 на 74 000 ₽', '',
+    '• Пересечения: 2 на 74 000 ₽',
+    '• Записался в клинике: 3 на 82 000 ₽',
+    '• Начал в клинике: 3 на 72 000 ₽', '',
     'Движение по стадиям:',
     '• Записался: 9 на 312 000 ₽', '',
     'Финализировано:',
@@ -595,7 +698,10 @@ function DSS_testDailyReportMessage_() {
 
   const zero = DSS_formatDailyReportMessage_({
     label: '01.08',
-    newDeals: { total: DSS_reportTotal_(), contact: DSS_reportTotal_(), waiting: DSS_reportTotal_(), intersection: DSS_reportTotal_() },
+    newDeals: {
+      total: DSS_reportTotal_(), contact: DSS_reportTotal_(), waiting: DSS_reportTotal_(),
+      intersection: DSS_reportTotal_(), clinicBooked: DSS_reportTotal_(), clinicStarted: DSS_reportTotal_()
+    },
     booked: DSS_reportTotal_(), won: DSS_reportTotal_(), lost: DSS_reportTotal_(),
     lostRefusal: DSS_reportTotal_(), lostNoContact: DSS_reportTotal_(),
     activities: { created: 0, completed: 0 }
