@@ -18,6 +18,9 @@
  *   начиная с даты назначения → "Записался в клинике" (C114:UC_LZO5RC).
  * При выполнении обоих условий побеждает "Начал в клинике".
  * AI-справка для таких сделок не запрашивается.
+ * В сделку "Записался в клинике" записывается дата плановой
+ * заявки: поле "Записан на дату" (UF_CRM_1739201665696),
+ * по нему Deal_Status_Sync.gs контролирует пропуск записи.
  *
  * Сопоставление:
  * - Пациент.Код = КлиентКод
@@ -419,6 +422,9 @@ const BITRIX_DEALS_HEADERS = [
   'Ошибка',
   'AI request_id',
   'AI updated_at',
+  // Дата плановой заявки для стадии «Записался в клинике»: уходит в поле
+  // Bitrix «Записан на дату» (UF_CRM_1739201665696).
+  'Записан на дату',
   // Колонка добавляется последней: форматирование листа опирается на номера колонок.
   'Целевая стадия'
 ];
@@ -467,6 +473,7 @@ function buildBitrixDealsSheet() {
         amount: 0,
         firstPlanDate: null,
         appointmentDate: null,
+        bookedDate: null,
         doctors: [],
         uids: [],
         compositions: [],
@@ -486,6 +493,14 @@ function buildBitrixDealsSheet() {
 
     if (planDate && (!group.firstPlanDate || planDate < group.firstPlanDate)) {
       group.firstPlanDate = planDate;
+    }
+
+    // Сделка «в клинике» собирается из строк одной стадии, поэтому дата
+    // записи берётся по ближайшей плановой заявке среди её УИДов.
+    const bookedDate = parseDateOnly_(row['Дата плановой заявки']);
+
+    if (bookedDate && (!group.bookedDate || bookedDate < group.bookedDate)) {
+      group.bookedDate = bookedDate;
     }
 
     addUniqueText_(group.doctors, row['Врач']);
@@ -562,6 +577,7 @@ function buildBitrixDealsSheet() {
         '',
         '',
         '',
+        group.targetStageId === BITRIX_DEAL_STAGE_CLINIC_BOOKED ? (group.bookedDate || '') : '',
         group.targetStageId || ''
       ];
     });
@@ -1207,6 +1223,8 @@ function writeBitrixDealsOutput_(ss, outputRows) {
   sheet.getRange(2, 8, totalRows, 2).setNumberFormat('dd.MM.yyyy');
   const aiUpdatedAtColumn = BITRIX_DEALS_HEADERS.indexOf('AI updated_at') + 1;
   sheet.getRange(2, aiUpdatedAtColumn, totalRows, 1).setNumberFormat('dd.MM.yyyy HH:mm:ss');
+  const bookedDateColumn = BITRIX_DEALS_HEADERS.indexOf('Записан на дату') + 1;
+  sheet.getRange(2, bookedDateColumn, totalRows, 1).setNumberFormat('dd.MM.yyyy');
 
   if (outputRows.length > 0) {
     sheet.getRange(2, 12, outputRows.length, 12).setWrap(true);
@@ -1527,6 +1545,12 @@ function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient) {
     resultStatus = DEALS_CONFIG.resultStatuses.clinicBooked;
   }
 
+  // Дата плановой заявки, из-за которой выбрана стадия «Записался в клинике»:
+  // ближайшая из совпавших плановых заявок. Уходит в поле «Записан на дату».
+  const bookedRequestDate = resultStatus === DEALS_CONFIG.resultStatuses.clinicBooked
+    ? findNearestPlannedRequestDate_(matchedRequests)
+    : null;
+
   // Сделка создаётся по любому статусу, поэтому сумма к продаже равна
   // сумме назначений: она уходит в OPPORTUNITY и в конструктор КП.
   const amountToSell = amountTotal;
@@ -1581,9 +1605,31 @@ function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient) {
       Array.from(matchedRequestNumbers).join(', '),
       nearestRequestsText,
       description,
-      buildUidPlanItemsJson_(uidGroup)
+      buildUidPlanItemsJson_(uidGroup),
+      bookedRequestDate || ''
     ]
   };
+}
+
+
+// Ближайшая по дате плановая заявка из совпавших: именно она делает
+// пациента записанным, её дата уходит в «Записан на дату».
+function findNearestPlannedRequestDate_(matchedRequests) {
+  let nearest = null;
+
+  matchedRequests.forEach(req => {
+    if (!req || !isPlannedRequestState_(req.state)) {
+      return;
+    }
+
+    const date = parseDateOnly_(req.startDate);
+
+    if (date && (!nearest || date < nearest)) {
+      nearest = date;
+    }
+  });
+
+  return nearest;
 }
 
 
@@ -2278,7 +2324,9 @@ function writeDealsOutput_(ss, outputRows) {
     'Номера найденных заявок',
     'Ближайшие заявки пациента',
     'Описание сделки',
-    'UID Plan Items JSON'
+    'UID Plan Items JSON',
+    // Колонка добавляется последней: форматирование листа опирается на номера колонок.
+    'Дата плановой заявки'
   ];
 
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
@@ -2300,6 +2348,7 @@ function writeDealsOutput_(ss, outputRows) {
   sheet.getRange(2, 7, totalRows, 1).setNumberFormat('#,##0.00');
   sheet.getRange(2, 8, totalRows, 1).setNumberFormat('#,##0.00');
   sheet.getRange(2, 9, totalRows, 2).setNumberFormat('dd.MM.yyyy');
+  sheet.getRange(2, headers.indexOf('Дата плановой заявки') + 1, totalRows, 1).setNumberFormat('dd.MM.yyyy');
 
   if (outputRows.length > 0) {
     sheet.getRange(2, 12, outputRows.length, 6).setWrap(true);
@@ -2716,6 +2765,9 @@ const BITRIX_DEAL_CATEGORY_ID = 114;
 const BITRIX_DEAL_TYPES_FIELD = 'UF_CRM_1784225678';
 const BITRIX_DEAL_PATIENT_CODE_FIELD = 'UF_CRM_1783751141';
 const BITRIX_DEAL_APPOINTMENT_DATE_FIELD = 'UF_CRM_1784267448';
+// «Записан на дату» — дата плановой заявки, по которой сделка считается записанной.
+// Поле типа «дата» без времени, по нему контролируется пропуск записи.
+const BITRIX_DEAL_BOOKED_DATE_FIELD = 'UF_CRM_1739201665696';
 const BITRIX_DEAL_STAGE_CONTACT = 'C114:NEW';
 const BITRIX_DEAL_STAGE_WAITING = 'C114:UC_2ITBVA';
 const BITRIX_DEAL_CONTACT_WINDOW_DAYS = 5;
@@ -2732,6 +2784,10 @@ const BITRIX_DEAL_STAGE_CLINIC_BOOKED = 'C114:UC_LZO5RC';  // Записался
 // «Начал в клинике» — транзитная: робот Bitrix сразу переводит её в «Дошёл».
 const BITRIX_DEAL_STAGE_CLINIC_STARTED = 'C114:UC_WR9VJQ'; // Начал в клинике
 
+// Стадия для пациентов, слетевших с записи: заявка на дату записи не состоялась,
+// новой плановой заявки с совпадающими типами услуг нет.
+const BITRIX_DEAL_STAGE_MISSED_APPOINTMENT = 'C114:UC_VMJ62D'; // Пропустил запись
+
 // Стадии, где сделка считается открытой для проверки пересечений:
 const BITRIX_INTERSECTION_CHECK_STAGE_IDS = [
   'C114:UC_2ITBVA',        // Ожидание
@@ -2744,6 +2800,7 @@ const BITRIX_INTERSECTION_CHECK_STAGE_IDS = [
   'C114:EXECUTING',        // Записался
   'C114:UC_G5EXVL',        // Запись по горящей акции
   'C114:UC_LZO5RC',        // Записался в клинике
+  'C114:UC_VMJ62D',        // Пропустил запись
   'C114:UC_C7PDQC'         // Пересечения
 ];
 // «Не вышел на связь» (C114:UC_1GZCBR) и «Отказ» (C114:UC_8I6LEA) — транзитные:
@@ -2752,6 +2809,8 @@ const BITRIX_INTERSECTION_CHECK_STAGE_IDS = [
 // её в «Дошёл», открытых сделок в ней не бывает.
 
 // Из этих стадий сделки НЕ переводятся в «Пересечения» (только комментарий):
+// «Пропустил запись» в список не входит — действующей записи там нет,
+// поэтому при пересечении типов сделка переводится в «Пересечения» на общих основаниях.
 const BITRIX_INTERSECTION_KEEP_STAGE_IDS = [
   'C114:EXECUTING',
   'C114:UC_G5EXVL',
@@ -3551,6 +3610,7 @@ function testBitrixDealIntersectionClassification_() {
     { stage: 'C114:EXECUTING', expected: false, name: '«Записался» не переводится' },
     { stage: 'C114:UC_G5EXVL', expected: false, name: '«Запись по горящей акции» не переводится' },
     { stage: BITRIX_DEAL_STAGE_CLINIC_BOOKED, expected: false, name: '«Записался в клинике» не переводится' },
+    { stage: BITRIX_DEAL_STAGE_MISSED_APPOINTMENT, expected: true, name: '«Пропустил запись» переводится в «Пересечения»' },
     { stage: BITRIX_DEAL_STAGE_INTERSECTION, expected: false, name: 'сделка уже в «Пересечениях»' },
     { stage: '', expected: false, name: 'пустая стадия не переводится' }
   ];
@@ -3568,6 +3628,14 @@ function testBitrixDealIntersectionClassification_() {
   if (BITRIX_INTERSECTION_CHECK_STAGE_IDS.indexOf(BITRIX_DEAL_STAGE_CLINIC_STARTED) !== -1 ||
     BITRIX_INTERSECTION_KEEP_STAGE_IDS.indexOf(BITRIX_DEAL_STAGE_CLINIC_STARTED) !== -1) {
     throw new Error('«Начал в клинике» — транзитная стадия и в списки пересечений не входит.');
+  }
+
+  if (BITRIX_INTERSECTION_CHECK_STAGE_IDS.indexOf(BITRIX_DEAL_STAGE_MISSED_APPOINTMENT) === -1) {
+    throw new Error('«Пропустил запись» должна участвовать в проверке пересечений.');
+  }
+
+  if (BITRIX_INTERSECTION_KEEP_STAGE_IDS.indexOf(BITRIX_DEAL_STAGE_MISSED_APPOINTMENT) !== -1) {
+    throw new Error('«Пропустил запись» не удерживает сделку: при пересечении она переводится в «Пересечения».');
   }
 
   return 'Проверка классификации пересечений сделок пройдена.';
@@ -3654,7 +3722,73 @@ function testClinicDealStageMapping_() {
     throw new Error('Колонка «Целевая стадия» должна оставаться последней.');
   }
 
+  if (BITRIX_DEALS_HEADERS.indexOf('Записан на дату') !== BITRIX_DEALS_HEADERS.length - 2) {
+    throw new Error('Колонка «Записан на дату» должна идти перед «Целевой стадией».');
+  }
+
   return 'testClinicDealStageMapping_: OK';
+}
+
+
+// «Записан на дату» заполняется датой плановой заявки, выбравшей стадию
+// «Записался в клинике»; для прочих стадий поле остаётся пустым.
+function testClinicBookedRequestDate_() {
+  const baseDate = new Date(2026, 0, 10);
+  const uidGroup = {
+    uid: 'TEST-UID-BOOKED-DATE',
+    branch: 'Тестовый филиал',
+    patient: 'Тестовый пациент',
+    patientCode: 'P-001',
+    doctor: 'Тестовый врач',
+    standard: 'Тестовый стандарт',
+    firstTreatmentDate: baseDate,
+    items: [
+      { treatmentDate: baseDate, nomenclature: 'Услуга 1', price: 1000, typeCode: 'L' },
+      { treatmentDate: baseDate, nomenclature: 'Услуга 2', price: 1000, typeCode: 'M' }
+    ]
+  };
+  const bookedDateIndex = 18;
+  const buildRow = requests => buildUidDealRow_(uidGroup, buildRequestIndexes_(requests), new Map());
+
+  const booked = buildRow([
+    buildUidStatusPriorityTestRequest_('Услуга 2', 'Запланирована', new Date(2026, 0, 20), 'P-001', 'TEST-M-LATE'),
+    buildUidStatusPriorityTestRequest_('Услуга 1', 'Запланирована', new Date(2026, 0, 14), 'P-001', 'TEST-L-NEAR')
+  ]);
+
+  if (booked.status !== DEALS_CONFIG.resultStatuses.clinicBooked) {
+    throw new Error('Плановые заявки должны давать статус «записался в клинике».');
+  }
+
+  const bookedDate = booked.row[bookedDateIndex];
+
+  if (!bookedDate || bookedDate.getTime() !== new Date(2026, 0, 14).getTime()) {
+    throw new Error('В «Записан на дату» должна попадать ближайшая плановая заявка 14.01.2026.');
+  }
+
+  const started = buildRow([
+    buildUidStatusPriorityTestRequest_('Услуга 1', 'Начато', baseDate, 'P-001', 'TEST-L-START'),
+    buildUidStatusPriorityTestRequest_('Услуга 2', 'Запланирована', new Date(2026, 0, 14), 'P-001', 'TEST-M-PLAN')
+  ]);
+
+  if (started.status !== DEALS_CONFIG.resultStatuses.clinicStarted) {
+    throw new Error('Начатая заявка должна давать статус «начал в клинике».');
+  }
+
+  if (started.row[bookedDateIndex] !== '') {
+    throw new Error('Для «Начал в клинике» дата записи не заполняется.');
+  }
+
+  const noRequests = buildRow([]);
+
+  if (noRequests.row[bookedDateIndex] !== '') {
+    throw new Error('Для обычной сделки дата записи не заполняется.');
+  }
+
+  if (findNearestPlannedRequestDate_([]) !== null) {
+    throw new Error('Без плановых заявок дата записи не определяется.');
+  }
+
+  return 'testClinicBookedRequestDate_: OK';
 }
 
 // Приоритет стадий при создании: «Записался/Начал в клинике» выше
@@ -3719,6 +3853,18 @@ function createBitrixDealFromRow_(row, doctorUserMap, overrideStageId) {
     fields[BITRIX_DEAL_PATIENT_CODE_FIELD] = patientCode;
   } else {
     warnings.push('В сделке не указан Пациент.Код.');
+  }
+
+  // «Записан на дату» заполняется только при создании в «Записался в клинике»:
+  // это дата плановой заявки, из-за которой выбрана эта стадия.
+  if (initialStageId === BITRIX_DEAL_STAGE_CLINIC_BOOKED) {
+    const bookedDate = parseDateForBitrix_(row['Записан на дату']);
+
+    if (bookedDate) {
+      fields[BITRIX_DEAL_BOOKED_DATE_FIELD] = bookedDate;
+    } else {
+      warnings.push('В сделке «Записался в клинике» не определена дата плановой заявки для поля «Записан на дату».');
+    }
   }
 
   if (phone) {
