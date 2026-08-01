@@ -10,10 +10,14 @@
  *
  * Одна строка на листе "Сделки" = один УИД назначения.
  *
- * УИД НЕ требует сделки, если:
- * - есть заявка "Начато" / "Выполнена" в день назначения;
- * - или есть плановая заявка на эту услугу на любую будущую дату
- *   начиная с даты назначения.
+ * Сделка создаётся по каждому УИД. Если пациент уже в клинике,
+ * сделка создаётся сразу в целевой стадии воронки 114:
+ * - есть заявка "Начато" / "Выполнена" в день назначения
+ *   → "Начал в клинике" (C114:UC_WR9VJQ);
+ * - есть плановая заявка на эту услугу на любую будущую дату
+ *   начиная с даты назначения → "Записался в клинике" (C114:UC_LZO5RC).
+ * При выполнении обоих условий побеждает "Начал в клинике".
+ * AI-справка для таких сделок не запрашивается.
  *
  * Сопоставление:
  * - Пациент.Код = КлиентКод
@@ -31,6 +35,9 @@
 
 const MIN_BITRIX_DEAL_AMOUNT = 20000;
 const AI_PROCESSING_TIMEOUT_SECONDS = 180;
+// Финальный статус AI-обработки для сделок «в клинике»: справка не запрашивается,
+// строка не ждёт n8n и не попадает в повторные отправки.
+const AI_STATUS_NOT_REQUIRED = 'Не требуется';
 const APPOINTMENT_TYPE_CODE_ORDER = ['L', 'M', 'S', 'F', 'C', 'D', 'U', 'P', 'B'];
 const APPOINTMENT_TYPE_CODE_SET = new Set(APPOINTMENT_TYPE_CODE_ORDER.concat('-'));
 
@@ -107,8 +114,17 @@ const DEALS_CONFIG = {
     'не состоялся'
   ],
 
+  // Статусы строк листа «Сделки». Сделка создаётся по любому статусу,
+  // «в клинике» отличаются только целевой стадией Bitrix.
   resultStatuses: {
     createDeal: 'Создать сделку',
+    clinicBooked: 'Сделка: записался в клинике',
+    clinicStarted: 'Сделка: начал в клинике'
+  },
+
+  // Подписи состояний заявок в текстовых колонках листа «Сделки».
+  // К статусам строк отношения не имеют.
+  requestStateLabels: {
     planned: 'Запланировано',
     started: 'Начато'
   },
@@ -345,8 +361,8 @@ function buildDealsSheet() {
     .sort((a, b) => {
       const statusOrder = {
         [DEALS_CONFIG.resultStatuses.createDeal]: 1,
-        [DEALS_CONFIG.resultStatuses.started]: 2,
-        [DEALS_CONFIG.resultStatuses.planned]: 3
+        [DEALS_CONFIG.resultStatuses.clinicStarted]: 2,
+        [DEALS_CONFIG.resultStatuses.clinicBooked]: 3
       };
 
       const statusDiff = (statusOrder[a.status] || 99) - (statusOrder[b.status] || 99);
@@ -402,7 +418,9 @@ const BITRIX_DEALS_HEADERS = [
   'Bitrix sent_at',
   'Ошибка',
   'AI request_id',
-  'AI updated_at'
+  'AI updated_at',
+  // Колонка добавляется последней: форматирование листа опирается на номера колонок.
+  'Целевая стадия'
 ];
 
 
@@ -415,7 +433,12 @@ function buildBitrixDealsSheet() {
   const groups = new Map();
 
   deals.forEach(row => {
-    if (String(row['Статус'] || '').trim() !== DEALS_CONFIG.resultStatuses.createDeal) {
+    const status = String(row['Статус'] || '').trim();
+    // Сделка создаётся по любому статусу листа «Сделки»; статусы «в клинике»
+    // отличаются только целевой стадией Bitrix.
+    const targetStageId = getClinicDealStageIdForStatus_(status);
+
+    if (status !== DEALS_CONFIG.resultStatuses.createDeal && !targetStageId) {
       return;
     }
 
@@ -432,11 +455,12 @@ function buildBitrixDealsSheet() {
       return;
     }
 
-    const dealKey = buildBitrixDealKey_(patientCode, branch);
+    const dealKey = buildBitrixDealKey_(patientCode, branch, targetStageId);
 
     if (!groups.has(dealKey)) {
       groups.set(dealKey, {
         dealKey,
+        targetStageId,
         patientCode,
         patientName: String(row['ФИО'] || '').trim(),
         branch,
@@ -508,7 +532,8 @@ function buildBitrixDealsSheet() {
       return [
         group.dealKey,
         'Новая',
-        'Не запрошено',
+        // Для сделок «в клинике» AI-справка не запрашивается: статус сразу финальный.
+        group.targetStageId ? AI_STATUS_NOT_REQUIRED : 'Не запрошено',
         group.patientCode,
         group.patientName,
         group.branch,
@@ -536,7 +561,8 @@ function buildBitrixDealsSheet() {
         '',
         '',
         '',
-        ''
+        '',
+        group.targetStageId || ''
       ];
     });
 
@@ -556,6 +582,12 @@ function requestAiSummariesForBitrixDeals() {
     const sendStatus = String(row['Статус отправки'] || '').trim();
     const aiStatus = String(row['AI статус'] || '').trim();
     const aiUpdatedAt = row['AI updated_at'];
+
+    // Сделки «в клинике» в n8n не отправляются и в ретраи не попадают.
+    if (isAiSkippedBitrixDealRow_(row)) {
+      return;
+    }
+
     const canRequestAi =
       aiStatus === 'Не запрошено' ||
       aiStatus === 'error' ||
@@ -714,7 +746,17 @@ function logAiContextBatch_(batchNumber, items, result) {
 }
 
 
+// AI-справка пропускается для сделок «в клинике»: признаком служит
+// финальный статус «Не требуется» либо заполненная целевая стадия.
+function isAiSkippedBitrixDealRow_(row) {
+  return String(row['AI статус'] || '').trim() === AI_STATUS_NOT_REQUIRED ||
+    Boolean(normalizeClinicDealStageId_(row['Целевая стадия']));
+}
+
+
 function isAiProcessingExpired_(aiStatus, aiUpdatedAt) {
+  // Таймаут считается только для «processing»: финальные статусы,
+  // включая «Не требуется», под ретраи не попадают.
   if (String(aiStatus || '').trim() !== 'processing') {
     return false;
   }
@@ -774,7 +816,9 @@ function buildFinalBitrixDescriptions() {
     const aiStatus = String(row['AI статус'] || '').trim();
     const currentDescription = String(row['Описание для Bitrix'] || '').trim();
 
-    if (aiStatus !== 'done' || currentDescription) {
+    // «Не требуется» — финальный статус сделок «в клинике»: описание
+    // собирается сразу, без ожидания AI-справки.
+    if ((aiStatus !== 'done' && aiStatus !== AI_STATUS_NOT_REQUIRED) || currentDescription) {
       return;
     }
 
@@ -841,8 +885,13 @@ function formatAiSummaryForBitrix_(value) {
   return text;
 }
 
-function buildBitrixDealKey_(patientCode, branch) {
-  return String(patientCode || '').trim() + '|' + String(branch || '').trim();
+// Целевая стадия входит в ключ: сделки «в клинике» не смешиваются
+// с обычной сделкой того же пациента и филиала.
+function buildBitrixDealKey_(patientCode, branch, targetStageId) {
+  const key = String(patientCode || '').trim() + '|' + String(branch || '').trim();
+  const stage = String(targetStageId || '').trim();
+
+  return stage ? key + '|' + stage : key;
 }
 
 
@@ -1470,15 +1519,17 @@ function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient) {
 
   // Статус определяется на уровне всего УИД: достаточно любого совпадения
   // по любой услуге из состава УИД, с приоритетом "Начато" выше "Запланировано".
+  // Этот же приоритет определяет целевую стадию Bitrix: при выполнении обоих
+  // условий сделка создаётся в «Начал в клинике».
   if (matchedRequests.some(req => isStartedOrCompletedRequestState_(req.state))) {
-    resultStatus = DEALS_CONFIG.resultStatuses.started;
+    resultStatus = DEALS_CONFIG.resultStatuses.clinicStarted;
   } else if (matchedRequests.some(req => isPlannedRequestState_(req.state))) {
-    resultStatus = DEALS_CONFIG.resultStatuses.planned;
+    resultStatus = DEALS_CONFIG.resultStatuses.clinicBooked;
   }
 
-  const amountToSell = resultStatus === DEALS_CONFIG.resultStatuses.createDeal
-    ? amountTotal
-    : 0;
+  // Сделка создаётся по любому статусу, поэтому сумма к продаже равна
+  // сумме назначений: она уходит в OPPORTUNITY и в конструктор КП.
+  const amountToSell = amountTotal;
 
   const appointmentComposition = buildAppointmentCompositionText_(uidGroup.items);
   const appointmentTypeCodes = buildAppointmentTypeCodes_(uidGroup.items);
@@ -1561,14 +1612,16 @@ function testBuildUidDealRowStatusPriority_() {
       requests: [
         buildUidStatusPriorityTestRequest_('Услуга 3', 'Запланирована', new Date(2026, 0, 12), 'P-001')
       ],
-      expectedStatus: DEALS_CONFIG.resultStatuses.planned
+      expectedStatus: DEALS_CONFIG.resultStatuses.clinicBooked,
+      expectedStageId: BITRIX_DEAL_STAGE_CLINIC_BOOKED
     },
     {
       name: 'начатая заявка только на одну услугу',
       requests: [
         buildUidStatusPriorityTestRequest_('Услуга 4', 'Начато', baseDate, 'P-001')
       ],
-      expectedStatus: DEALS_CONFIG.resultStatuses.started
+      expectedStatus: DEALS_CONFIG.resultStatuses.clinicStarted,
+      expectedStageId: BITRIX_DEAL_STAGE_CLINIC_STARTED
     },
     {
       name: 'плановая и начатая заявки на разные услуги',
@@ -1576,16 +1629,29 @@ function testBuildUidDealRowStatusPriority_() {
         buildUidStatusPriorityTestRequest_('Услуга 1', 'Запланирована', new Date(2026, 0, 12), 'P-001'),
         buildUidStatusPriorityTestRequest_('Услуга 5', 'Начато', baseDate, 'P-001')
       ],
-      expectedStatus: DEALS_CONFIG.resultStatuses.started
+      expectedStatus: DEALS_CONFIG.resultStatuses.clinicStarted,
+      expectedStageId: BITRIX_DEAL_STAGE_CLINIC_STARTED
+    },
+    {
+      name: 'оба условия по одной и той же услуге',
+      requests: [
+        buildUidStatusPriorityTestRequest_('Услуга 2', 'Запланирована', new Date(2026, 0, 15), 'P-001', 'TEST-M-PLAN'),
+        buildUidStatusPriorityTestRequest_('Услуга 2', 'Начато', baseDate, 'P-001', 'TEST-M-START')
+      ],
+      expectedStatus: DEALS_CONFIG.resultStatuses.clinicStarted,
+      expectedStageId: BITRIX_DEAL_STAGE_CLINIC_STARTED
     },
     {
       name: 'нет подходящих заявок',
       requests: [
         buildUidStatusPriorityTestRequest_('Другая услуга', 'Запланирована', new Date(2026, 0, 12), 'P-001')
       ],
-      expectedStatus: DEALS_CONFIG.resultStatuses.createDeal
+      expectedStatus: DEALS_CONFIG.resultStatuses.createDeal,
+      expectedStageId: ''
     }
   ];
+
+  const amountToSellIndex = 7;
 
   checks.forEach(check => {
     const row = buildUidDealRow_(
@@ -1603,6 +1669,28 @@ function testBuildUidDealRowStatusPriority_() {
         '", получено "' +
         row.status +
         '".'
+      );
+    }
+
+    const stageId = getClinicDealStageIdForStatus_(row.status);
+
+    if (stageId !== check.expectedStageId) {
+      throw new Error(
+        'Проверка целевой стадии УИД не пройдена: ' +
+        check.name +
+        '. Ожидалось "' +
+        check.expectedStageId +
+        '", получено "' +
+        stageId +
+        '".'
+      );
+    }
+
+    // Сделка создаётся по любому статусу, поэтому сумма к продаже всегда полная.
+    if (row.row[amountToSellIndex] !== 5000) {
+      throw new Error(
+        'Сумма к продаже должна равняться сумме назначений: ' + check.name +
+        '. Получено ' + row.row[amountToSellIndex] + '.'
       );
     }
   });
@@ -1645,7 +1733,7 @@ function testCrossBranchRequestMatching_() {
     new Map()
   );
 
-  if (row.status !== DEALS_CONFIG.resultStatuses.planned) {
+  if (row.status !== DEALS_CONFIG.resultStatuses.clinicBooked) {
     throw new Error(
       'Тест 7 не пройден: заявка в другом филиале с кабинетом ФТЛ должна подходить. Получено: ' +
       row.status
@@ -1688,7 +1776,7 @@ function testCrossBranchTypeRequestMatching_() {
     new Map()
   );
 
-  if (row.status !== DEALS_CONFIG.resultStatuses.planned) {
+  if (row.status !== DEALS_CONFIG.resultStatuses.clinicBooked) {
     throw new Error(
       'Тест 8 не пройден: заявка в другом филиале должна сопоставляться по типу M. Получено: ' +
       row.status
@@ -1718,7 +1806,7 @@ function buildCrossBranchMatchingTestRequest_(options) {
 }
 
 
-function buildUidStatusPriorityTestRequest_(nomenclature, state, startDate, clientCode) {
+function buildUidStatusPriorityTestRequest_(nomenclature, state, startDate, clientCode, number) {
   const c = DEALS_CONFIG.requestColumns;
   const row = {};
 
@@ -1728,7 +1816,7 @@ function buildUidStatusPriorityTestRequest_(nomenclature, state, startDate, clie
   row[c.state] = state;
   row[c.startDate] = startDate;
   row[c.endDate] = '';
-  row[c.number] = 'TEST-' + nomenclature;
+  row[c.number] = number || ('TEST-' + nomenclature);
   row[c.nomenclature] = nomenclature;
   row[c.cabinet] = '';
   row.typeCode = nomenclature === 'Другая услуга' ? 'D' : {
@@ -2226,11 +2314,11 @@ function writeDealsOutput_(ss, outputRows) {
         range.setBackground('#fff2cc');
       }
 
-      if (status === DEALS_CONFIG.resultStatuses.planned) {
+      if (status === DEALS_CONFIG.resultStatuses.clinicBooked) {
         range.setBackground('#d9ead3');
       }
 
-      if (status === DEALS_CONFIG.resultStatuses.started) {
+      if (status === DEALS_CONFIG.resultStatuses.clinicStarted) {
         range.setBackground('#cfe2f3');
       }
     });
@@ -2308,11 +2396,11 @@ function isStartedOrCompletedRequestState_(state) {
 
 function normalizeOutputState_(state) {
   if (isStartedOrCompletedRequestState_(state)) {
-    return DEALS_CONFIG.resultStatuses.started;
+    return DEALS_CONFIG.requestStateLabels.started;
   }
 
   if (isPlannedRequestState_(state)) {
-    return DEALS_CONFIG.resultStatuses.planned;
+    return DEALS_CONFIG.requestStateLabels.planned;
   }
 
   return String(state || '').trim();
@@ -2639,6 +2727,11 @@ const BITRIX_DEAL_SUCCESS_STATUSES = ['Отправлено', 'sent_to_bitrix', 
 
 const BITRIX_DEAL_STAGE_INTERSECTION = 'C114:UC_C7PDQC'; // стадия «Пересечения»
 
+// Стадии для назначений, по которым пациент уже в клинике.
+const BITRIX_DEAL_STAGE_CLINIC_BOOKED = 'C114:UC_LZO5RC';  // Записался в клинике
+// «Начал в клинике» — транзитная: робот Bitrix сразу переводит её в «Дошёл».
+const BITRIX_DEAL_STAGE_CLINIC_STARTED = 'C114:UC_WR9VJQ'; // Начал в клинике
+
 // Стадии, где сделка считается открытой для проверки пересечений:
 const BITRIX_INTERSECTION_CHECK_STAGE_IDS = [
   'C114:UC_2ITBVA',        // Ожидание
@@ -2650,13 +2743,46 @@ const BITRIX_INTERSECTION_CHECK_STAGE_IDS = [
   'C114:UC_XR0QG1',        // Повторные касания. Не дозвоны
   'C114:EXECUTING',        // Записался
   'C114:UC_G5EXVL',        // Запись по горящей акции
+  'C114:UC_LZO5RC',        // Записался в клинике
   'C114:UC_C7PDQC'         // Пересечения
 ];
 // «Не вышел на связь» (C114:UC_1GZCBR) и «Отказ» (C114:UC_8I6LEA) — транзитные:
 // робот сразу переводит их в «Провал», сделки там не живут, в проверку не входят.
+// «Начал в клинике» (C114:UC_WR9VJQ) — тоже транзитная: робот сразу переводит
+// её в «Дошёл», открытых сделок в ней не бывает.
 
 // Из этих стадий сделки НЕ переводятся в «Пересечения» (только комментарий):
-const BITRIX_INTERSECTION_KEEP_STAGE_IDS = ['C114:EXECUTING', 'C114:UC_G5EXVL'];
+const BITRIX_INTERSECTION_KEEP_STAGE_IDS = [
+  'C114:EXECUTING',
+  'C114:UC_G5EXVL',
+  'C114:UC_LZO5RC'
+];
+
+// Целевая стадия по статусу строки листа «Сделки».
+// Пустая строка — обычная сделка со стандартной логикой стадий.
+function getClinicDealStageIdForStatus_(status) {
+  const text = String(status || '').trim();
+
+  if (text === DEALS_CONFIG.resultStatuses.clinicStarted) {
+    return BITRIX_DEAL_STAGE_CLINIC_STARTED;
+  }
+
+  if (text === DEALS_CONFIG.resultStatuses.clinicBooked) {
+    return BITRIX_DEAL_STAGE_CLINIC_BOOKED;
+  }
+
+  return '';
+}
+
+// Целевая стадия из листа «Сделки в Битрикс»: принимаются только
+// стадии «в клинике», чтобы столбец не подменял обычную логику.
+function normalizeClinicDealStageId_(value) {
+  const stage = String(value || '').trim();
+
+  return stage === BITRIX_DEAL_STAGE_CLINIC_STARTED || stage === BITRIX_DEAL_STAGE_CLINIC_BOOKED
+    ? stage
+    : '';
+}
 
 function getTodayDateOnly_() {
   const timeZone = Session.getScriptTimeZone();
@@ -3023,7 +3149,7 @@ function uploadBitrixDeals() {
       const created = createBitrixDealFromRow_(
         row,
         doctorUserMap,
-        intersectionCheck.hasIntersection ? BITRIX_DEAL_STAGE_INTERSECTION : ''
+        resolveBitrixDealStageOverride_(row, intersectionCheck.hasIntersection)
       );
       const warnings = created.warnings.slice().concat(intersectionCheck.warnings);
 
@@ -3424,6 +3550,7 @@ function testBitrixDealIntersectionClassification_() {
     { stage: 'C114:NEW', expected: true, name: 'обычная стадия переводится в «Пересечения»' },
     { stage: 'C114:EXECUTING', expected: false, name: '«Записался» не переводится' },
     { stage: 'C114:UC_G5EXVL', expected: false, name: '«Запись по горящей акции» не переводится' },
+    { stage: BITRIX_DEAL_STAGE_CLINIC_BOOKED, expected: false, name: '«Записался в клинике» не переводится' },
     { stage: BITRIX_DEAL_STAGE_INTERSECTION, expected: false, name: 'сделка уже в «Пересечениях»' },
     { stage: '', expected: false, name: 'пустая стадия не переводится' }
   ];
@@ -3434,8 +3561,115 @@ function testBitrixDealIntersectionClassification_() {
     }
   });
 
+  if (BITRIX_INTERSECTION_CHECK_STAGE_IDS.indexOf(BITRIX_DEAL_STAGE_CLINIC_BOOKED) === -1) {
+    throw new Error('«Записался в клинике» должна участвовать в проверке пересечений.');
+  }
+
+  if (BITRIX_INTERSECTION_CHECK_STAGE_IDS.indexOf(BITRIX_DEAL_STAGE_CLINIC_STARTED) !== -1 ||
+    BITRIX_INTERSECTION_KEEP_STAGE_IDS.indexOf(BITRIX_DEAL_STAGE_CLINIC_STARTED) !== -1) {
+    throw new Error('«Начал в клинике» — транзитная стадия и в списки пересечений не входит.');
+  }
+
   return 'Проверка классификации пересечений сделок пройдена.';
 }
+
+
+// Маппинг «условие → целевая стадия», приоритет стадии при пересечении
+// и пропуск AI-справки для сделок «в клинике».
+function testClinicDealStageMapping_() {
+  const assertEqual = (actual, expected, message) => {
+    if (actual !== expected) {
+      throw new Error(message + ' Ожидалось: "' + expected + '", получено: "' + actual + '".');
+    }
+  };
+
+  assertEqual(
+    getClinicDealStageIdForStatus_(DEALS_CONFIG.resultStatuses.clinicStarted),
+    BITRIX_DEAL_STAGE_CLINIC_STARTED,
+    'Статус «начал в клинике» должен давать стадию «Начал в клинике».'
+  );
+  assertEqual(
+    getClinicDealStageIdForStatus_(DEALS_CONFIG.resultStatuses.clinicBooked),
+    BITRIX_DEAL_STAGE_CLINIC_BOOKED,
+    'Статус «записался в клинике» должен давать стадию «Записался в клинике».'
+  );
+  assertEqual(
+    getClinicDealStageIdForStatus_(DEALS_CONFIG.resultStatuses.createDeal),
+    '',
+    'Обычный статус не должен переопределять стадию.'
+  );
+  assertEqual(getClinicDealStageIdForStatus_(''), '', 'Пустой статус не должен переопределять стадию.');
+
+  assertEqual(
+    normalizeClinicDealStageId_(BITRIX_DEAL_STAGE_INTERSECTION),
+    '',
+    'Через колонку «Целевая стадия» принимаются только стадии «в клинике».'
+  );
+
+  // Стадия «в клинике» побеждает «Пересечения», обычная сделка — нет.
+  assertEqual(
+    resolveBitrixDealStageOverride_({ 'Целевая стадия': BITRIX_DEAL_STAGE_CLINIC_BOOKED }, true),
+    BITRIX_DEAL_STAGE_CLINIC_BOOKED,
+    'При пересечении сделка «в клинике» остаётся в своей стадии.'
+  );
+  assertEqual(
+    resolveBitrixDealStageOverride_({ 'Целевая стадия': BITRIX_DEAL_STAGE_CLINIC_STARTED }, true),
+    BITRIX_DEAL_STAGE_CLINIC_STARTED,
+    'При пересечении сделка «начал в клинике» остаётся в своей стадии.'
+  );
+  assertEqual(
+    resolveBitrixDealStageOverride_({ 'Целевая стадия': '' }, true),
+    BITRIX_DEAL_STAGE_INTERSECTION,
+    'Обычная сделка при пересечении создаётся в «Пересечениях».'
+  );
+  assertEqual(
+    resolveBitrixDealStageOverride_({ 'Целевая стадия': '' }, false),
+    '',
+    'Без пересечения обычная сделка использует стандартную логику стадий.'
+  );
+
+  // Пропуск AI: ни отправки в n8n, ни ожидания, ни ретраев.
+  if (!isAiSkippedBitrixDealRow_({ 'AI статус': AI_STATUS_NOT_REQUIRED, 'Целевая стадия': '' })) {
+    throw new Error('Статус «Не требуется» должен исключать строку из отправки в n8n.');
+  }
+  if (!isAiSkippedBitrixDealRow_({ 'AI статус': 'Не запрошено', 'Целевая стадия': BITRIX_DEAL_STAGE_CLINIC_STARTED })) {
+    throw new Error('Строка с целевой стадией «в клинике» не должна отправляться в n8n.');
+  }
+  if (isAiSkippedBitrixDealRow_({ 'AI статус': 'Не запрошено', 'Целевая стадия': '' })) {
+    throw new Error('Обычная сделка должна отправляться в n8n.');
+  }
+  if (isAiProcessingExpired_(AI_STATUS_NOT_REQUIRED, new Date(2000, 0, 1))) {
+    throw new Error('Статус «Не требуется» не должен считаться просроченным.');
+  }
+
+  // Ключ группировки разводит обычную сделку и сделки «в клинике».
+  const patientKey = buildBitrixDealKey_('P-001', 'Темед Казань', '');
+  const clinicKey = buildBitrixDealKey_('P-001', 'Темед Казань', BITRIX_DEAL_STAGE_CLINIC_BOOKED);
+  if (patientKey === clinicKey) {
+    throw new Error('Сделка «в клинике» должна получать отдельный DealKey.');
+  }
+  assertEqual(patientKey, 'P-001|Темед Казань', 'Ключ обычной сделки не должен меняться.');
+
+  if (BITRIX_DEALS_HEADERS.indexOf('Целевая стадия') !== BITRIX_DEALS_HEADERS.length - 1) {
+    throw new Error('Колонка «Целевая стадия» должна оставаться последней.');
+  }
+
+  return 'testClinicDealStageMapping_: OK';
+}
+
+// Приоритет стадий при создании: «Записался/Начал в клинике» выше
+// «Пересечений» — пациент уже в клинике, разбор не нужен.
+// Пересечение в этом случае фиксируется только комментариями.
+function resolveBitrixDealStageOverride_(row, hasIntersection) {
+  const clinicStageId = normalizeClinicDealStageId_(row['Целевая стадия']);
+
+  if (clinicStageId) {
+    return clinicStageId;
+  }
+
+  return hasIntersection ? BITRIX_DEAL_STAGE_INTERSECTION : '';
+}
+
 
 function createBitrixDealFromRow_(row, doctorUserMap, overrideStageId) {
   const warnings = [];
