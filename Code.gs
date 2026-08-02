@@ -22,6 +22,19 @@
  * заявки: поле "Записан на дату" (UF_CRM_1739201665696),
  * по нему Deal_Status_Sync.gs контролирует пропуск записи.
  *
+ * Судьбу всех УИДов пациента (в пределах "пациент + филиал")
+ * решает записанность курсовых услуг — магнитотерапии S
+ * и лазеротерапии L:
+ * - А: среди записанных УИДов есть S или L → одна сделка
+ *   "в клинике" со ВСЕМИ УИДами пациента, включая незаписанные;
+ * - Б: записанные есть, курса среди них нет → две сделки:
+ *   записанные УИДы "в клинике", остальные — операторская сделка
+ *   с комментарием о записи на другие услуги; друг для друга
+ *   эти две сделки пересечением не считаются;
+ * - В: записанных УИДов нет → одна операторская сделка.
+ * Консультация C в этих правилах не участвует: её записанность
+ * не делает УИД записанным.
+ *
  * Сопоставление:
  * - Пациент.Код = КлиентКод
  * - сначала кабинет заявки:
@@ -43,6 +56,17 @@ const AI_PROCESSING_TIMEOUT_SECONDS = 180;
 const AI_STATUS_NOT_REQUIRED = 'Не требуется';
 const APPOINTMENT_TYPE_CODE_ORDER = ['L', 'M', 'S', 'F', 'C', 'D', 'U', 'P', 'B'];
 const APPOINTMENT_TYPE_CODE_SET = new Set(APPOINTMENT_TYPE_CODE_ORDER.concat('-'));
+
+// Курсовые услуги: магнитотерапия S и лазеротерапия L. Записанность УИДов
+// с этими типами решает судьбу всех остальных УИДов пациента.
+const COURSE_APPOINTMENT_TYPE_CODES = ['S', 'L'];
+// Консультация в правилах группировки не участвует: её записанность
+// не делает УИД записанным (как и в проверке пересечений).
+const CONSULTATION_APPOINTMENT_TYPE_CODE = 'C';
+// Комментарий в операторскую сделку случая Б: перечень услуг, на которые
+// пациент записался в день назначения. Заменяет комментарий о пересечении
+// с парной клинической сделкой.
+const BOOKED_OTHER_SERVICES_COMMENT_PREFIX = 'В день назначения записался на другие услуги: ';
 
 const DEALS_CONFIG = {
   appointmentsSheetName: 'Назначения',
@@ -134,6 +158,35 @@ const DEALS_CONFIG = {
 
   nearestRequestsLimit: 7
 };
+
+
+// Колонки листа «Сделки». Порядок задаёт строку, которую возвращает
+// buildUidDealRow_, поэтому индексы берутся отсюда.
+const DEALS_SHEET_HEADERS = [
+  'Статус',
+  'ФИО',
+  'Пациент.Код',
+  'Филиал',
+  'УИД',
+  'Кол-во услуг',
+  'Сумма назначений',
+  'Сумма к продаже',
+  'Дата назначения',
+  'Первый плановый день',
+  'Врач',
+  'Стандарт лечения',
+  'Состав назначений',
+  'Типы назначений',
+  'Номера найденных заявок',
+  'Ближайшие заявки пациента',
+  'Описание сделки',
+  'UID Plan Items JSON',
+  // Колонка добавляется последней: форматирование листа опирается на номера колонок.
+  'Дата плановой заявки'
+];
+
+const DEAL_ROW_STATUS_INDEX = DEALS_SHEET_HEADERS.indexOf('Статус');
+const DEAL_ROW_BOOKED_DATE_INDEX = DEALS_SHEET_HEADERS.indexOf('Дата плановой заявки');
 
 
 /****************************************************
@@ -359,8 +412,14 @@ function buildDealsSheet() {
   const nearestRequestsByClient = buildNearestRequestsByClientIndex_(requests);
   const uidGroups = groupAppointmentsByUid_(appointments);
 
-  const outputRows = Object.values(uidGroups)
-    .map(uidGroup => buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient))
+  // Судьба УИДов решается на уровне «пациент + филиал»: записанность
+  // курсовых услуг S/L может забрать в клиническую сделку и незаписанные УИДы.
+  const uidItems = applyCourseEnrollmentGrouping_(
+    Object.values(uidGroups)
+      .map(uidGroup => buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient))
+  );
+
+  const outputRows = uidItems
     .sort((a, b) => {
       const statusOrder = {
         [DEALS_CONFIG.resultStatuses.createDeal]: 1,
@@ -422,6 +481,11 @@ const BITRIX_DEALS_HEADERS = [
   'Ошибка',
   'AI request_id',
   'AI updated_at',
+  // Deal Hash второй сделки этой же отправки (клиническая ↔ операторская
+  // случая Б): такие сделки пересечением друг для друга не считаются.
+  'Парная сделка Hash',
+  // Комментарий о записи на другие услуги для операторской сделки случая Б.
+  'Комментарий о записи',
   // Дата плановой заявки для стадии «Записался в клинике»: уходит в поле
   // Bitrix «Записан на дату» (UF_CRM_1739201665696).
   'Записан на дату',
@@ -520,6 +584,9 @@ function buildBitrixDealsSheet() {
       uid,
       appointmentDate: appointmentDate || '',
       firstPlanDate: planDate,
+      // Дата заявки, по которой УИД считается записанным: нужна комментарию
+      // о записи на другие услуги в парной операторской сделке.
+      bookedDate: bookedDate || null,
       doctor: String(row['Врач'] || '').trim(),
       composition: String(row['Состав назначений'] || '').trim(),
       amount: parseNumber_(row['Сумма к продаже']),
@@ -530,7 +597,17 @@ function buildBitrixDealsSheet() {
     });
   });
 
-  const outputRows = Array.from(groups.values())
+  const groupList = Array.from(groups.values());
+
+  // Хэши считаются до связывания пар: клиническая и операторская сделки
+  // случая Б ссылаются друг на друга именно по Deal Hash.
+  groupList.forEach(group => {
+    group.dealHash = buildDealHashFromUids_(group.uids);
+  });
+
+  linkPairedBitrixDealGroups_(groupList);
+
+  const outputRows = groupList
     .sort((a, b) => {
       const dateDiff = (a.firstPlanDate ? a.firstPlanDate.getTime() : 0) - (b.firstPlanDate ? b.firstPlanDate.getTime() : 0);
       if (dateDiff !== 0) return dateDiff;
@@ -542,7 +619,7 @@ function buildBitrixDealsSheet() {
     })
     .map(group => {
       const uidsText = group.uids.join(', ');
-      const dealHash = buildDealHashFromUids_(group.uids);
+      const dealHash = group.dealHash;
 
       return [
         group.dealKey,
@@ -577,12 +654,81 @@ function buildBitrixDealsSheet() {
         '',
         '',
         '',
+        (group.pairDealHashes || []).join(', '),
+        group.bookedServicesComment || '',
         group.targetStageId === BITRIX_DEAL_STAGE_CLINIC_BOOKED ? (group.bookedDate || '') : '',
         group.targetStageId || ''
       ];
     });
 
   writeBitrixDealsOutput_(ss, outputRows);
+}
+
+
+// Клиническая и операторская сделки одного пациента и филиала (случай Б) —
+// пара одной отправки: в операторскую уходит комментарий о записи на другие
+// услуги, а пересечением друг для друга они не считаются.
+function linkPairedBitrixDealGroups_(groups) {
+  const buckets = new Map();
+
+  (groups || []).forEach(group => {
+    const key = buildBitrixDealKey_(group.patientCode, group.branch, '');
+
+    if (!buckets.has(key)) {
+      buckets.set(key, []);
+    }
+
+    buckets.get(key).push(group);
+  });
+
+  buckets.forEach(bucket => {
+    const clinicGroups = bucket.filter(group => group.targetStageId);
+    const operatorGroups = bucket.filter(group => !group.targetStageId);
+
+    if (!clinicGroups.length || !operatorGroups.length) {
+      return;
+    }
+
+    const clinicHashes = clinicGroups.map(group => group.dealHash).filter(Boolean);
+    const operatorHashes = operatorGroups.map(group => group.dealHash).filter(Boolean);
+    const comment = buildBookedOtherServicesComment_(clinicGroups);
+
+    operatorGroups.forEach(group => {
+      group.pairDealHashes = clinicHashes;
+      group.bookedServicesComment = comment;
+    });
+
+    // Зеркальный комментарий в клиническую сделку не пишется — только
+    // взаимное исключение из проверки пересечений.
+    clinicGroups.forEach(group => {
+      group.pairDealHashes = operatorHashes;
+    });
+  });
+
+  return groups || [];
+}
+
+
+// Перечень записанных услуг с датами заявок для комментария
+// в операторскую сделку случая Б.
+function buildBookedOtherServicesComment_(clinicGroups) {
+  const parts = [];
+
+  (clinicGroups || []).forEach(group => {
+    (group.uidRows || []).forEach(uidRow => {
+      const services = splitLines_(uidRow.composition).join(', ');
+
+      if (!services) {
+        return;
+      }
+
+      const requestDate = uidRow.bookedDate || uidRow.firstPlanDate || null;
+
+      parts.push(requestDate ? services + ' — заявка на ' + formatDateRu_(requestDate) : services);
+    });
+  });
+
+  return parts.length ? BOOKED_OTHER_SERVICES_COMMENT_PREFIX + parts.join('; ') : '';
 }
 
 
@@ -1231,6 +1377,7 @@ function writeBitrixDealsOutput_(ss, outputRows) {
   }
 
   sheet.autoResizeColumns(1, BITRIX_DEALS_HEADERS.length);
+  sheet.setColumnWidth(BITRIX_DEALS_HEADERS.indexOf('Комментарий о записи') + 1, 600);
   sheet.setColumnWidth(12, 450);
   sheet.setColumnWidth(13, 500);
   sheet.setColumnWidth(14, 180);
@@ -1501,6 +1648,9 @@ function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient) {
   const matchedRequests = [];
   const matchedRequestNumbers = new Set();
   const matchExplanations = [];
+  // Услуги УИДа, по которым нашлась подходящая заявка: их типы нужны
+  // группировке по записанности курса, определение записанности не меняют.
+  const bookedItems = [];
 
   let amountTotal = 0;
 
@@ -1512,6 +1662,10 @@ function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient) {
       item,
       requestIndexes
     );
+
+    if (candidateRequests.length) {
+      bookedItems.push(item);
+    }
 
     candidateRequests.forEach(match => {
       const req = match.request;
@@ -1585,7 +1739,11 @@ function buildUidDealRow_(uidGroup, requestIndexes, nearestRequestsByClient) {
   return {
     uid: uidGroup.uid,
     patient: uidGroup.patient,
+    patientCode: uidGroup.patientCode,
+    branch: uidGroup.branch,
     status: resultStatus,
+    typeCodes: appointmentTypeCodes,
+    bookedTypeCodes: buildAppointmentTypeCodes_(bookedItems),
     sortDate: uidGroup.firstTreatmentDate ? uidGroup.firstTreatmentDate.getTime() : 0,
     row: [
       resultStatus,
@@ -1630,6 +1788,373 @@ function findNearestPlannedRequestDate_(matchedRequests) {
   });
 
   return nearest;
+}
+
+
+/****************************************************
+ * Группировка УИДов пациента по записанности курса S/L
+ ****************************************************/
+
+// В типах УИДа есть курсовая услуга: магнитотерапия S или лазеротерапия L.
+function hasCourseAppointmentTypeCode_(typeCodes) {
+  const text = String(typeCodes || '').toUpperCase();
+
+  return COURSE_APPOINTMENT_TYPE_CODES.some(code => text.indexOf(code) !== -1);
+}
+
+
+// Типы, записанность которых учитывается: консультация C не участвует.
+function getEnrollingTypeCodes_(typeCodes) {
+  return String(typeCodes || '')
+    .toUpperCase()
+    .split('')
+    .filter(code => {
+      return APPOINTMENT_TYPE_CODE_ORDER.indexOf(code) !== -1 &&
+        code !== CONSULTATION_APPOINTMENT_TYPE_CODE;
+    });
+}
+
+
+// УИД считается записанным, если по нему найдена заявка не только
+// на консультацию. Само определение записанности (сопоставление заявок
+// по номенклатуре и кабинетам) не меняется.
+function isEnrolledUidItem_(item) {
+  if (!item || item.status === DEALS_CONFIG.resultStatuses.createDeal) {
+    return false;
+  }
+
+  return getEnrollingTypeCodes_(item.bookedTypeCodes).length > 0;
+}
+
+
+// Разбиение УИДов одного пациента и филиала на клиническую и операторскую сделки:
+// - А: среди записанных УИДов есть курсовая услуга S/L → клиническая сделка
+//   забирает ВСЕ УИДы пациента, операторская не создаётся;
+// - Б: записанные есть, курса среди них нет → записанные уходят в клиническую
+//   сделку, остальные (включая УИДы с S/L) — в операторскую;
+// - В: записанных УИДов нет → всё уходит в операторскую сделку.
+// Целевой статус клинической сделки — по существующему приоритету:
+// начатая заявка в день назначения выше плановой.
+function splitUidItemsByCourseEnrollment_(items) {
+  const list = items || [];
+  const enrolled = list.filter(isEnrolledUidItem_);
+
+  if (!enrolled.length) {
+    return {
+      caseCode: 'В',
+      clinicStatus: '',
+      clinicItems: [],
+      operatorItems: list.slice()
+    };
+  }
+
+  const clinicStatus = enrolled.some(item => item.status === DEALS_CONFIG.resultStatuses.clinicStarted)
+    ? DEALS_CONFIG.resultStatuses.clinicStarted
+    : DEALS_CONFIG.resultStatuses.clinicBooked;
+
+  if (enrolled.some(item => hasCourseAppointmentTypeCode_(item.typeCodes))) {
+    return {
+      caseCode: 'А',
+      clinicStatus,
+      clinicItems: list.slice(),
+      operatorItems: []
+    };
+  }
+
+  return {
+    caseCode: 'Б',
+    clinicStatus,
+    clinicItems: enrolled,
+    operatorItems: list.filter(item => enrolled.indexOf(item) === -1)
+  };
+}
+
+
+// Статус строки листа «Сделки» хранится и в объекте, и в самой строке.
+// Дата плановой заявки остаётся только у статуса «записался в клинике»:
+// в остальных случаях она ни на что не влияет и не должна вводить в заблуждение.
+function setUidDealRowStatus_(item, status) {
+  item.status = status;
+  item.row[DEAL_ROW_STATUS_INDEX] = status;
+
+  if (status !== DEALS_CONFIG.resultStatuses.clinicBooked) {
+    item.row[DEAL_ROW_BOOKED_DATE_INDEX] = '';
+  }
+}
+
+
+// Область группировки — существующий ключ «пациент + филиал» в рамках
+// одной отправки. Статусы строк листа «Сделки» приводятся к судьбе УИДа:
+// по ним buildBitrixDealsSheet собирает клиническую и операторскую сделки.
+function applyCourseEnrollmentGrouping_(items) {
+  const groups = new Map();
+
+  (items || []).forEach(item => {
+    const key = buildBitrixDealKey_(item.patientCode, item.branch, '');
+
+    if (!groups.has(key)) {
+      groups.set(key, []);
+    }
+
+    groups.get(key).push(item);
+  });
+
+  groups.forEach(groupItems => {
+    const split = splitUidItemsByCourseEnrollment_(groupItems);
+
+    split.clinicItems.forEach(item => setUidDealRowStatus_(item, split.clinicStatus));
+    split.operatorItems.forEach(item => setUidDealRowStatus_(item, DEALS_CONFIG.resultStatuses.createDeal));
+  });
+
+  return items || [];
+}
+
+
+// Разбиение УИДов пациента по записанности курсовых услуг S/L:
+// случаи А (курс записан), Б (записан не курс), В (записанных нет),
+// а также неучастие консультации C.
+function testCourseEnrollmentGrouping_() {
+  const baseDate = new Date(2026, 0, 10);
+  const futureDate = new Date(2026, 0, 14);
+  const statuses = DEALS_CONFIG.resultStatuses;
+
+  const course = ['УИД-КТБ', [
+    { nomenclature: 'Лазеротерапия', typeCode: 'L' },
+    { nomenclature: 'Магнитотерапия', typeCode: 'S' },
+    { nomenclature: 'ЛФК', typeCode: 'F' }
+  ]];
+  const physioConsultation = ['УИД-ФИЗТЕРАПЕВТ', [
+    { nomenclature: 'Консультация физического терапевта', typeCode: 'F' }
+  ]];
+  const analyses = ['УИД-АНАЛИЗЫ', [
+    { nomenclature: 'Анализ крови общий', typeCode: 'D' }
+  ]];
+  const massage = ['УИД-МАССАЖ', [
+    { nomenclature: 'Массаж спины', typeCode: 'M' }
+  ]];
+  const consultation = ['УИД-КОНСУЛЬТАЦИЯ', [
+    { nomenclature: 'Первичная консультация', typeCode: 'C' }
+  ]];
+  const massageWithConsultation = ['УИД-МАССАЖ-С-КОНСУЛЬТАЦИЕЙ', [
+    { nomenclature: 'Первичная консультация', typeCode: 'C' },
+    { nomenclature: 'Массаж спины', typeCode: 'M' }
+  ]];
+
+  const plannedRequest = (typeCode, nomenclature) => buildCourseEnrollmentTestRequest_({
+    number: 'TEST-PLAN-' + typeCode,
+    state: 'Запланирована',
+    startDate: futureDate,
+    nomenclature,
+    typeCode
+  });
+  const startedRequest = (typeCode, nomenclature) => buildCourseEnrollmentTestRequest_({
+    number: 'TEST-START-' + typeCode,
+    state: 'Начато',
+    startDate: baseDate,
+    nomenclature,
+    typeCode
+  });
+
+  const checks = [
+    {
+      name: 'случай А: записан курс LSF, довески приклеиваются',
+      uidGroups: [course, physioConsultation, analyses],
+      requests: [plannedRequest('L', 'Лазеротерапия')],
+      expectedCase: 'А',
+      expectedDeals: 1,
+      expected: {
+        'УИД-КТБ': statuses.clinicBooked,
+        'УИД-ФИЗТЕРАПЕВТ': statuses.clinicBooked,
+        'УИД-АНАЛИЗЫ': statuses.clinicBooked
+      }
+    },
+    {
+      name: 'случай А: начатая заявка в день назначения',
+      uidGroups: [course, physioConsultation, analyses],
+      requests: [startedRequest('S', 'Магнитотерапия')],
+      expectedCase: 'А',
+      expectedDeals: 1,
+      expected: {
+        'УИД-КТБ': statuses.clinicStarted,
+        'УИД-ФИЗТЕРАПЕВТ': statuses.clinicStarted,
+        'УИД-АНАЛИЗЫ': statuses.clinicStarted
+      }
+    },
+    {
+      name: 'случай Б: записан только массаж, курс SL остаётся операторским',
+      uidGroups: [course, massage, physioConsultation, analyses],
+      requests: [plannedRequest('M', 'Массаж спины')],
+      expectedCase: 'Б',
+      expectedDeals: 2,
+      expected: {
+        'УИД-МАССАЖ': statuses.clinicBooked,
+        'УИД-КТБ': statuses.createDeal,
+        'УИД-ФИЗТЕРАПЕВТ': statuses.createDeal,
+        'УИД-АНАЛИЗЫ': statuses.createDeal
+      }
+    },
+    {
+      name: 'случай В: подходящих заявок нет',
+      uidGroups: [course, massage, analyses],
+      requests: [],
+      expectedCase: 'В',
+      expectedDeals: 1,
+      expected: {
+        'УИД-КТБ': statuses.createDeal,
+        'УИД-МАССАЖ': statuses.createDeal,
+        'УИД-АНАЛИЗЫ': statuses.createDeal
+      }
+    },
+    {
+      name: 'записана только консультация C: случай В, одна операторская сделка',
+      uidGroups: [consultation, physioConsultation, analyses],
+      requests: [plannedRequest('C', 'Первичная консультация')],
+      expectedCase: 'В',
+      expectedDeals: 1,
+      expected: {
+        'УИД-КОНСУЛЬТАЦИЯ': statuses.createDeal,
+        'УИД-ФИЗТЕРАПЕВТ': statuses.createDeal,
+        'УИД-АНАЛИЗЫ': statuses.createDeal
+      }
+    },
+    {
+      name: 'записана консультация внутри УИДа с массажем: записанным УИД не считается',
+      uidGroups: [massageWithConsultation, analyses],
+      requests: [plannedRequest('C', 'Первичная консультация')],
+      expectedCase: 'В',
+      expectedDeals: 1,
+      expected: {
+        'УИД-МАССАЖ-С-КОНСУЛЬТАЦИЕЙ': statuses.createDeal,
+        'УИД-АНАЛИЗЫ': statuses.createDeal
+      }
+    },
+    {
+      name: 'записан массаж в УИДе с консультацией: случай Б',
+      uidGroups: [massageWithConsultation, analyses],
+      requests: [plannedRequest('M', 'Массаж спины')],
+      expectedCase: 'Б',
+      expectedDeals: 2,
+      expected: {
+        'УИД-МАССАЖ-С-КОНСУЛЬТАЦИЕЙ': statuses.clinicBooked,
+        'УИД-АНАЛИЗЫ': statuses.createDeal
+      }
+    },
+    {
+      name: 'случай А: анализы приклеиваются к записанной магнитотерапии',
+      uidGroups: [['УИД-МАГНИТ', [{ nomenclature: 'Магнитотерапия', typeCode: 'S' }]], analyses],
+      requests: [plannedRequest('S', 'Магнитотерапия')],
+      expectedCase: 'А',
+      expectedDeals: 1,
+      expected: {
+        'УИД-МАГНИТ': statuses.clinicBooked,
+        'УИД-АНАЛИЗЫ': statuses.clinicBooked
+      }
+    }
+  ];
+
+  checks.forEach(check => {
+    const requestIndexes = buildRequestIndexes_(check.requests);
+    const items = check.uidGroups.map(definition => {
+      return buildUidDealRow_(
+        buildCourseEnrollmentTestUidGroup_(definition[0], definition[1], baseDate),
+        requestIndexes,
+        new Map()
+      );
+    });
+
+    const split = splitUidItemsByCourseEnrollment_(items);
+
+    if (split.caseCode !== check.expectedCase) {
+      throw new Error(
+        'Проверка группировки не пройдена: ' + check.name +
+        '. Ожидался случай ' + check.expectedCase + ', получен ' + split.caseCode + '.'
+      );
+    }
+
+    applyCourseEnrollmentGrouping_(items);
+
+    const dealKeys = new Set();
+
+    items.forEach(item => {
+      const expected = check.expected[item.uid];
+
+      if (item.status !== expected) {
+        throw new Error(
+          'Проверка группировки не пройдена: ' + check.name +
+          '. УИД ' + item.uid + ': ожидался статус "' + expected +
+          '", получен "' + item.status + '".'
+        );
+      }
+
+      if (item.row[DEAL_ROW_STATUS_INDEX] !== expected) {
+        throw new Error(
+          'Статус строки листа «Сделки» не совпал со статусом УИДа ' + item.uid +
+          ': ' + check.name + '.'
+        );
+      }
+
+      dealKeys.add(buildBitrixDealKey_(
+        item.patientCode,
+        item.branch,
+        getClinicDealStageIdForStatus_(item.status)
+      ));
+    });
+
+    if (dealKeys.size !== check.expectedDeals) {
+      throw new Error(
+        'Проверка количества сделок не пройдена: ' + check.name +
+        '. Ожидалось ' + check.expectedDeals + ', получено ' + dealKeys.size + '.'
+      );
+    }
+  });
+
+  // Курсовыми считаются только S и L, консультация из записанности исключается.
+  if (!hasCourseAppointmentTypeCode_('LSF') || !hasCourseAppointmentTypeCode_('MS') ||
+    hasCourseAppointmentTypeCode_('MFC') || hasCourseAppointmentTypeCode_('')) {
+    throw new Error('Курсовыми считаются только магнитотерапия S и лазеротерапия L.');
+  }
+
+  if (getEnrollingTypeCodes_('C').length !== 0 || getEnrollingTypeCodes_('CM').join('') !== 'M') {
+    throw new Error('Консультация C не должна учитываться в записанности УИДа.');
+  }
+
+  return 'testCourseEnrollmentGrouping_: OK (' + checks.length + ')';
+}
+
+
+function buildCourseEnrollmentTestUidGroup_(uid, services, baseDate) {
+  return {
+    uid,
+    branch: 'Тестовый филиал',
+    patient: 'Тестовый пациент',
+    patientCode: 'P-001',
+    doctor: 'Тестовый врач',
+    standard: 'Тестовый стандарт',
+    appointmentDate: baseDate,
+    firstTreatmentDate: baseDate,
+    items: (services || []).map(service => {
+      return {
+        treatmentDate: baseDate,
+        nomenclature: service.nomenclature,
+        price: service.price || 1000,
+        typeCode: service.typeCode
+      };
+    })
+  };
+}
+
+
+function buildCourseEnrollmentTestRequest_(options) {
+  return buildCrossBranchMatchingTestRequest_({
+    number: options.number,
+    branch: 'Тестовый филиал',
+    clientCode: 'P-001',
+    state: options.state,
+    startDate: options.startDate,
+    nomenclature: options.nomenclature,
+    cabinet: '',
+    typeCode: options.typeCode
+  });
 }
 
 
@@ -2306,28 +2831,7 @@ function writeDealsOutput_(ss, outputRows) {
 
   sheet.clear();
 
-  const headers = [
-    'Статус',
-    'ФИО',
-    'Пациент.Код',
-    'Филиал',
-    'УИД',
-    'Кол-во услуг',
-    'Сумма назначений',
-    'Сумма к продаже',
-    'Дата назначения',
-    'Первый плановый день',
-    'Врач',
-    'Стандарт лечения',
-    'Состав назначений',
-    'Типы назначений',
-    'Номера найденных заявок',
-    'Ближайшие заявки пациента',
-    'Описание сделки',
-    'UID Plan Items JSON',
-    // Колонка добавляется последней: форматирование листа опирается на номера колонок.
-    'Дата плановой заявки'
-  ];
+  const headers = DEALS_SHEET_HEADERS;
 
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
 
@@ -2765,6 +3269,8 @@ const BITRIX_DEAL_CATEGORY_ID = 114;
 const BITRIX_DEAL_TYPES_FIELD = 'UF_CRM_1784225678';
 const BITRIX_DEAL_PATIENT_CODE_FIELD = 'UF_CRM_1783751141';
 const BITRIX_DEAL_APPOINTMENT_DATE_FIELD = 'UF_CRM_1784267448';
+// Deal Hash сделки: по нему ищутся дубли и исключается парная сделка отправки.
+const BITRIX_DEAL_HASH_FIELD = 'UF_CRM_1783751578';
 // «Записан на дату» — дата плановой заявки, по которой сделка считается записанной.
 // Поле типа «дата» без времени, по нему контролируется пропуск записи.
 const BITRIX_DEAL_BOOKED_DATE_FIELD = 'UF_CRM_1739201665696';
@@ -3320,6 +3826,22 @@ function uploadBitrixDeals() {
         warnings.push('Сделка создана, но комментарий в таймлайн не добавлен: ' + commentErrorText);
       }
 
+      // Комментарий о записи на другие услуги (операторская сделка случая Б)
+      // добавляется после описания: в ленте Bitrix он встаёт выше него.
+      try {
+        const bookedServicesComment = String(row['Комментарий о записи'] || '').trim();
+
+        if (bookedServicesComment) {
+          addBitrixDealComment_(created.dealId, bookedServicesComment);
+        }
+      } catch (commentErr) {
+        const commentErrorText = commentErr && commentErr.message
+          ? commentErr.message
+          : String(commentErr);
+
+        warnings.push('Сделка создана, но комментарий о записи на другие услуги не добавлен: ' + commentErrorText);
+      }
+
       // Комментарии о пересечениях и перевод старых сделок — после
       // основной справки, чтобы она осталась первой в таймлайне.
       warnings.push.apply(warnings, applyBitrixDealIntersectionResults_(
@@ -3380,12 +3902,12 @@ function findBitrixDealByHash_(dealHash) {
     return null;
   }
 
+  const filter = { CATEGORY_ID: BITRIX_DEAL_CATEGORY_ID };
+  filter[BITRIX_DEAL_HASH_FIELD] = dealHash;
+
   const result = bitrixCall_('crm.deal.list', {
-    filter: {
-      CATEGORY_ID: BITRIX_DEAL_CATEGORY_ID,
-      UF_CRM_1783751578: dealHash
-    },
-    select: ['ID', 'TITLE', 'CATEGORY_ID', 'UF_CRM_1783751578']
+    filter: filter,
+    select: ['ID', 'TITLE', 'CATEGORY_ID', BITRIX_DEAL_HASH_FIELD]
   });
 
   if (Array.isArray(result) && result.length) {
@@ -3438,6 +3960,24 @@ function classifyBitrixDealIntersection_(newCodes, existingCodes) {
     overlap: overlap
   };
 }
+
+// Deal Hash парных сделок одной отправки из колонки «Парная сделка Hash».
+function parsePairedDealHashes_(value) {
+  return splitUids_(value).map(hash => hash.toLowerCase());
+}
+
+
+// Сделка Bitrix — вторая сделка этой же отправки (клиническая ↔ операторская).
+function isPairedBitrixDeal_(deal, pairDealHashes) {
+  if (!deal || !pairDealHashes || !pairDealHashes.length) {
+    return false;
+  }
+
+  const dealHash = String(deal[BITRIX_DEAL_HASH_FIELD] || '').trim().toLowerCase();
+
+  return Boolean(dealHash) && pairDealHashes.indexOf(dealHash) !== -1;
+}
+
 
 function shouldMoveBitrixDealToIntersectionStage_(stageId) {
   const stage = String(stageId || '');
@@ -3492,7 +4032,7 @@ function fetchOpenBitrixDealsByPatientCode_(patientCode) {
       payload: JSON.stringify({
         order: { ID: 'ASC' },
         filter: filter,
-        select: ['ID', 'TITLE', 'STAGE_ID', BITRIX_DEAL_TYPES_FIELD],
+        select: ['ID', 'TITLE', 'STAGE_ID', BITRIX_DEAL_TYPES_FIELD, BITRIX_DEAL_HASH_FIELD],
         start: start
       }),
       muteHttpExceptions: true
@@ -3543,6 +4083,7 @@ function checkBitrixDealIntersections_(row) {
 
   const patientCode = normalizePatientCodeForBitrix_(row['Пациент.Код']);
   const mergedTypes = mergeAppointmentTypeCodes_([row['Типы назначений'] || '']);
+  const pairDealHashes = parsePairedDealHashes_(row['Парная сделка Hash']);
 
   if (!patientCode || !mergedTypes) {
     return result;
@@ -3572,6 +4113,12 @@ function checkBitrixDealIntersections_(row) {
     const dealId = String(deal.ID || '');
 
     if (!dealId) {
+      return;
+    }
+
+    // Вторая сделка этой же отправки пересечением не считается: её заменяет
+    // комментарий о записи на другие услуги в операторской сделке.
+    if (isPairedBitrixDeal_(deal, pairDealHashes)) {
       return;
     }
 
@@ -3820,6 +4367,16 @@ function testClinicDealStageMapping_() {
     throw new Error('Колонка «Записан на дату» должна идти перед «Целевой стадией».');
   }
 
+  if (BITRIX_DEALS_HEADERS.indexOf('Парная сделка Hash') === -1 ||
+    BITRIX_DEALS_HEADERS.indexOf('Комментарий о записи') === -1) {
+    throw new Error('Колонки парной сделки и комментария о записи должны быть на листе «Сделки в Битрикс».');
+  }
+
+  if (DEALS_SHEET_HEADERS[DEAL_ROW_STATUS_INDEX] !== 'Статус' ||
+    DEALS_SHEET_HEADERS[DEAL_ROW_BOOKED_DATE_INDEX] !== 'Дата плановой заявки') {
+    throw new Error('Индексы колонок листа «Сделки» должны соответствовать заголовкам.');
+  }
+
   return 'testClinicDealStageMapping_: OK';
 }
 
@@ -3841,7 +4398,7 @@ function testClinicBookedRequestDate_() {
       { treatmentDate: baseDate, nomenclature: 'Услуга 2', price: 1000, typeCode: 'M' }
     ]
   };
-  const bookedDateIndex = 18;
+  const bookedDateIndex = DEAL_ROW_BOOKED_DATE_INDEX;
   const buildRow = requests => buildUidDealRow_(uidGroup, buildRequestIndexes_(requests), new Map());
 
   const booked = buildRow([
@@ -3883,6 +4440,97 @@ function testClinicBookedRequestDate_() {
   }
 
   return 'testClinicBookedRequestDate_: OK';
+}
+
+
+// Пара «клиническая + операторская сделка» случая Б: комментарий о записи
+// на другие услуги и взаимное исключение из проверки пересечений.
+function testPairedBitrixDealComment_() {
+  const buildGroup = options => {
+    return {
+      patientCode: 'P-001',
+      branch: 'Темед Казань',
+      targetStageId: options.targetStageId || '',
+      dealHash: options.dealHash,
+      uidRows: options.uidRows || []
+    };
+  };
+
+  const clinicGroup = buildGroup({
+    targetStageId: BITRIX_DEAL_STAGE_CLINIC_BOOKED,
+    dealHash: 'hash-clinic',
+    uidRows: [{
+      composition: 'Массаж спины х 10\nМассаж шеи',
+      bookedDate: new Date(2026, 0, 14),
+      firstPlanDate: new Date(2026, 0, 10)
+    }]
+  });
+  const operatorGroup = buildGroup({
+    dealHash: 'hash-operator',
+    uidRows: [{ composition: 'Лазеротерапия х 10', firstPlanDate: new Date(2026, 0, 10) }]
+  });
+
+  linkPairedBitrixDealGroups_([clinicGroup, operatorGroup]);
+
+  const expectedComment = BOOKED_OTHER_SERVICES_COMMENT_PREFIX +
+    'Массаж спины х 10, Массаж шеи — заявка на 14.01.2026';
+
+  if (operatorGroup.bookedServicesComment !== expectedComment) {
+    throw new Error(
+      'Комментарий о записи на другие услуги не совпал. Ожидалось: "' + expectedComment +
+      '", получено: "' + operatorGroup.bookedServicesComment + '".'
+    );
+  }
+
+  if (clinicGroup.bookedServicesComment) {
+    throw new Error('Зеркальный комментарий в клиническую сделку не пишется.');
+  }
+
+  if ((operatorGroup.pairDealHashes || []).join(',') !== 'hash-clinic' ||
+    (clinicGroup.pairDealHashes || []).join(',') !== 'hash-operator') {
+    throw new Error('Сделки одной пары должны ссылаться друг на друга по Deal Hash.');
+  }
+
+  // Одиночная сделка пары не образует: комментарий и исключение не нужны.
+  const soloGroup = buildGroup({ dealHash: 'hash-solo', uidRows: [{ composition: 'ЛФК' }] });
+  linkPairedBitrixDealGroups_([soloGroup]);
+
+  if (soloGroup.pairDealHashes || soloGroup.bookedServicesComment) {
+    throw new Error('Сделка без пары не должна получать парный хэш и комментарий.');
+  }
+
+  // Сделки разных пациентов парой не считаются.
+  const otherPatientClinic = buildGroup({
+    targetStageId: BITRIX_DEAL_STAGE_CLINIC_BOOKED,
+    dealHash: 'hash-other',
+    uidRows: [{ composition: 'Массаж спины' }]
+  });
+  otherPatientClinic.patientCode = 'P-002';
+  const lonelyOperator = buildGroup({ dealHash: 'hash-lonely', uidRows: [{ composition: 'ЛФК' }] });
+  linkPairedBitrixDealGroups_([otherPatientClinic, lonelyOperator]);
+
+  if (lonelyOperator.pairDealHashes || otherPatientClinic.pairDealHashes) {
+    throw new Error('Парой считаются только сделки одного пациента и филиала.');
+  }
+
+  // Парная сделка исключается из проверки пересечений по Deal Hash.
+  const pairHashes = parsePairedDealHashes_('hash-clinic, hash-second');
+  const pairedDeal = {};
+  pairedDeal[BITRIX_DEAL_HASH_FIELD] = 'HASH-CLINIC';
+  const foreignDeal = {};
+  foreignDeal[BITRIX_DEAL_HASH_FIELD] = 'hash-foreign';
+
+  if (!isPairedBitrixDeal_(pairedDeal, pairHashes)) {
+    throw new Error('Сделка с парным Deal Hash должна исключаться из пересечений.');
+  }
+
+  if (isPairedBitrixDeal_(foreignDeal, pairHashes) ||
+    isPairedBitrixDeal_({}, pairHashes) ||
+    isPairedBitrixDeal_(pairedDeal, [])) {
+    throw new Error('Чужие сделки пациента должны участвовать в проверке пересечений.');
+  }
+
+  return 'testPairedBitrixDealComment_: OK';
 }
 
 // Приоритет стадий при создании: «Записался/Начал в клинике» выше
