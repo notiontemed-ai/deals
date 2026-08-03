@@ -28,6 +28,12 @@
  * есть новая плановая заявка с совпадающими типами записи
  * → перенос даты, нет → «Пропустил запись». Плановая
  * консультация C записью не считается.
+ *
+ * Шаги 3 и 4 пишут предложения на общий лист
+ * «Актуализация сделок» и различаются колонкой «Источник
+ * проверки»: каждый шаг переписывает только свои строки,
+ * поэтому результаты обоих шагов уходят в Bitrix одним
+ * запуском пункта 5.
  ****************************************************/
 
 const DSS_CONFIG = Object.freeze({
@@ -118,8 +124,14 @@ const DSS_REPORT_STAGE_NO_CONTACT = 'C114:UC_1GZCBR';     // Не вышел н�
 
 const DSS_REQUEST_HEADERS = ['КлиентКод', 'Пациент', 'Дата', 'Запланированы', 'Выполнены', 'Дата обработки'];
 const DSS_DEAL_HEADERS = ['ID сделки', 'Название', 'ФИО пациента', 'CATEGORY_ID', 'Текущая стадия ID', 'Текущая стадия', 'Код пациента', 'Сумма сделки', 'Дата создания сделки', 'Дата назначения', 'Первый день лечения', 'Записан на дату', 'Состав назначения', 'Типы назначений', 'Дата загрузки', 'Ошибка данных'];
-const DSS_ACTUALIZATION_HEADERS = ['Отправить', 'ID сделки', 'Название сделки', 'Код пациента', 'Дата назначения', 'Первый день лечения', 'Типы назначений', 'Найденные запланированные типы', 'Найденные выполненные типы', 'Текущая стадия ID', 'Текущая стадия', 'Предлагаемая стадия ID', 'Предлагаемая стадия', 'Записан на дату', 'Результат проверки', 'Причина', 'Дата загрузки сделок', 'Дата обработки заявок', 'Дата актуализации', 'Статус отправки', 'Ошибка отправки'];
+const DSS_ACTUALIZATION_HEADERS = ['Отправить', 'Источник проверки', 'ID сделки', 'Название сделки', 'Код пациента', 'Дата назначения', 'Первый день лечения', 'Типы назначений', 'Найденные запланированные типы', 'Найденные выполненные типы', 'Текущая стадия ID', 'Текущая стадия', 'Предлагаемая стадия ID', 'Предлагаемая стадия', 'Записан на дату', 'Результат проверки', 'Причина', 'Дата загрузки сделок', 'Дата обработки заявок', 'Дата актуализации', 'Статус отправки', 'Ошибка отправки'];
 const DSS_STAGE_HEADERS = ['Название стадии', 'Код стадии'];
+// Шаги 3 и 4 пишут предложения на общий лист «Актуализация сделок»
+// и отправляются пунктом 5 совместно. Источник проверки разделяет строки:
+// каждый шаг переписывает только свои строки.
+const DSS_ACTUALIZATION_SOURCE_REQUESTS = 'Актуализация по заявкам'; // шаг 3
+const DSS_ACTUALIZATION_SOURCE_MISSED = 'Пропуск записи';           // шаг 4
+const DSS_ACTUALIZATION_SOURCES = [DSS_ACTUALIZATION_SOURCE_REQUESTS, DSS_ACTUALIZATION_SOURCE_MISSED];
 
 function onOpen(e) { DSS_addDealStatusSyncMenu_(); }
 function DSS_addDealStatusSyncMenu_() {
@@ -301,9 +313,9 @@ function DSS_actualizeDeals() {
       if (targetId && result === 'Записался') bookedDate = DSS_pickBookedAppointmentDate_(plannedDates, today) || '';
     }
     if (result === 'Записался' && targetId) booked += 1; else if (result === 'Дошёл' && targetId) attended += 1; else unchanged += 1;
-    return [Boolean(targetId), id, d['Название'], patient, appointmentDate || '', firstTreatment || '', DSS_codes_(codes), DSS_codes_(planned), DSS_codes_(done), d['Текущая стадия ID'], d['Текущая стадия'], targetId, targetName, bookedDate, result, reason, d['Дата загрузки'], requestTime || '', now, '', ''];
+    return [Boolean(targetId), DSS_ACTUALIZATION_SOURCE_REQUESTS, id, d['Название'], patient, appointmentDate || '', firstTreatment || '', DSS_codes_(codes), DSS_codes_(planned), DSS_codes_(done), d['Текущая стадия ID'], d['Текущая стадия'], targetId, targetName, bookedDate, result, reason, d['Дата загрузки'], requestTime || '', now, '', ''];
   });
-  DSS_writeActualization_(ss, rows); DSS_log_(ss, 'Актуализация сделок', now);
+  DSS_writeActualizationForSource_(ss, DSS_ACTUALIZATION_SOURCE_REQUESTS, rows); DSS_log_(ss, 'Актуализация сделок', now);
   DSS_alert_('Актуализация сделок завершена.', 'Сделок проверено: ' + deals.length + '.\nПредлагается «Записался»: ' + booked + '.\nПредлагается «Дошёл»: ' + attended + '.\nБез изменений: ' + unchanged + '.\nСтрок с ошибками данных: ' + errors + '.');
 }
 // Из «Записался в клинике» рассчитывается только переход в «Дошёл»:
@@ -399,12 +411,16 @@ function DSS_actualizeMissedAppointments() {
   if (!DSS_isToday_(dealTime) || !DSS_isToday_(requestTime)) { const ui = SpreadsheetApp.getUi(); if (ui.alert('Предупреждение', 'Данные были подготовлены не сегодня. Контроль пропуска записи выполняется по свежей выгрузке заявок.', ui.ButtonSet.YES_NO) !== ui.Button.YES) return; }
   const index = new Map(); requests.forEach(r => { const code = DSS_normalizePatientCode_(r['КлиентКод']); if (!code) return; if (!index.has(code)) index.set(code, []); index.get(code).push(r); });
   const stageInfo = DSS_loadStageDirectory_(); const now = new Date(); const today = DSS_today_();
-  let transferred = 0, missed = 0, attended = 0, errors = 0;
+  // Сделки с неотправленным предложением шага 3 контроль пропуска записи
+  // не трогает: перевод стадии важнее переноса даты записи.
+  const preparedByRequests = DSS_activeDealIdsBySource_(DSS_readActualizationRows_(ss), DSS_ACTUALIZATION_SOURCE_REQUESTS);
+  let transferred = 0, missed = 0, attended = 0, errors = 0, preparedByStageStep = 0;
   const rows = [];
   deals.forEach(d => {
     const stageId = String(d['Текущая стадия ID'] || '');
     const currentBookedDate = DSS_date_(d['Записан на дату']);
     if (!DSS_isMissedAppointmentCandidate_(stageId, currentBookedDate, today)) return;
+    if (preparedByRequests.has(String(d['ID сделки'] || ''))) { preparedByStageStep += 1; return; }
 
     const id = String(d['ID сделки'] || ''); const patient = DSS_normalizePatientCode_(d['Код пациента']);
     const appointmentDate = DSS_date_(d['Дата назначения']); const firstTreatment = DSS_date_(d['Первый день лечения']); const codes = DSS_codeSet_(d['Типы назначений']);
@@ -441,16 +457,19 @@ function DSS_actualizeMissedAppointments() {
       targetName = (si && si.byId.get(targetId)) || result;
     }
 
-    rows.push([Boolean(targetId || bookedDate), id, d['Название'], patient, appointmentDate || '', firstTreatment || '', DSS_codes_(codes), DSS_codes_(planned), DSS_codes_(done), stageId, d['Текущая стадия'], targetId, targetName, bookedDate, result, reason, d['Дата загрузки'], requestTime || '', now, '', '']);
+    rows.push([Boolean(targetId || bookedDate), DSS_ACTUALIZATION_SOURCE_MISSED, id, d['Название'], patient, appointmentDate || '', firstTreatment || '', DSS_codes_(codes), DSS_codes_(planned), DSS_codes_(done), stageId, d['Текущая стадия'], targetId, targetName, bookedDate, result, reason, d['Дата загрузки'], requestTime || '', now, '', '']);
   });
-  DSS_writeActualization_(ss, rows); DSS_log_(ss, 'Контроль пропуска записи', now);
-  DSS_alert_('Контроль пропуска записи завершён.', 'Сделок с прошедшей датой записи: ' + rows.length + '.\nПредлагается перенос записи: ' + transferred + '.\nПредлагается «Пропустил запись»: ' + missed + '.\nОбрабатывается шагом «Дошёл»: ' + attended + '.\nСтрок с ошибками данных: ' + errors + '.\n\nПроверьте лист «' + DSS_CONFIG.sheets.actualization + '» и выполните пункт «5. Отправить изменения в Bitrix».');
+  DSS_writeActualizationForSource_(ss, DSS_ACTUALIZATION_SOURCE_MISSED, rows); DSS_log_(ss, 'Контроль пропуска записи', now);
+  DSS_alert_('Контроль пропуска записи завершён.', 'Сделок с прошедшей датой записи: ' + rows.length + '.\nПредлагается перенос записи: ' + transferred + '.\nПредлагается «Пропустил запись»: ' + missed + '.\nОбрабатывается шагом «Дошёл»: ' + attended + '.\nУже подготовлено шагом «3. Актуализировать сделки по заявкам»: ' + preparedByStageStep + '.\nСтрок с ошибками данных: ' + errors + '.\n\nПроверьте лист «' + DSS_CONFIG.sheets.actualization + '» и выполните пункт «5. Отправить изменения в Bitrix».');
 }
 
 function DSS_sendChangesToBitrixWithConfirmation() {
   const ui = SpreadsheetApp.getUi(); if (ui.alert('Отправка изменений в Bitrix', 'Будут обновлены стадии сделок и даты записи для строк, отмеченных флажком «Отправить» на листе «Актуализация сделок». Продолжить?', ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
-  const ss = SpreadsheetApp.getActiveSpreadsheet(); const sheet = ss.getSheetByName(DSS_CONFIG.sheets.actualization); if (!sheet || sheet.getLastRow() < 2) throw new Error('Нет подготовленных изменений для отправки.');
+  const ss = SpreadsheetApp.getActiveSpreadsheet(); const sheet = ss.getSheetByName(DSS_CONFIG.sheets.actualization);
+  if (!sheet || sheet.getLastRow() < 2) { DSS_alert_('Отправка изменений в Bitrix', 'Нет подготовленных изменений для отправки.'); return; }
   const rows = DSS_readObjects_(sheet); const actualized = DSS_latestDate_(rows, 'Дата актуализации'); const deals = DSS_readObjects_(DSS_requiredSheet_(ss, DSS_CONFIG.sheets.deals)); const requests = DSS_readObjects_(DSS_requiredSheet_(ss, DSS_CONFIG.sheets.aggregated));
+  // Пустой лист (шаги 3 и 4 не нашли кандидатов) устареванием данных не считается.
+  if (!actualized) { DSS_alert_('Отправка изменений в Bitrix', 'Нет подготовленных изменений для отправки.'); return; }
   if (DSS_latestDate_(deals, 'Дата загрузки') > actualized || DSS_latestDate_(requests, 'Дата обработки') > actualized) throw new Error('После актуализации исходные данные изменились. Повторно выполните пункт «3. Актуализировать сделки по заявкам» или «4. Проверить пропуск записи».');
   const candidates = rows.map((r, i) => ({ r, row: i + 2 })).filter(x => x.r['Отправить'] === true && x.r['ID сделки'] && DSS_hasActualizationChange_(x.r) && x.r['Статус отправки'] !== 'Отправлено');
   if (!candidates.length) { DSS_alert_('Отправка изменений в Bitrix', 'Нет подготовленных изменений для отправки.'); return; }
@@ -913,6 +932,75 @@ function DSS_testMissedAppointmentActualization_() {
   return 'DSS_testMissedAppointmentActualization_: OK';
 }
 
+// Общий лист актуализации: строки шагов 3 и 4 сосуществуют,
+// каждый шаг переписывает только свои строки.
+function DSS_testActualizationSourcesMerge_() {
+  const assertEqual = (actual, expected, message) => { if (actual !== expected) throw new Error(message + ' Ожидалось: ' + expected + ', получено: ' + actual + '.'); };
+  const assertTrue = (actual, message) => { if (!actual) throw new Error(message); };
+  const d = (year, month, day) => new Date(year, month - 1, day);
+  const today = d(2026, 8, 2);
+  const row = (source, id, options) => Object.assign({
+    'Отправить': true, 'Источник проверки': source, 'ID сделки': id, 'Название сделки': 'Сделка ' + id,
+    'Текущая стадия ID': 'C114:EXECUTING', 'Текущая стадия': 'Записался',
+    'Предлагаемая стадия ID': '', 'Предлагаемая стадия': '', 'Записан на дату': '',
+    'Дата актуализации': new Date(2026, 7, 2, 20, 0, 0), 'Статус отправки': '', 'Ошибка отправки': ''
+  }, options || {});
+  const stageRow = (source, id, options) => row(source, id, Object.assign({ 'Предлагаемая стадия ID': DSS_REPORT_STAGE_WON, 'Предлагаемая стадия': 'Дошёл' }, options || {}));
+  const transferRow = (source, id, options) => row(source, id, Object.assign({ 'Записан на дату': d(2026, 8, 6) }, options || {}));
+  const merged = (existing, rows, source) => DSS_mergeActualizationRows_(existing, rows.map(DSS_actualizationRowValues_), source, today).map(DSS_actualizationRowObject_);
+  const ids = list => list.map(x => String(x['ID сделки'] || '')).join(',');
+
+  // Колонки: источник добавлен, статус отправки и ошибка идут подряд.
+  assertTrue(DSS_ACTUALIZATION_HEADERS.indexOf('Источник проверки') !== -1, 'Колонка «Источник проверки» должна быть на листе актуализации.');
+  assertEqual(DSS_actualizationColumn_('Отправить'), 1, 'Флажок «Отправить» остаётся первой колонкой.');
+  assertEqual(DSS_actualizationColumn_('Ошибка отправки'), DSS_actualizationColumn_('Статус отправки') + 1, 'Статус и ошибка отправки должны идти подряд: DSS_sendStatus_ пишет две ячейки.');
+
+  const stepThree = [stageRow(DSS_ACTUALIZATION_SOURCE_REQUESTS, '1'), stageRow(DSS_ACTUALIZATION_SOURCE_REQUESTS, '2')];
+
+  // Шаг 4 без кандидатов не стирает предложения шага 3.
+  assertEqual(ids(merged(stepThree, [], DSS_ACTUALIZATION_SOURCE_MISSED)), '1,2', 'Шаг 4 с нулём кандидатов сохраняет строки шага 3.');
+
+  // Шаг 4 переписывает свои строки и не трогает чужие.
+  const afterMissed = merged(stepThree.concat([transferRow(DSS_ACTUALIZATION_SOURCE_MISSED, '3')]), [transferRow(DSS_ACTUALIZATION_SOURCE_MISSED, '4')], DSS_ACTUALIZATION_SOURCE_MISSED);
+  assertEqual(ids(afterMissed), '1,2,4', 'Шаг 4 переписывает только строки своего источника.');
+  assertEqual(String(afterMissed[2]['Источник проверки']), DSS_ACTUALIZATION_SOURCE_MISSED, 'Новые строки шага 4 помечаются своим источником.');
+
+  // Шаг 3 переписывает свои строки, строки шага 4 остаются.
+  const afterRequests = merged(stepThree.concat([transferRow(DSS_ACTUALIZATION_SOURCE_MISSED, '3')]), [stageRow(DSS_ACTUALIZATION_SOURCE_REQUESTS, '5')], DSS_ACTUALIZATION_SOURCE_REQUESTS);
+  assertEqual(ids(afterRequests), '3,5', 'Шаг 3 переписывает только строки своего источника.');
+
+  // Конфликт по одной сделке: остаётся строка шага 3.
+  const conflict = merged([transferRow(DSS_ACTUALIZATION_SOURCE_MISSED, '7'), transferRow(DSS_ACTUALIZATION_SOURCE_MISSED, '8')], [stageRow(DSS_ACTUALIZATION_SOURCE_REQUESTS, '7')], DSS_ACTUALIZATION_SOURCE_REQUESTS);
+  assertEqual(ids(conflict), '8,7', 'При конфликте по сделке остаётся строка шага 3.');
+  assertEqual(String(conflict[1]['Источник проверки']), DSS_ACTUALIZATION_SOURCE_REQUESTS, 'По конфликтной сделке остаётся строка шага 3.');
+
+  // Состояние флажка чужих строк сохраняется, лист прошлой версии переписывается.
+  const unchecked = merged([stageRow(DSS_ACTUALIZATION_SOURCE_REQUESTS, '9', { 'Отправить': false }), row('', '10')], [], DSS_ACTUALIZATION_SOURCE_MISSED);
+  assertEqual(ids(unchecked), '9', 'Строки без известного источника переписываются как строки прошлой версии листа.');
+  assertEqual(unchecked[0]['Отправить'], false, 'Снятый вручную флажок чужой строки не восстанавливается.');
+
+  // Отправленные строки чужого шага: сегодняшние остаются, вчерашние убираются.
+  const sentToday = stageRow(DSS_ACTUALIZATION_SOURCE_REQUESTS, '11', { 'Статус отправки': 'Отправлено 02.08.2026 20:15:00' });
+  const sentYesterday = stageRow(DSS_ACTUALIZATION_SOURCE_REQUESTS, '12', { 'Статус отправки': 'Отправлено 01.08.2026 20:15:00', 'Дата актуализации': new Date(2026, 7, 1, 20, 0, 0) });
+  assertEqual(ids(merged([sentToday, sentYesterday], [], DSS_ACTUALIZATION_SOURCE_MISSED)), '11', 'Отправленные строки чужого шага за прошлые дни на листе не накапливаются.');
+
+  // Дедупликация шага 4: активные строки шага 3 по сделке.
+  const prepared = DSS_activeDealIdsBySource_([
+    stageRow(DSS_ACTUALIZATION_SOURCE_REQUESTS, '20'),
+    stageRow(DSS_ACTUALIZATION_SOURCE_REQUESTS, '21', { 'Отправить': false }),
+    stageRow(DSS_ACTUALIZATION_SOURCE_REQUESTS, '22', { 'Статус отправки': 'Отправлено 02.08.2026 20:15:00' }),
+    row(DSS_ACTUALIZATION_SOURCE_REQUESTS, '23'),
+    transferRow(DSS_ACTUALIZATION_SOURCE_MISSED, '24')
+  ], DSS_ACTUALIZATION_SOURCE_REQUESTS);
+  assertTrue(prepared.has('20'), 'Неотправленный перевод стадии шага 3 отдаёт сделку шагу 3.');
+  assertTrue(!prepared.has('21'), 'Строка со снятым флажком сделку за шагом 3 не удерживает.');
+  assertTrue(!prepared.has('22'), 'Отправленная строка сделку за шагом 3 не удерживает.');
+  assertTrue(!prepared.has('23'), 'Строка без изменений сделку за шагом 3 не удерживает.');
+  assertTrue(!prepared.has('24'), 'Строки шага 4 в список шага 3 не попадают.');
+
+  return 'DSS_testActualizationSourcesMerge_: OK';
+}
+
 function DSS_testDailyReportMessage_() {
   const total = (count, amount) => ({ count, amount });
   const message = DSS_formatDailyReportMessage_({
@@ -1052,13 +1140,88 @@ function DSS_writeSheet_(ss, name, headers, rows, formats) {
   if (s.getFilter()) s.getFilter().remove();
   s.getRange(1, 1, Math.max(rows.length + 1, 1), headers.length).createFilter();
 }
-function DSS_writeActualization_(ss, rows) { DSS_writeSheet_(ss, DSS_CONFIG.sheets.actualization, DSS_ACTUALIZATION_HEADERS, rows, { dates: [5,6,14], dateTimes: [17,18,19] }); const s = ss.getSheetByName(DSS_CONFIG.sheets.actualization); s.getRange(2,1,Math.max(rows.length,1),1).insertCheckboxes(); }
+// Номера колонок листа актуализации берутся из заголовков: при добавлении
+// колонок форматы и обращения по индексам не разъезжаются.
+function DSS_actualizationColumn_(header) {
+  const index = DSS_ACTUALIZATION_HEADERS.indexOf(header);
+  if (index === -1) throw new Error('На листе «' + DSS_CONFIG.sheets.actualization + '» нет колонки «' + header + '».');
+  return index + 1;
+}
+function DSS_writeActualization_(ss, rows) {
+  const dates = ['Дата назначения', 'Первый день лечения', 'Записан на дату'].map(h => DSS_actualizationColumn_(h));
+  const dateTimes = ['Дата загрузки сделок', 'Дата обработки заявок', 'Дата актуализации'].map(h => DSS_actualizationColumn_(h));
+  DSS_writeSheet_(ss, DSS_CONFIG.sheets.actualization, DSS_ACTUALIZATION_HEADERS, rows, { dates, dateTimes });
+  const s = ss.getSheetByName(DSS_CONFIG.sheets.actualization); const sendColumn = DSS_actualizationColumn_('Отправить');
+  s.getRange(2, sendColumn, Math.max(rows.length, 1), 1).insertCheckboxes();
+  // insertCheckboxes сбрасывает значения ячеек, поэтому флажки проставляются
+  // после вставки: у строк другого шага сохраняется прежнее состояние.
+  if (rows.length) s.getRange(2, sendColumn, rows.length, 1).setValues(rows.map(row => [row[sendColumn - 1] === true]));
+}
+// Запись результатов одного шага актуализации на общий лист: строки своего
+// источника переписываются, строки другого шага сохраняются.
+function DSS_writeActualizationForSource_(ss, source, rows) {
+  DSS_writeActualization_(ss, DSS_mergeActualizationRows_(DSS_readActualizationRows_(ss), rows, source, DSS_today_()));
+}
+function DSS_readActualizationRows_(ss) {
+  const sheet = ss.getSheetByName(DSS_CONFIG.sheets.actualization);
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  return DSS_readObjects_(sheet);
+}
+// Строка листа актуализации в виде объекта по заголовкам.
+function DSS_actualizationRowObject_(row) {
+  const out = {};
+  DSS_ACTUALIZATION_HEADERS.forEach((header, index) => { out[header] = row[index]; });
+  return out;
+}
+function DSS_actualizationRowValues_(row) {
+  return DSS_ACTUALIZATION_HEADERS.map(header => (row[header] === undefined || row[header] === null ? '' : row[header]));
+}
+// Отправленная строка: статус пишется как «Отправлено <дата и время>».
+function DSS_isSentActualizationRow_(row) {
+  return String(row['Статус отправки'] || '').indexOf('Отправлено') === 0;
+}
+// Активная строка: подготовленное изменение, отмеченное флажком и не отправленное.
+function DSS_isActiveActualizationRow_(row) {
+  return row['Отправить'] === true && Boolean(String(row['ID сделки'] || '')) &&
+    DSS_hasActualizationChange_(row) && !DSS_isSentActualizationRow_(row);
+}
+function DSS_activeDealIdsBySource_(rows, source) {
+  const ids = new Set();
+  (rows || []).forEach(row => {
+    if (String(row['Источник проверки'] || '') !== source) return;
+    if (!DSS_isActiveActualizationRow_(row)) return;
+    ids.add(String(row['ID сделки'] || ''));
+  });
+  return ids;
+}
+/* Слияние строк листа актуализации при записи результатов шага.
+ * Удаляются: все прежние строки своего источника (шаг пересчитал их заново),
+ * строки без известного источника (лист прошлой версии скрипта),
+ * отправленные строки другого шага за прошлые дни,
+ * а также неотправленные строки шага 4 по сделкам, для которых шаг 3
+ * подготовил перевод стадии: перевод важнее переноса даты записи.
+ * Остальные строки другого шага сохраняются вместе с состоянием флажка. */
+function DSS_mergeActualizationRows_(existing, rows, source, today) {
+  const replaced = new Set();
+  (rows || []).forEach(row => { const item = DSS_actualizationRowObject_(row); if (DSS_isActiveActualizationRow_(item)) replaced.add(String(item['ID сделки'] || '')); });
+  const kept = (existing || []).filter(row => {
+    const rowSource = String(row['Источник проверки'] || '');
+    if (rowSource === source || DSS_ACTUALIZATION_SOURCES.indexOf(rowSource) === -1) return false;
+    if (DSS_isSentActualizationRow_(row)) {
+      const actualized = DSS_date_(row['Дата актуализации']);
+      return Boolean(actualized) && Boolean(today) && !(actualized < today);
+    }
+    if (source === DSS_ACTUALIZATION_SOURCE_REQUESTS && replaced.has(String(row['ID сделки'] || ''))) return false;
+    return true;
+  }).map(row => DSS_actualizationRowValues_(row));
+  return kept.concat(rows || []);
+}
 function DSS_prepareSheet_(ss, name, headers) { let s = ss.getSheetByName(name); if(!s) s = ss.insertSheet(name); if (s.getFilter()) s.getFilter().remove(); s.clear(); s.getRange(1,1,1,headers.length).setValues([headers]); return s; }
 function DSS_requiredSheet_(ss, name) { const s = ss.getSheetByName(name); if(!s) throw new Error('Не найден обязательный лист "' + name + '".'); return s; }
 function DSS_readObjects_(sheet) { const values = sheet.getDataRange().getValues(), display = sheet.getDataRange().getDisplayValues(); if(!values.length) return []; const h = display[0].map(x => String(x || '').trim()); return values.slice(1).map((row,i) => { const x = {}; h.forEach((k,j) => x[k] = row[j]); return x; }); }
 // Колонки статуса отправки берутся из заголовков: их номера сдвигаются
 // при добавлении колонок на лист актуализации.
-function DSS_sendStatus_(sheet, row, status, error) { sheet.getRange(row, DSS_ACTUALIZATION_HEADERS.indexOf('Статус отправки') + 1, 1, 2).setValues([[status,error]]); }
+function DSS_sendStatus_(sheet, row, status, error) { sheet.getRange(row, DSS_actualizationColumn_('Статус отправки'), 1, 2).setValues([[status,error]]); }
 function DSS_ensureLogSheet_(ss) { let s = ss.getSheetByName(DSS_CONFIG.sheets.log); if(!s) s = ss.insertSheet(DSS_CONFIG.sheets.log); if(!s.getLastRow()) s.appendRow(['Дата и время','Этап']); return s; }
 function DSS_log_(ss, stage, date) { DSS_ensureLogSheet_(ss).appendRow([date, stage]); }
 function DSS_alert_(title, text) { SpreadsheetApp.getUi().alert(title, text, SpreadsheetApp.getUi().ButtonSet.OK); }
